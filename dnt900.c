@@ -239,10 +239,6 @@ static void dnt900_init_packet(struct dnt900_packet *packet, struct spi_device *
     packet->message.complete = dnt900_packet_complete;
     packet->transfer.len = len;
     packet->transfer.tx_buf = tx_buf;
-    packet->transfer.cs_change = 1;
-    packet->transfer.bits_per_word = 8;
-    packet->transfer.speed_hz = 80640;
-    packet->transfer.delay_usecs = 12;
     spi_message_add_tail(&packet->transfer, &packet->message);
     INIT_LIST_HEAD(&packet->list);
     init_completion(&packet->completed);
