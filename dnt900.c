@@ -11,6 +11,8 @@
 #include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/types.h>
+#include <linux/ctype.h>
+#include <linux/sysfs.h>
 #include <linux/device.h>
 #include <linux/string.h>
 #include <linux/err.h>
@@ -111,6 +113,430 @@ struct dnt900_device {
     unsigned int mac_address;
 };
 
+#define ATTR_R  (S_IRUGO)
+#define ATTR_W  (S_IWUSR | S_IWGRP)
+#define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
+
+static ssize_t dnt900_show_attr(struct device *, struct device_attribute *, char *);
+static ssize_t dnt900_store_attr(struct device *, struct device_attribute *, const char *, size_t);
+static ssize_t dnt900_reset(struct device *, struct device_attribute *, const char *, size_t);
+static ssize_t dnt900_discover(struct device *, struct device_attribute *, const char *, size_t);
+
+static struct device_attribute dnt900_local_attributes[] = {
+    __ATTR(reset,    ATTR_W, NULL, dnt900_reset),
+    __ATTR(discover, ATTR_W, NULL, dnt900_discover)
+};
+
+struct dnt900_attribute {
+    struct device_attribute attr;
+    char bank;
+    char offset;
+    char span;
+    int (*print)(const char *value, char *buf);
+    int (*parse)(const char *buf, size_t count, char *value);
+};
+
+#define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse) { \
+    .attr = { \
+        .attr = { \
+            .name = _name, \
+            .mode = _mode \
+        }, \
+        .show = dnt900_show_attr, \
+        .store = dnt900_store_attr \
+    }, \
+    .bank = _bank, \
+    .offset = _offset, \
+    .span = _span, \
+    .print = _print, \
+    .parse = _parse \
+}
+
+static int print_bytes(int bytes, const char *value, char *buf)
+{
+    int count = scnprintf(buf, PAGE_SIZE, "0x");
+    for (; bytes > 0; --bytes)
+        count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", value[bytes-1]);
+    count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
+    return count;
+}
+
+static int print_1_bytes(const char *value, char *buf)
+{
+    return print_bytes(1, value, buf);
+}
+
+static int print_2_bytes(const char *value, char *buf)
+{
+    return print_bytes(2, value, buf);
+}
+
+static int print_3_bytes(const char *value, char *buf)
+{
+    return print_bytes(3, value, buf);
+}
+
+static int print_4_bytes(const char *value, char *buf)
+{
+    return print_bytes(4, value, buf);
+}
+
+static int print_hex(int bytes, const char *value, char *buf)
+{
+    int count = scnprintf(buf, PAGE_SIZE, "0x");
+    for (; bytes > 0; ++value, --bytes)
+        count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", *value);
+    count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
+    return count;
+}
+
+static int print_32_hex(const char *value, char *buf)
+{
+    return print_hex(32, value, buf);
+}
+
+static int print_8_ascii(const char *value, char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%.8s\n", value);
+}
+
+static int print_16_ascii(const char *value, char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%.16s\n", value);
+}
+
+static int print_5_macs(const char *value, char *buf)
+{
+    // TODO: this is big-endian, should be little-endian
+    return scnprintf(buf, PAGE_SIZE,
+        "0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X\n",
+        value[ 2], value[ 1], value[ 0],
+        value[ 5], value[ 4], value[ 3],
+        value[ 8], value[ 7], value[ 6],
+        value[11], value[10], value[ 9],
+        value[14], value[13], value[12]);
+}
+
+static int parse_bytes(int bytes, const char *buf, size_t count, char *value)
+{
+    unsigned long result;
+    int error = kstrtoul(buf, 0, &result);
+    printk(KERN_INFO "kstrtoul gave %lx\n", result);
+    if (error)
+        return error;
+    if (result >> (8 * bytes))
+        return -ERANGE;
+    for (; bytes > 0; --bytes, ++value, result >>= 8)
+        *value = result & 0xFF;
+    return 0;
+}
+
+static int parse_1_bytes(const char *buf, size_t count, char *value)
+{
+    return parse_bytes(1, buf, count, value);
+}
+
+static int parse_2_bytes(const char *buf, size_t count, char *value)
+{
+    return parse_bytes(2, buf, count, value);
+}
+
+static int parse_3_bytes(const char *buf, size_t count, char *value)
+{
+    return parse_bytes(3, buf, count, value);
+}
+
+static int parse_4_bytes(const char *buf, size_t count, char *value)
+{
+    return parse_bytes(4, buf, count, value);
+}
+
+static int parse_hex(int bytes, const char *buf, size_t count, char *value)
+{
+    if (bytes * 2 + 2 != count)
+        return -EINVAL;
+    if (*buf++ != '0')
+        return -EINVAL;
+    if (tolower(*buf++) != 'x')
+        return -EINVAL;
+    for (; bytes > 0; --bytes, ++value) {
+        int n;
+        for (*value = 0, n = 0; n < 2; ++n, ++buf) {
+            if (!isxdigit(*buf))
+                return -EINVAL;
+            *value <<= 4;
+            *value += isdigit(*buf) ? (*buf - '0') : (tolower(*buf) - 'a' + 10);
+        }
+    }
+    return 0;
+}
+
+static int parse_16_hex(const char *buf, size_t count, char *value)
+{
+    return parse_hex(16, buf, count, value);
+}
+
+static int parse_32_hex(const char *buf, size_t count, char *value)
+{
+    return parse_hex(32, buf, count, value);
+}
+
+static int parse_16_ascii(const char *buf, size_t count, char *value)
+{
+    int n;
+    for (n = 0; n < 16; ++n)
+        value[n] = n < count ? buf[n] : 0;
+    return 0;
+}
+
+static struct dnt900_attribute dnt900_attributes[] = {
+    DNT900_ATTR("DeviceMode",         ATTR_RW, 0x00, 0x00, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("RF_DataRate",        ATTR_RW, 0x00, 0x01, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("HopDuration",        ATTR_RW, 0x00, 0x02, 0x02, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("InitialParentNwkID", ATTR_RW, 0x00, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SecurityKey",        ATTR_W,  0x00, 0x05, 0x10, NULL, parse_16_hex),
+    DNT900_ATTR("SleepMode",          ATTR_RW, 0x00, 0x15, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("WakeResponseTime",   ATTR_RW, 0x00, 0x16, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("WakeLinkTimeout",    ATTR_RW, 0x00, 0x17, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("TxPower",            ATTR_RW, 0x00, 0x18, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ExtSyncEnable",      ATTR_RW, 0x00, 0x19, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("DiversityMode",      ATTR_RW, 0x00, 0x1A, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("UserTag",            ATTR_RW, 0x00, 0x1C, 0x10, print_16_ascii, parse_16_ascii),
+    DNT900_ATTR("RegDenialDelay",     ATTR_RW, 0x00, 0x2C, 0x02, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("RmtTransDestAddr",   ATTR_RW, 0x00, 0x2E, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("TreeRoutingEn",      ATTR_RW, 0x00, 0x34, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("BaseModeNetID",      ATTR_RW, 0x00, 0x35, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("StaticNetAddr",      ATTR_RW, 0x00, 0x36, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("HeartbeatIntrvl",    ATTR_RW, 0x00, 0x37, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("TreeRoutingSysID",   ATTR_RW, 0x00, 0x39, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("enableRtAcks",       ATTR_RW, 0x00, 0x3A, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("FrequencyBand",      ATTR_RW, 0x01, 0x00, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("AccessMode",         ATTR_RW, 0x01, 0x01, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("BaseSlotSize",       ATTR_RW, 0x01, 0x02, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("LeasePeriod",        ATTR_RW, 0x01, 0x03, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ARQ_Mode",           ATTR_RW, 0x01, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ARQ_AttemptLimit",   ATTR_RW, 0x01, 0x05, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("MaxSlots",           ATTR_RW, 0x01, 0x06, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("CSMA_Predelay",      ATTR_RW, 0x01, 0x07, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("CSMA_Backoff",       ATTR_RW, 0x01, 0x08, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("MaxPropDelay",       ATTR_RW, 0x01, 0x09, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("LinkDropThreshold",  ATTR_RW, 0x01, 0x0A, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("CSMA_RemtSlotSize",  ATTR_RW, 0x01, 0x0B, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("CSMA_BusyThreshold", ATTR_RW, 0x01, 0x0C, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("RangingInterval",    ATTR_RW, 0x01, 0x0D, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("AuthMode",           ATTR_RW, 0x01, 0x0E, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("P2PReplyTimeout",    ATTR_RW, 0x01, 0x0F, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("MacAddress",         ATTR_R,  0x02, 0x00, 0x03, print_3_bytes, NULL),
+    DNT900_ATTR("CurrNwkAddr",        ATTR_R,  0x02, 0x03, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrNwkID",          ATTR_R,  0x02, 0x04, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrRF_DataRate",    ATTR_R,  0x02, 0x05, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrFreqBand",       ATTR_R,  0x02, 0x06, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("LinkStatus",         ATTR_R,  0x02, 0x07, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("RemoteSlotSize",     ATTR_R,  0x02, 0x08, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("TDMA_NumSlots",      ATTR_R,  0x02, 0x09, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("TDMA_CurrSlot",      ATTR_R,  0x02, 0x0B, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("HardwareVersion",    ATTR_R,  0x02, 0x0C, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("FirmwareVersion",    ATTR_R,  0x02, 0x0D, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("FirmwareBuildNum",   ATTR_R,  0x02, 0x0E, 0x02, print_2_bytes, NULL),
+    DNT900_ATTR("SuperframeCount",    ATTR_R,  0x02, 0x11, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("RSSI_Idle",          ATTR_R,  0x02, 0x12, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("RSSI_Last",          ATTR_R,  0x02, 0x13, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrTxPower",        ATTR_R,  0x02, 0x14, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrAttemptLimit",   ATTR_R,  0x02, 0x15, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrRangeDelay",     ATTR_R,  0x02, 0x16, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("FirmwareBuildDate",  ATTR_R,  0x02, 0x17, 0x08, print_8_ascii, NULL),
+    DNT900_ATTR("FirmwareBuildTime",  ATTR_R,  0x02, 0x1F, 0x08, print_8_ascii, NULL),
+    DNT900_ATTR("ModelNumber",        ATTR_R,  0x02, 0x27, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("CurrBaseModeNetID",  ATTR_R,  0x02, 0x28, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("AveRXPwrOvHopSeq",   ATTR_R,  0x02, 0x29, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentACKQual",      ATTR_R,  0x02, 0x2A, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("SerialRate",         ATTR_RW, 0x03, 0x00, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("SerialParams",       ATTR_RW, 0x03, 0x02, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SerialControls",     ATTR_RW, 0x03, 0x03, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SPI_Mode",           ATTR_RW, 0x03, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SPI_Divisor",        ATTR_RW, 0x03, 0x05, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SPI_Options",        ATTR_RW, 0x03, 0x06, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SPI_MasterCmdLen",   ATTR_RW, 0x03, 0x07, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("SPI_MasterCmdStr",   ATTR_RW, 0x03, 0x08, 0x20, print_32_hex, parse_32_hex),
+    DNT900_ATTR("ProtocolMode",       ATTR_RW, 0x04, 0x00, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ProtocolOptions",    ATTR_RW, 0x04, 0x01, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("TxTimeout",          ATTR_RW, 0x04, 0x02, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("MinPacketLength",    ATTR_RW, 0x04, 0x03, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("AnnounceOptions",    ATTR_RW, 0x04, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("TransLinkAnnEn",     ATTR_RW, 0x04, 0x05, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ProtocolSequenceEn", ATTR_RW, 0x04, 0x06, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("TransPtToPtMode",    ATTR_RW, 0x04, 0x07, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("MaxPktsPerHop",      ATTR_RW, 0x04, 0x08, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO0",              ATTR_RW, 0x05, 0x00, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO1",              ATTR_RW, 0x05, 0x01, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO2",              ATTR_RW, 0x05, 0x02, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO3",              ATTR_RW, 0x05, 0x03, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO4",              ATTR_RW, 0x05, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO5",              ATTR_RW, 0x05, 0x05, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ADC0",               ATTR_R,  0x05, 0x06, 0x02, print_2_bytes, NULL),
+    DNT900_ATTR("ADC1",               ATTR_R,  0x05, 0x08, 0x02, print_2_bytes, NULL),
+    DNT900_ATTR("ADC2",               ATTR_R,  0x05, 0x0A, 0x02, print_2_bytes, NULL),
+    DNT900_ATTR("Event_Flags",        ATTR_R,  0x05, 0x0C, 0x02, print_2_bytes, NULL),
+    DNT900_ATTR("PWM0",               ATTR_RW, 0x05, 0x0E, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("PWM1",               ATTR_RW, 0x05, 0x10, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("GPIO_Dir",           ATTR_RW, 0x06, 0x00, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_Init",          ATTR_RW, 0x06, 0x01, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_Alt",           ATTR_RW, 0x06, 0x02, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_Edge_Trigger",  ATTR_RW, 0x06, 0x03, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_SleepMode",     ATTR_RW, 0x06, 0x04, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_SleepDir",      ATTR_RW, 0x06, 0x05, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("GPIO_SleepState",    ATTR_RW, 0x06, 0x06, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("PWM0_Init",          ATTR_RW, 0x06, 0x07, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("PWM1_Init",          ATTR_RW, 0x06, 0x09, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC_SampleIntvl",    ATTR_RW, 0x06, 0x0B, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC0_ThresholdLo",   ATTR_RW, 0x06, 0x0D, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC0_ThresholdHi",   ATTR_RW, 0x06, 0x0F, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC1_ThresholdLo",   ATTR_RW, 0x06, 0x11, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC1_ThresholdHi",   ATTR_RW, 0x06, 0x13, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC2_ThresholdLo",   ATTR_RW, 0x06, 0x15, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("ADC2_ThresholdHi",   ATTR_RW, 0x06, 0x17, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("IO_ReportTrigger",   ATTR_RW, 0x06, 0x19, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("IO_ReportInterval",  ATTR_RW, 0x06, 0x1A, 0x04, print_4_bytes, parse_4_bytes),
+    DNT900_ATTR("IO_ReportPreDel",    ATTR_RW, 0x06, 0x1E, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("IO_ReportRepeat",    ATTR_RW, 0x06, 0x1F, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("ApprovedAddr00",     ATTR_RW, 0x07, 0x00, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr01",     ATTR_RW, 0x07, 0x03, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr02",     ATTR_RW, 0x07, 0x06, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr03",     ATTR_RW, 0x07, 0x09, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr04",     ATTR_RW, 0x07, 0x0C, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr05",     ATTR_RW, 0x07, 0x0F, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr06",     ATTR_RW, 0x07, 0x12, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr07",     ATTR_RW, 0x07, 0x15, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr08",     ATTR_RW, 0x07, 0x18, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr09",     ATTR_RW, 0x07, 0x1B, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr10",     ATTR_RW, 0x07, 0x1E, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr11",     ATTR_RW, 0x07, 0x21, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr12",     ATTR_RW, 0x07, 0x24, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr13",     ATTR_RW, 0x07, 0x27, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr14",     ATTR_RW, 0x07, 0x2A, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("ApprovedAddr15",     ATTR_RW, 0x07, 0x2D, 0x03, print_3_bytes, parse_3_bytes),
+    DNT900_ATTR("BaseNetworkID",      ATTR_R,  0x08, 0x00, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID01",  ATTR_R,  0x08, 0x01, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID02",  ATTR_R,  0x08, 0x02, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID03",  ATTR_R,  0x08, 0x03, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID04",  ATTR_R,  0x08, 0x04, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID05",  ATTR_R,  0x08, 0x05, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID06",  ATTR_R,  0x08, 0x06, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID07",  ATTR_R,  0x08, 0x07, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID08",  ATTR_R,  0x08, 0x08, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID09",  ATTR_R,  0x08, 0x09, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID10",  ATTR_R,  0x08, 0x0A, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID11",  ATTR_R,  0x08, 0x0B, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID12",  ATTR_R,  0x08, 0x0C, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID13",  ATTR_R,  0x08, 0x0D, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID14",  ATTR_R,  0x08, 0x0E, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID15",  ATTR_R,  0x08, 0x0F, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID16",  ATTR_R,  0x08, 0x10, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID17",  ATTR_R,  0x08, 0x11, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID18",  ATTR_R,  0x08, 0x12, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID19",  ATTR_R,  0x08, 0x13, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID20",  ATTR_R,  0x08, 0x14, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID21",  ATTR_R,  0x08, 0x15, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID22",  ATTR_R,  0x08, 0x16, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID23",  ATTR_R,  0x08, 0x17, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID24",  ATTR_R,  0x08, 0x18, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID25",  ATTR_R,  0x08, 0x19, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID26",  ATTR_R,  0x08, 0x1A, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID27",  ATTR_R,  0x08, 0x1B, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID28",  ATTR_R,  0x08, 0x1C, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID29",  ATTR_R,  0x08, 0x1D, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID30",  ATTR_R,  0x08, 0x1E, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID31",  ATTR_R,  0x08, 0x1F, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID32",  ATTR_R,  0x08, 0x20, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID33",  ATTR_R,  0x08, 0x21, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID34",  ATTR_R,  0x08, 0x22, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID35",  ATTR_R,  0x08, 0x23, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID36",  ATTR_R,  0x08, 0x24, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID37",  ATTR_R,  0x08, 0x25, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID38",  ATTR_R,  0x08, 0x26, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID39",  ATTR_R,  0x08, 0x27, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID40",  ATTR_R,  0x08, 0x28, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID41",  ATTR_R,  0x08, 0x29, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID42",  ATTR_R,  0x08, 0x2A, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID43",  ATTR_R,  0x08, 0x2B, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID44",  ATTR_R,  0x08, 0x2C, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID45",  ATTR_R,  0x08, 0x2D, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID46",  ATTR_R,  0x08, 0x2E, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID47",  ATTR_R,  0x08, 0x2F, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID48",  ATTR_R,  0x08, 0x30, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID49",  ATTR_R,  0x08, 0x31, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID50",  ATTR_R,  0x08, 0x32, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID51",  ATTR_R,  0x08, 0x33, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID52",  ATTR_R,  0x08, 0x34, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID53",  ATTR_R,  0x08, 0x35, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID54",  ATTR_R,  0x08, 0x36, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID55",  ATTR_R,  0x08, 0x37, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID56",  ATTR_R,  0x08, 0x38, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID57",  ATTR_R,  0x08, 0x39, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID58",  ATTR_R,  0x08, 0x3A, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID59",  ATTR_R,  0x08, 0x3B, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID60",  ATTR_R,  0x08, 0x3C, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID61",  ATTR_R,  0x08, 0x3D, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID62",  ATTR_R,  0x08, 0x3E, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("ParentNetworkID63",  ATTR_R,  0x08, 0x3F, 0x01, print_1_bytes, NULL),
+    DNT900_ATTR("RegMACAddr00",       ATTR_R,  0x09, 0x00, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr01",       ATTR_R,  0x09, 0x01, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr02",       ATTR_R,  0x09, 0x02, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr03",       ATTR_R,  0x09, 0x03, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr04",       ATTR_R,  0x09, 0x04, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr05",       ATTR_R,  0x09, 0x05, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr06",       ATTR_R,  0x09, 0x06, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr07",       ATTR_R,  0x09, 0x07, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr08",       ATTR_R,  0x09, 0x08, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr09",       ATTR_R,  0x09, 0x09, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr10",       ATTR_R,  0x09, 0x0A, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr11",       ATTR_R,  0x09, 0x0B, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr12",       ATTR_R,  0x09, 0x0C, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr13",       ATTR_R,  0x09, 0x0D, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr14",       ATTR_R,  0x09, 0x0E, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr15",       ATTR_R,  0x09, 0x0F, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr16",       ATTR_R,  0x09, 0x10, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr17",       ATTR_R,  0x09, 0x11, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr18",       ATTR_R,  0x09, 0x12, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr19",       ATTR_R,  0x09, 0x13, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr20",       ATTR_R,  0x09, 0x14, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr21",       ATTR_R,  0x09, 0x15, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr22",       ATTR_R,  0x09, 0x16, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr23",       ATTR_R,  0x09, 0x17, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr24",       ATTR_R,  0x09, 0x18, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("RegMACAddr25",       ATTR_R,  0x09, 0x19, 0x0F, print_5_macs, NULL),
+    DNT900_ATTR("UcReset",            ATTR_W,  0xFF, 0x00, 0x01, NULL, parse_1_bytes),
+    DNT900_ATTR("SleepModeOverride",  ATTR_RW, 0xFF, 0x0C, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("RoutingTableUpd",    ATTR_RW, 0xFF, 0x1C, 0x01, print_1_bytes, parse_1_bytes),
+    DNT900_ATTR("DiagSerialRate",     ATTR_RW, 0xFF, 0x20, 0x02, print_2_bytes, parse_2_bytes),
+    DNT900_ATTR("MemorySave",         ATTR_W,  0xFF, 0xFF, 0x01, NULL, parse_1_bytes)
+};
+
+static int dnt900_add_attributes(struct dnt900_device *device) {
+    int n;
+    for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n) {
+        int result = device_create_file(device->dev, &dnt900_attributes[n].attr);
+        if (result)
+            return result;
+    }
+    if (device->is_local)
+        for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n) {
+            int result = device_create_file(device->dev, dnt900_local_attributes + n);
+            if (result)
+                return result;
+        }
+    return 0;
+}
+
+static void dnt900_remove_attributes(struct dnt900_device *device) {
+    int n;
+    for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
+        device_remove_file(device->dev, &dnt900_attributes[n].attr);
+    if (device->is_local)
+        for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
+            device_remove_file(device->dev, dnt900_local_attributes + n);
+}
+
 static irqreturn_t dnt900_avl_handler(int, void *);
 static irqreturn_t dnt900_cts_handler(int, void *);
 
@@ -150,18 +576,15 @@ static int dnt900_probe(struct spi_device *spi)
         error = -ENOMEM;
         goto fail_device_alloc;
     }
-    
-    // code to verify dnt900 device is present
-    // code to claim and configure GPIOs for /CFG and SPI_RX_AVL
-    // code to initialise dnt900 device
-    
-    // device->mac_address = XXX; // obtain from dnt900 via protocol message
     device->is_local = 1;
     device->dev = device_create(dnt900_class, &spi->dev, MKDEV(0, 0), device, local_name);
     if (IS_ERR(device->dev)) {
         error = PTR_ERR(device->dev);
         goto fail_device_create;
-    } 
+    }
+    
+    error = dnt900_add_attributes(device);
+    if (error) goto fail_add_attributes;
      
     driver->gpio_cfg = gpio_cfg; // how to make this per-instance?
     driver->gpio_avl = gpio_avl; // how to make this per-instance?
@@ -173,24 +596,30 @@ static int dnt900_probe(struct spi_device *spi)
     if (error) goto fail_gpio_avl;
     error = gpio_request_one(driver->gpio_cts, GPIOF_IN, "/host_cts");
     if (error) goto fail_gpio_cts;
-    // error = request_irq(gpio_to_irq(driver->gpio_avl), dnt900_avl_handler, IRQF_DISABLED | IRQF_TRIGGER_RISING, driver_name, spi);
-    // if (error) goto fail_irq_avl;
-    // error = request_irq(gpio_to_irq(driver->gpio_cts), dnt900_cts_handler, IRQF_DISABLED | IRQF_TRIGGER_FALLING, driver_name, spi);
-    // if (error) goto fail_irq_cts;
-    
     gpio_set_value(driver->gpio_cfg, 0); // enter protocol mode
+    
+    error = request_irq(gpio_to_irq(driver->gpio_avl), dnt900_avl_handler, IRQF_DISABLED | IRQF_TRIGGER_RISING, driver_name, spi);
+    if (error) goto fail_irq_avl;
+    error = request_irq(gpio_to_irq(driver->gpio_cts), dnt900_cts_handler, IRQF_DISABLED | IRQF_TRIGGER_FALLING, driver_name, spi);
+    if (error) goto fail_irq_cts;
+    
+    // code to verify dnt900 device is present?
+    // code to initialise dnt900 device?
+    // device->mac_address = XXX; // obtain from dnt900 via protocol message
 
     return 0;
     
-// fail_irq_cts:
-//     free_irq(gpio_to_irq(driver->gpio_avl), driver);
-// fail_irq_avl:
+fail_irq_cts:
+    free_irq(gpio_to_irq(driver->gpio_avl), driver);
+fail_irq_avl:
     gpio_free(driver->gpio_cts);
 fail_gpio_cts:
     gpio_free(driver->gpio_avl);
 fail_gpio_avl:
     gpio_free(driver->gpio_cfg);
 fail_gpio_cfg:
+    dnt900_remove_attributes(device);
+fail_add_attributes:
     device_unregister(device->dev);
 fail_device_create:
     kfree(device);
@@ -203,12 +632,13 @@ fail_driver_alloc:
     return error;
 }
 
-static int dnt900_remove_child(struct device *child, void *unused)
+static int dnt900_remove_child(struct device *dev, void *unused)
 {
-    struct dnt900_device *device = dev_get_drvdata(child);
+    struct dnt900_device *device = dev_get_drvdata(dev);
     if (!device->is_local)
         cdev_del(&device->cdev);
-    device_unregister(child);
+    dnt900_remove_attributes(device);
+    device_unregister(dev);
     kfree(device);
     return 0;
 }
@@ -218,8 +648,8 @@ static int dnt900_remove(struct spi_device *spi)
     struct dnt900_driver *driver = spi_get_drvdata(spi);
     
     // code to sleep the dnt900 here?
-    // free_irq(gpio_to_irq(driver->gpio_avl), spi);
-    // free_irq(gpio_to_irq(driver->gpio_cts), spi);
+    free_irq(gpio_to_irq(driver->gpio_avl), spi);
+    free_irq(gpio_to_irq(driver->gpio_cts), spi);
     gpio_free(driver->gpio_cts);
     gpio_free(driver->gpio_avl);
     gpio_free(driver->gpio_cfg);
@@ -229,14 +659,14 @@ static int dnt900_remove(struct spi_device *spi)
     return 0;
 }
 
-static void dnt900_packet_complete(void *);
+static void dnt900_complete_packet(void *);
 
 static void dnt900_init_packet(struct dnt900_packet *packet, struct spi_device *spi, unsigned len, const void *tx_buf, char *result)
 {
     memset(packet, 0, sizeof(*packet));
     INIT_LIST_HEAD(&packet->message.transfers);
     packet->message.context = packet;
-    packet->message.complete = dnt900_packet_complete;
+    packet->message.complete = dnt900_complete_packet;
     packet->transfer.len = len;
     packet->transfer.tx_buf = tx_buf;
     spi_message_add_tail(&packet->transfer, &packet->message);
@@ -251,31 +681,25 @@ static void dnt900_init_packet(struct dnt900_packet *packet, struct spi_device *
 static void dnt900_send_queued_packets(struct spi_device *spi)
 {
     struct dnt900_driver *driver = spi_get_drvdata(spi);
-    struct dnt900_packet *packet;
     unsigned long flags;
     
-    if (gpio_get_value(driver->gpio_cts) != 0)
-        return;
-    
     spin_lock_irqsave(&driver->lock, flags);
-    if (list_empty(&driver->unsent_packets) && gpio_get_value(driver->gpio_avl)) {
+    if (gpio_get_value(driver->gpio_avl) &&
+            (list_empty(&driver->unsent_packets) || gpio_get_value(driver->gpio_cts))) {
         dnt900_init_packet(&driver->empty_packet, spi, EMPTY_PACKET_BYTES, NULL, NULL);
-        printk(KERN_INFO "inserting empty packet\n");
-        list_add_tail(&driver->empty_packet.list, &driver->unsent_packets);
+        list_add(&driver->empty_packet.list, &driver->unsent_packets);
     }
-    packet = list_empty(&driver->unsent_packets) ? NULL : list_first_entry(&driver->unsent_packets, struct dnt900_packet, list);
-    spin_unlock_irqrestore(&driver->lock, flags);
-    
-    if (packet) {
+    if (!list_empty(&driver->unsent_packets)) {
+        struct dnt900_packet *packet = list_first_entry(&driver->unsent_packets, struct dnt900_packet, list);
         // spinlock for accessing driver->rx_head ??
         packet->transfer.rx_buf = driver->rx_buf + driver->rx_head;
         driver->rx_head = CIRC_OFFSET(driver->rx_head, packet->transfer.len, RX_BUFFER_SIZE);
         spi_async(spi, &packet->message);
-        printk(KERN_INFO "queued packet to send on SPI\n");
     }
+    spin_unlock_irqrestore(&driver->lock, flags);
 }
 
-static void dnt900_packet_complete(void *context)
+static void dnt900_complete_packet(void *context)
 {
     struct dnt900_packet *packet = context;
     struct spi_device *spi = packet->spi;
@@ -285,27 +709,18 @@ static void dnt900_packet_complete(void *context)
     char * const rx_buf_end = driver->rx_buf + RX_BUFFER_SIZE;
     char * const transfer_end = packet->transfer.rx_buf + packet->transfer.len;
     unsigned long flags;
-    printk(KERN_INFO "packet sent with requested length %i, actual length %i\n and status %i", packet->transfer.len, packet->message.actual_length, packet->message.status);
-    
-    // TODO: check packet->message.actual_length agains packet->transfer.len?
     
     if (transfer_end > rx_buf_end)
         memcpy(driver->rx_buf, rx_buf_end, transfer_end - rx_buf_end);
     
     spin_lock_irqsave(&driver->lock, flags);
-    if (packet->message.status == 0 && packet->transfer.tx_buf)
-    {
+    if (!packet->message.status && packet->transfer.tx_buf)
         list_move_tail(&packet->list, &driver->sent_packets);
-        printk(KERN_INFO "packet moved to sent queue\n");
-    }    
     else
-    {
         list_del(&packet->list);
-        printk(KERN_INFO "packet deleted\n");
-    }
     spin_unlock_irqrestore(&driver->lock, flags);
     
-    if (packet->message.status != 0) {
+    if (packet->message.status) {
         packet->status = packet->message.status;
         complete(&packet->completed);
     }
@@ -390,6 +805,7 @@ static void dnt900_packet_complete(void *context)
     //     //              || tx_buf[5] != driver->rx_buf[CIRC_OFFSET(tail, 6, RX_BUFFER_SIZE)])
     //     //                 continue;
     //     //             packet->status = driver->rx_buf[CIRC_OFFSET(tail, 3, RX_BUFFER_SIZE)];
+    //     //             // TODO: recast this +ve status as a -ve errno
     //     //             break;
                     
     //     //         case COMMAND_DISCOVER:
@@ -399,6 +815,7 @@ static void dnt900_packet_complete(void *context)
     //     //              || tx_buf[5] != driver->rx_buf[CIRC_OFFSET(tail, 6, RX_BUFFER_SIZE)])
     //     //                 continue; 
     //     //             packet->status = driver->rx_buf[CIRC_OFFSET(tail, 3, RX_BUFFER_SIZE)];
+    //     //             // TODO: recast this +ve status as a -ve errno
     //     //             if (packet->status == STATUS_ACKNOWLEDGED)
     //     //                 for (index = 0; index < 3; ++index)
     //     //                     packet->result[index] = driver->rx_buf[CIRC_OFFSET(tail, 7 + index)];
@@ -411,6 +828,7 @@ static void dnt900_packet_complete(void *context)
     //     //              || tx_buf[5] != driver->rx_buf[CIRC_OFFSET(tail, 6, RX_BUFFER_SIZE)])
     //     //                 continue;
     //     //             packet->status = driver->rx_buf[CIRC_OFFSET(tail, 3, RX_BUFFER_SIZE)];
+    //     //             // TODO: recast this +ve status as a -ve errno
     //     //             if (packet->status == STATUS_ACKNOWLEDGED)
     //     //                 for (index = 0; index < tx_buf[8]; ++index)
     //     //                     packet->result[index] = driver->rx_buf[CIRC_OFFSET(tail, 11 + index, RX_BUFFER_SIZE)];
@@ -423,6 +841,7 @@ static void dnt900_packet_complete(void *context)
     //     //              || tx_buf[5] != driver->rx_buf[CIRC_OFFSET(tail, 6, RX_BUFFER_SIZE)])
     //     //                 continue;
     //     //             packet->status = driver->rx_buf[CIRC_OFFSET(tail, 3, RX_BUFFER_SIZE)];
+    //     //             // TODO: recast this +ve status as a -ve errno
     //     //             break;
                     
     //     //         }
@@ -446,27 +865,27 @@ static void dnt900_packet_complete(void *context)
     dnt900_send_queued_packets(spi);
 }
 
-// static irqreturn_t dnt900_avl_handler(int irq, void *dev_id)
-// {
-//     struct spi_device *spi = dev_id;
-//     dnt900_send_queued_packets(spi);
-//     return IRQ_HANDLED;
-// }
+static irqreturn_t dnt900_avl_handler(int irq, void *dev_id)
+{
+    struct spi_device *spi = dev_id;
+    printk(KERN_INFO "got RX_AVL interrupt\n");
+    dnt900_send_queued_packets(spi);
+    return IRQ_HANDLED;
+}
 
-// static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
-// {
-//     struct spi_device *spi = dev_id;
-//     dnt900_send_queued_packets(spi);
-//     return IRQ_HANDLED;    
-// }
+static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
+{
+    printk(KERN_INFO "got /HOST_CTS interrupt\n");
+    // struct spi_device *spi = dev_id;
+    // dnt900_send_queued_packets(spi);
+    return IRQ_HANDLED;    
+}
 
-static int dnt900_send_command(struct spi_device *spi, char *buf, char *result)
+static int dnt900_send_command(struct spi_device *spi, const char *buf, char *result)
 {
     struct dnt900_driver *driver = spi_get_drvdata(spi);
-    // TODO: packets contain the buffers and need to be DMA-safe i.e. allocated on the
-    // heap using kmalloc, not on the stack as here:
     struct dnt900_packet packet;
-    int interrupted;
+    int error;
     unsigned long flags;
     
     dnt900_init_packet(&packet, spi, buf[1] + 2, buf, result);
@@ -475,42 +894,29 @@ static int dnt900_send_command(struct spi_device *spi, char *buf, char *result)
     spin_unlock_irqrestore(&driver->lock, flags);
     dnt900_send_queued_packets(spi);
     // TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-    interrupted = wait_for_completion_interruptible(&packet.completed);
-    return interrupted ? interrupted : packet.status;
+    error = wait_for_completion_interruptible(&packet.completed);
+    // TODO: remove packet from queue if interrupted
+    // TODO: implement dnt900_destroy_packet to do this...
+    return error < 0 ? error : packet.status;
 }
 
-static int dnt900_get_register(struct spi_device *spi, char reg, char bank, char span, char *result)
+static int dnt900_get_register(struct spi_device *spi, char bank, char offset, char span, char *value)
 {
-    char cmd[6] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, reg, bank, span };
-    printk(KERN_INFO "sending %02X %02X %02X %02X %02X %02X\n", cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5]);
-    return dnt900_send_command(spi, cmd, result);
+    // TODO: cmd buffer should be DMA-safe i.e. allocated on the
+    // heap using kmalloc, not on the stack as here:
+    char cmd[6] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
+    return dnt900_send_command(spi, cmd, value);
 }
 
-// static ssize_t dnt900_read_attribute(struct device *dev, struct device_attribute *attr, char *buf)
-// {
-//     struct spi_device *spi = to_spi_device(dev->parent);
-//     char reg, bank, span;
-//     char result[32];
-//     // TODO: code to match attribute name and set reg/bank/span accordingly (use gperf?)
-//     dnt900_get_register(spi, reg, bank, span, result);
-//     // TODO: code to convert result to string
-//     return XXX;
-// }
-
-static ssize_t dnt900_test(struct device *dev, struct device_attribute *attr, char *buf)
+static int dnt900_set_register(struct spi_device *spi, char bank, char offset, char span, const char *value)
 {
-    struct spi_device *spi = to_spi_device(dev->parent);
-    char result[32];
-    dnt900_get_register(spi, 0x00, 0x01, 1, result);
-    return sprintf(buf, "0x%2X", result[0]);
-}
-
-static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-    struct spi_device *spi = to_spi_device(dev->parent);
-    char cmd[4] = { START_OF_PACKET, 2, COMMAND_SOFTWARE_RESET, 0 };
-    dnt900_send_command(spi, cmd, NULL);
-    return count;
+    // TODO: cmd buffer should be DMA-safe i.e. allocated on the
+    // heap using kmalloc, not on the stack as here:
+    char cmd[6 + 32] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
+    int n;
+    for (n = 0; n < span; ++n)
+        cmd[6 + n] = value[n];
+    return dnt900_send_command(spi, cmd, NULL);
 }
 
 static int dnt900_open(struct inode *inode, struct file *filp)
@@ -571,7 +977,10 @@ static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr
         error = PTR_ERR(device->dev);
         goto fail_device_create;
     }
-
+    
+    error = dnt900_add_attributes(device);
+    if (error) goto fail_add_attributes;
+    
     cdev_init(&device->cdev, &dnt900_fops);
     error = cdev_add(&device->cdev, devt, 1);
     if (error) goto fail_cdev_add;
@@ -579,6 +988,8 @@ static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr
     return count;
     
 fail_cdev_add:
+    dnt900_remove_attributes(device);
+fail_add_attributes:
     device_unregister(device->dev);
 fail_device_create:
     kfree(device);
@@ -586,15 +997,37 @@ fail_device_alloc:
 fail_nonlocal:
 fail_discovery:
 fail_input:
+    return error; // TODO: does this work?
+}
+
+static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct spi_device *spi = to_spi_device(dev->parent);
+    char cmd[4] = { START_OF_PACKET, 2, COMMAND_SOFTWARE_RESET, 0 };
+    dnt900_send_command(spi, cmd, NULL);
     return count;
 }
 
-static struct device_attribute dnt900_attribs[] = {
-    __ATTR(reset, S_IWUSR|S_IWGRP, NULL, dnt900_reset),
-    __ATTR(discover, S_IWUSR|S_IWGRP, NULL, dnt900_discover),
-    __ATTR(test, S_IRUSR|S_IRGRP, dnt900_test, NULL),
-    __ATTR_NULL
-};
+static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct spi_device *spi = to_spi_device(dev->parent);
+    struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+    char value[32];
+    int error = dnt900_get_register(spi, attribute->offset, attribute->bank, attribute->span, value);
+    return error < 0 ? error : attribute->print(value, buf);
+}
+
+static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct spi_device *spi = to_spi_device(dev->parent);
+    struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+    char value[32];
+    int error = attribute->parse(buf, count, value);
+    if (error)
+        return error;
+    error = dnt900_set_register(spi, attribute->offset, attribute->bank, attribute->span, value);
+    return error < 0 ? error : count;
+}
 
 static struct spi_driver dnt900_driver = {
     .driver = {
@@ -609,18 +1042,18 @@ static struct spi_driver dnt900_driver = {
 int __init dnt900_init(void)
 {
     // TODO: error handling!
-    dnt900_class = class_create(THIS_MODULE, class_name);
-    dnt900_class->dev_attrs = dnt900_attribs;
-    spi_register_driver(&dnt900_driver);
     printk(KERN_INFO "inserting dnt900 module\n");
+    dnt900_class = class_create(THIS_MODULE, class_name);
+    // dnt900_class->dev_attrs = dnt900_attribs;
+    spi_register_driver(&dnt900_driver);
     return 0;
 }
 
 void __exit dnt900_exit(void)
 {
+    printk(KERN_INFO "removing dnt900 module\n");
     spi_unregister_driver(&dnt900_driver);
     class_destroy(dnt900_class);
-    printk(KERN_INFO "removing dnt900 module\n");
 }
 
 module_init(dnt900_init);
