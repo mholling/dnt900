@@ -1,5 +1,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/stddef.h>
 #include <linux/init.h>
 #include <linux/stat.h>
 #include <linux/fs.h>
@@ -688,6 +689,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 
 static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
+	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
+	// heap using kmalloc, not on the stack as here:
 	struct spi_device *spi = to_spi_device(dev->parent);
 	struct dnt900_driver *driver = spi_get_drvdata(spi);
 	char cmd[4] = { START_OF_PACKET, 2, COMMAND_SOFTWARE_RESET, 0 };
@@ -731,7 +734,7 @@ static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, l
 	struct dnt900_device *device = filp->private_data;
 	int available, count, copied;
 	
-	if (!mutex_trylock(&device->lock)) // TODO: use mutex_lock_interruptible?
+	if (!mutex_trylock(&device->lock))
 		return 0;
 	available = (device->head > device->tail ? device->head : RX_BUF_SIZE) - device->tail;
 	count = available > length ? length : available;
@@ -739,12 +742,20 @@ static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, l
 	CIRC_OFFSET(device->tail, count, RX_BUF_SIZE);
 	mutex_unlock(&device->lock);
 	
-	return count && !copied ? -EFAULT : copied;
+	if (count && !copied)
+		return -EFAULT;
+	*offp += copied;
+	return copied;
 }
 
 static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
-	// struct dnt900_device *device = filp->private_data;
+	struct dnt900_device *device = filp->private_data;
+	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
+	// heap using kmalloc, not on the stack as here:
+	char cmd[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
+	if (device->is_local)
+		return -EPERM;
 	// TODO: pull a packet's worth of data from buf and send TxData message
 	return length;
 }
@@ -796,9 +807,11 @@ static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_add
 		goto fail_add_attributes;
 
 	cdev_init(&device->cdev, &dnt900_fops);
+	device->cdev.owner = THIS_MODULE;
 	error = cdev_add(&device->cdev, devt, 1);
 	if (error)
 		goto fail_cdev_add;
+	// TODO: set permissions to read-only if is_local
 
 	return 0;
 
@@ -1093,7 +1106,9 @@ static int dnt900_probe(struct spi_device *spi)
 		error = -ENOMEM;
 		goto fail_driver_alloc;
 	}
-
+	
+	// TODO: do we need to spi_dev_get(spi) here? (and spi_dev_put in dnt900_remove)
+	// (or better: is there some other better way to get the spi_device from the driver?)
 	driver->spi = spi;
 	spin_lock_init(&driver->lock);
 	INIT_LIST_HEAD(&driver->queued_packets);
