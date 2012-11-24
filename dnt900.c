@@ -63,6 +63,138 @@
 #define ATTR_W  (S_IWUSR | S_IWGRP)
 #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
 
+struct dnt900_packet {
+  struct spi_transfer transfer;
+  struct spi_message message;
+  struct list_head list;
+  struct completion completed;
+  char *result;
+  int status;
+};
+
+struct dnt900_driver {
+  struct spi_device *spi;
+
+  int major;
+  int minor;
+
+  unsigned gpio_cfg;
+  unsigned gpio_avl;
+  unsigned gpio_cts;
+
+  struct list_head queued_packets;
+  struct list_head sent_packets;
+
+  spinlock_t lock;
+
+  char buf[DRIVER_BUF_SIZE + MAX_PACKET_SIZE];
+  int head;
+  int tail;
+
+  struct dnt900_packet empty_packet;
+};
+
+struct dnt900_device {
+  struct cdev cdev;
+  int is_local;
+  unsigned int mac_address;
+  unsigned int sys_address;
+
+  struct mutex lock;
+  
+  char buf[RX_BUF_SIZE];
+  int head;
+  int tail;
+};
+
+struct dnt900_rxdata {
+  const char *buf;
+  int len;
+};
+
+struct dnt900_attribute {
+  struct device_attribute attr;
+  char bank;
+  char offset;
+  char span;
+  int (*print)(const char *value, char *buf);
+  int (*parse)(const char *buf, size_t count, char *value);
+};
+
+#define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse) { \
+  .attr = { \
+    .attr = { \
+      .name = _name, \
+      .mode = _mode \
+    }, \
+    .show = dnt900_show_attr, \
+    .store = dnt900_store_attr \
+  }, \
+  .bank = _bank, \
+  .offset = _offset, \
+  .span = _span, \
+  .print = _print, \
+  .parse = _parse \
+}
+
+static int print_bytes(int bytes, const char *value, char *buf);
+static int print_1_bytes(const char *value, char *buf);
+static int print_2_bytes(const char *value, char *buf);
+static int print_3_bytes(const char *value, char *buf);
+static int print_4_bytes(const char *value, char *buf);
+static int print_hex(int bytes, const char *value, char *buf);
+static int print_32_hex(const char *value, char *buf);
+static int print_8_ascii(const char *value, char *buf);
+static int print_16_ascii(const char *value, char *buf);
+static int print_5_macs(const char *value, char *buf);
+
+static int parse_bytes(int bytes, const char *buf, size_t count, char *value);
+static int parse_1_bytes(const char *buf, size_t count, char *value);
+static int parse_2_bytes(const char *buf, size_t count, char *value);
+static int parse_3_bytes(const char *buf, size_t count, char *value);
+static int parse_4_bytes(const char *buf, size_t count, char *value);
+static int parse_hex(int bytes, const char *buf, size_t count, char *value);
+static int parse_16_hex(const char *buf, size_t count, char *value);
+static int parse_32_hex(const char *buf, size_t count, char *value);
+static int parse_16_ascii(const char *buf, size_t count, char *value);
+
+static int dnt900_add_attributes(struct device *dev);
+static void dnt900_remove_attributes(struct device *dev);
+
+static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result);
+static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value);
+static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value);
+
+static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+
+static int dnt900_open(struct inode *inode, struct file *filp);
+static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
+static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
+
+static void dnt900_init_packet(struct dnt900_packet *packet, struct dnt900_driver *driver, unsigned len, const void *tx_buf, char *result);
+static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local);
+static int dnt900_free_dev(struct device *dev, void *unused);
+static void dnt900_free_devices(struct dnt900_driver *driver);
+
+static int dnt900_is_matching_device(struct device *dev, void *data);
+static int dnt900_dispatch_to_device(struct dnt900_driver *driver, unsigned int sys_address, void *data, int (*operation)(struct device *, void *));
+
+static int dnt900_receive_data(struct device *dev, void *data);
+static int dnt900_errno_from_txstatus(char txstatus);
+static void dnt900_send_queued_packets(struct dnt900_driver *driver);
+static void dnt900_complete_packet(void *context);
+
+static irqreturn_t dnt900_avl_handler(int irq, void *dev_id);
+static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
+static int dnt900_probe(struct spi_device *spi);
+static int dnt900_remove(struct spi_device *spi);
+
+int __init dnt900_init(void);
+void __exit dnt900_exit(void);
+
 static int members = 126;
 static int spi_hz = 80640;
 static int gpio_cfg = 25;
@@ -83,221 +215,10 @@ static const char class_name[] = "dnt900";
 static const char local_name[] = "dnt900.local";
 static const char remote_name_template[] = "dnt900.0x%06X";
 
-static struct class *dnt900_class;
-
-struct dnt900_packet {
-	struct spi_transfer transfer;
-	struct spi_message message;
-	struct list_head list;
-	struct completion completed;
-	char *result;
-	int status;
-};
-
-struct dnt900_driver {
-	struct spi_device *spi;
-
-	int major;
-	int minor;
-
-	unsigned gpio_cfg;
-	unsigned gpio_avl;
-	unsigned gpio_cts;
-
-	struct list_head queued_packets;
-	struct list_head sent_packets;
-
-	spinlock_t lock;
-
-	char buf[DRIVER_BUF_SIZE + MAX_PACKET_SIZE];
-	int head;
-	int tail;
-
-	struct dnt900_packet empty_packet;
-};
-
-struct dnt900_device {
-	struct cdev cdev;
-	int is_local;
-	unsigned int mac_address;
-	unsigned int sys_address;
-
-	struct mutex lock;
-	
-	char buf[RX_BUF_SIZE];
-	int head;
-	int tail;
-};
-
-struct dnt900_attribute {
-	struct device_attribute attr;
-	char bank;
-	char offset;
-	char span;
-	int (*print)(const char *value, char *buf);
-	int (*parse)(const char *buf, size_t count, char *value);
-};
-
-static ssize_t dnt900_show_attr(struct device *, struct device_attribute *, char *);
-static ssize_t dnt900_store_attr(struct device *, struct device_attribute *, const char *, size_t);
-static ssize_t dnt900_reset(struct device *, struct device_attribute *, const char *, size_t);
-static ssize_t dnt900_discover(struct device *, struct device_attribute *, const char *, size_t);
-
 static struct device_attribute dnt900_local_attributes[] = {
 	__ATTR(reset,	ATTR_W, NULL, dnt900_reset),
 	__ATTR(discover, ATTR_W, NULL, dnt900_discover)
 };
-
-#define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse) { \
-	.attr = { \
-		.attr = { \
-			.name = _name, \
-			.mode = _mode \
-		}, \
-		.show = dnt900_show_attr, \
-		.store = dnt900_store_attr \
-	}, \
-	.bank = _bank, \
-	.offset = _offset, \
-	.span = _span, \
-	.print = _print, \
-	.parse = _parse \
-}
-
-static int print_bytes(int bytes, const char *value, char *buf)
-{
-	int count = scnprintf(buf, PAGE_SIZE, "0x");
-	for (; bytes > 0; --bytes)
-		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", value[bytes-1]);
-	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
-	return count;
-}
-
-static int print_1_bytes(const char *value, char *buf)
-{
-	return print_bytes(1, value, buf);
-}
-
-static int print_2_bytes(const char *value, char *buf)
-{
-	return print_bytes(2, value, buf);
-}
-
-static int print_3_bytes(const char *value, char *buf)
-{
-	return print_bytes(3, value, buf);
-}
-
-static int print_4_bytes(const char *value, char *buf)
-{
-	return print_bytes(4, value, buf);
-}
-
-static int print_hex(int bytes, const char *value, char *buf)
-{
-	int count = scnprintf(buf, PAGE_SIZE, "0x");
-	for (; bytes > 0; ++value, --bytes)
-		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", *value);
-	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
-	return count;
-}
-
-static int print_32_hex(const char *value, char *buf)
-{
-	return print_hex(32, value, buf);
-}
-
-static int print_8_ascii(const char *value, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%.8s\n", value);
-}
-
-static int print_16_ascii(const char *value, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%.16s\n", value);
-}
-
-static int print_5_macs(const char *value, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE,
-		"0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X\n",
-		value[ 2], value[ 1], value[ 0],
-		value[ 5], value[ 4], value[ 3],
-		value[ 8], value[ 7], value[ 6],
-		value[11], value[10], value[ 9],
-		value[14], value[13], value[12]);
-}
-
-static int parse_bytes(int bytes, const char *buf, size_t count, char *value)
-{
-	unsigned long result;
-	int error = kstrtoul(buf, 0, &result);
-	if (error)
-		return error;
-	if (result >> (8 * bytes))
-		return -ERANGE;
-	for (; bytes > 0; --bytes, ++value, result >>= 8)
-		*value = result & 0xFF;
-	return 0;
-}
-
-static int parse_1_bytes(const char *buf, size_t count, char *value)
-{
-	return parse_bytes(1, buf, count, value);
-}
-
-static int parse_2_bytes(const char *buf, size_t count, char *value)
-{
-	return parse_bytes(2, buf, count, value);
-}
-
-static int parse_3_bytes(const char *buf, size_t count, char *value)
-{
-	return parse_bytes(3, buf, count, value);
-}
-
-static int parse_4_bytes(const char *buf, size_t count, char *value)
-{
-	return parse_bytes(4, buf, count, value);
-}
-
-static int parse_hex(int bytes, const char *buf, size_t count, char *value)
-{
-	if (bytes * 2 + 2 != count)
-		return -EINVAL;
-	if (*buf++ != '0')
-		return -EINVAL;
-	if (tolower(*buf++) != 'x')
-		return -EINVAL;
-	for (; bytes > 0; --bytes, ++value) {
-		int n;
-		for (*value = 0, n = 0; n < 2; ++n, ++buf) {
-			if (!isxdigit(*buf))
-				return -EINVAL;
-			*value <<= 4;
-			*value += isdigit(*buf) ? (*buf - '0') : (tolower(*buf) - 'a' + 10);
-		}
-	}
-	return 0;
-}
-
-static int parse_16_hex(const char *buf, size_t count, char *value)
-{
-	return parse_hex(16, buf, count, value);
-}
-
-static int parse_32_hex(const char *buf, size_t count, char *value)
-{
-	return parse_hex(32, buf, count, value);
-}
-
-static int parse_16_ascii(const char *buf, size_t count, char *value)
-{
-	int n;
-	for (n = 0; n < 16; ++n)
-		value[n] = n < count ? buf[n] : 0;
-	return 0;
-}
 
 static struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("DeviceMode",         ATTR_RW, 0x00, 0x00, 0x01, print_1_bytes, parse_1_bytes),
@@ -522,7 +443,162 @@ static struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("MemorySave",         ATTR_W,  0xFF, 0xFF, 0x01, NULL, parse_1_bytes)
 };
 
-static int dnt900_add_attributes(struct device *dev) {
+static struct class *dnt900_class;
+
+static struct file_operations dnt900_fops = {
+	.owner = THIS_MODULE,
+	.open = dnt900_open,
+	.read = dnt900_read,
+	.write = dnt900_write
+};
+
+static struct spi_driver dnt900_driver = {
+	.driver = {
+		.name = driver_name,
+		.bus = &spi_bus_type,
+		.owner = THIS_MODULE,
+	},
+	.probe = dnt900_probe,
+	.remove = __devexit_p(dnt900_remove),
+};
+
+static int print_bytes(int bytes, const char *value, char *buf)
+{
+	int count = scnprintf(buf, PAGE_SIZE, "0x");
+	for (; bytes > 0; --bytes)
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", value[bytes-1]);
+	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
+	return count;
+}
+
+static int print_1_bytes(const char *value, char *buf)
+{
+	return print_bytes(1, value, buf);
+}
+
+static int print_2_bytes(const char *value, char *buf)
+{
+	return print_bytes(2, value, buf);
+}
+
+static int print_3_bytes(const char *value, char *buf)
+{
+	return print_bytes(3, value, buf);
+}
+
+static int print_4_bytes(const char *value, char *buf)
+{
+	return print_bytes(4, value, buf);
+}
+
+static int print_hex(int bytes, const char *value, char *buf)
+{
+	int count = scnprintf(buf, PAGE_SIZE, "0x");
+	for (; bytes > 0; ++value, --bytes)
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", *value);
+	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
+	return count;
+}
+
+static int print_32_hex(const char *value, char *buf)
+{
+	return print_hex(32, value, buf);
+}
+
+static int print_8_ascii(const char *value, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%.8s\n", value);
+}
+
+static int print_16_ascii(const char *value, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%.16s\n", value);
+}
+
+static int print_5_macs(const char *value, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE,
+		"0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X 0x%02X%02X%02X\n",
+		value[ 2], value[ 1], value[ 0],
+		value[ 5], value[ 4], value[ 3],
+		value[ 8], value[ 7], value[ 6],
+		value[11], value[10], value[ 9],
+		value[14], value[13], value[12]);
+}
+
+static int parse_bytes(int bytes, const char *buf, size_t count, char *value)
+{
+	unsigned long result;
+	int error = kstrtoul(buf, 0, &result);
+	if (error)
+		return error;
+	if (result >> (8 * bytes))
+		return -ERANGE;
+	for (; bytes > 0; --bytes, ++value, result >>= 8)
+		*value = result & 0xFF;
+	return 0;
+}
+
+static int parse_1_bytes(const char *buf, size_t count, char *value)
+{
+	return parse_bytes(1, buf, count, value);
+}
+
+static int parse_2_bytes(const char *buf, size_t count, char *value)
+{
+	return parse_bytes(2, buf, count, value);
+}
+
+static int parse_3_bytes(const char *buf, size_t count, char *value)
+{
+	return parse_bytes(3, buf, count, value);
+}
+
+static int parse_4_bytes(const char *buf, size_t count, char *value)
+{
+	return parse_bytes(4, buf, count, value);
+}
+
+static int parse_hex(int bytes, const char *buf, size_t count, char *value)
+{
+	if (bytes * 2 + 2 != count)
+		return -EINVAL;
+	if (*buf++ != '0')
+		return -EINVAL;
+	if (tolower(*buf++) != 'x')
+		return -EINVAL;
+	for (; bytes > 0; --bytes, ++value) {
+		int n;
+		for (*value = 0, n = 0; n < 2; ++n, ++buf) {
+			if (!isxdigit(*buf))
+				return -EINVAL;
+			*value <<= 4;
+			*value += isdigit(*buf) ? (*buf - '0') : (tolower(*buf) - 'a' + 10);
+		}
+	}
+	return 0;
+}
+
+static int parse_16_hex(const char *buf, size_t count, char *value)
+{
+	return parse_hex(16, buf, count, value);
+}
+
+static int parse_32_hex(const char *buf, size_t count, char *value)
+{
+	return parse_hex(32, buf, count, value);
+}
+
+static int parse_16_ascii(const char *buf, size_t count, char *value)
+{
+	int n;
+	for (n = 0; n < 16; ++n)
+		value[n] = n < count ? buf[n] : 0;
+	return 0;
+}
+
+static int dnt900_add_attributes(struct device *dev)
+{
 	int n;
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n) {
@@ -539,7 +615,8 @@ static int dnt900_add_attributes(struct device *dev) {
 	return 0;
 }
 
-static void dnt900_remove_attributes(struct device *dev) {
+static void dnt900_remove_attributes(struct device *dev)
+{
 	int n;
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
@@ -549,9 +626,42 @@ static void dnt900_remove_attributes(struct device *dev) {
 			device_remove_file(dev, dnt900_local_attributes + n);
 }
 
-static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result);
-static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value);
-static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value);
+static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result)
+{
+	struct dnt900_packet packet;
+	int error;
+	unsigned long flags;
+
+	dnt900_init_packet(&packet, driver, buf[1] + 2, buf, result);
+	spin_lock_irqsave(&driver->lock, flags);
+	list_add_tail(&packet.list, &driver->queued_packets);
+	spin_unlock_irqrestore(&driver->lock, flags);
+	dnt900_send_queued_packets(driver);
+	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
+	error = wait_for_completion_interruptible(&packet.completed);
+	// TODO: remove packet from queue if interrupted
+	// TODO: implement dnt900_destroy_packet to do this...
+	return error < 0 ? error : packet.status;
+}
+
+static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value)
+{
+	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
+	// heap using kmalloc, not on the stack as here:
+	char cmd[6] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
+	return dnt900_send_command(driver, cmd, value);
+}
+
+static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value)
+{
+	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
+	// heap using kmalloc, not on the stack as here:
+	char cmd[6 + 32] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
+	int n;
+	for (n = 0; n < span; ++n)
+		cmd[6 + n] = value[n];
+	return dnt900_send_command(driver, cmd, NULL);
+}
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -585,8 +695,6 @@ static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, c
 	return count;
 }
 
-static int dnt900_alloc_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local);
-
 static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct spi_device *spi = to_spi_device(dev->parent);
@@ -606,14 +714,57 @@ static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr
 	if (false /* TODO: check that the device has not already been discovered and registered */)
 		return -EEXIST;
 		
-	error = dnt900_alloc_device(driver, mac_address, sys_address, 0);
+	error = dnt900_init_device(driver, mac_address, sys_address, 0);
 	
 	return error ? error : count;
 }
 
-static struct file_operations dnt900_fops;
+static int dnt900_open(struct inode *inode, struct file *filp)
+{
+	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
+	filp->private_data = device;
+	return 0;
+}
 
-static int dnt900_alloc_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local)
+static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
+{
+	struct dnt900_device *device = filp->private_data;
+	int available, count, copied;
+	
+	if (!mutex_trylock(&device->lock)) // TODO: use mutex_lock_interruptible?
+		return 0;
+	available = (device->head > device->tail ? device->head : RX_BUF_SIZE) - device->tail;
+	count = available > length ? length : available;
+	copied = count - copy_to_user(buf, device->buf + device->tail, count);
+	CIRC_OFFSET(device->tail, count, RX_BUF_SIZE);
+	mutex_unlock(&device->lock);
+	
+	return count && !copied ? -EFAULT : copied;
+}
+
+static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
+{
+	// struct dnt900_device *device = filp->private_data;
+	// TODO: pull a packet's worth of data from buf and send TxData message
+	return length;
+}
+
+static void dnt900_init_packet(struct dnt900_packet *packet, struct dnt900_driver *driver, unsigned len, const void *tx_buf, char *result)
+{
+	memset(packet, 0, sizeof(*packet));
+	INIT_LIST_HEAD(&packet->message.transfers);
+	packet->message.context = driver;
+	packet->message.complete = dnt900_complete_packet;
+	packet->transfer.len = len;
+	packet->transfer.tx_buf = tx_buf;
+	spi_message_add_tail(&packet->transfer, &packet->message);
+	INIT_LIST_HEAD(&packet->list);
+	init_completion(&packet->completed);
+	packet->result = result;
+	packet->status = 0;
+}
+
+static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local)
 {
 	int error = 0;
 	struct device *dev;
@@ -661,7 +812,7 @@ fail_device_alloc:
 	return error;
 }
 
-static int dnt900_free_device(struct device *dev, void *unused)
+static int dnt900_free_dev(struct device *dev, void *unused)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	cdev_del(&device->cdev);
@@ -673,22 +824,30 @@ static int dnt900_free_device(struct device *dev, void *unused)
 
 static void dnt900_free_devices(struct dnt900_driver *driver)
 {
-	device_for_each_child(&driver->spi->dev, NULL, dnt900_free_device);
+	device_for_each_child(&driver->spi->dev, NULL, dnt900_free_dev);
 }
 
-static int dnt900_device_matches_sys_address(struct device *dev, void *data)
+static int dnt900_is_matching_device(struct device *dev, void *data)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	unsigned int *sys_address = data;
 	return device->sys_address == *sys_address;
 }
 
-struct dnt900_rxdata {
-	const char *buf;
-	int len;
-};
+static int dnt900_dispatch_to_device(struct dnt900_driver *driver, unsigned int sys_address, void *data, int (*operation)(struct device *, void *))
+{
+	int error;
+	struct device *dev = device_find_child(&driver->spi->dev, &sys_address, dnt900_is_matching_device);
+	if (dev) {
+		error = operation(dev, data);
+		put_device(dev);
+	} else 
+		error = -ENODEV; // TODO: if no device is found we should probably add it!
+	return error;
+}
 
-int dnt900_receive_data(struct device *dev, void *data) {
+static int dnt900_receive_data(struct device *dev, void *data)
+{
 	struct dnt900_rxdata *rxdata = data;
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	int n;
@@ -707,36 +866,7 @@ int dnt900_receive_data(struct device *dev, void *data) {
 	return 0;
 }
 
-static int dnt900_dispatch_to_device(struct dnt900_driver *driver, unsigned int sys_address, void *data, int (*operation)(struct device *, void *))
-{
-	int error;
-	struct device *dev = device_find_child(&driver->spi->dev, &sys_address, dnt900_device_matches_sys_address);
-	if (dev) {
-		error = operation(dev, data);
-		put_device(dev);
-	} else 
-		error = -ENODEV; // TODO: if no device is found we should probably add it!
-	return error;
-}
-
-static void dnt900_complete_packet(void *);
-
-static void dnt900_init_packet(struct dnt900_packet *packet, struct dnt900_driver *driver, unsigned len, const void *tx_buf, char *result)
-{
-	memset(packet, 0, sizeof(*packet));
-	INIT_LIST_HEAD(&packet->message.transfers);
-	packet->message.context = driver;
-	packet->message.complete = dnt900_complete_packet;
-	packet->transfer.len = len;
-	packet->transfer.tx_buf = tx_buf;
-	spi_message_add_tail(&packet->transfer, &packet->message);
-	INIT_LIST_HEAD(&packet->list);
-	init_completion(&packet->completed);
-	packet->result = result;
-	packet->status = 0;
-}
-
-static int dnt900_errno_from_txstatus(char txstatus)
+static inline int dnt900_errno_from_txstatus(char txstatus)
 {
 	switch (txstatus) {
 	case STATUS_ACKNOWLEDGED:
@@ -937,80 +1067,6 @@ static void dnt900_complete_packet(void *context)
 	dnt900_send_queued_packets(driver);
 }
 
-static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result)
-{
-	struct dnt900_packet packet;
-	int error;
-	unsigned long flags;
-
-	dnt900_init_packet(&packet, driver, buf[1] + 2, buf, result);
-	spin_lock_irqsave(&driver->lock, flags);
-	list_add_tail(&packet.list, &driver->queued_packets);
-	spin_unlock_irqrestore(&driver->lock, flags);
-	dnt900_send_queued_packets(driver);
-	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-	error = wait_for_completion_interruptible(&packet.completed);
-	// TODO: remove packet from queue if interrupted
-	// TODO: implement dnt900_destroy_packet to do this...
-	return error < 0 ? error : packet.status;
-}
-
-static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value)
-{
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	char cmd[6] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
-	return dnt900_send_command(driver, cmd, value);
-}
-
-static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value)
-{
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	char cmd[6 + 32] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
-	int n;
-	for (n = 0; n < span; ++n)
-		cmd[6 + n] = value[n];
-	return dnt900_send_command(driver, cmd, NULL);
-}
-
-static int dnt900_open(struct inode *inode, struct file *filp)
-{
-	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
-	filp->private_data = device;
-	return 0;
-}
-
-static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
-{
-	struct dnt900_device *device = filp->private_data;
-	int available, count, copied;
-	
-	if (!mutex_trylock(&device->lock)) // TODO: use mutex_lock_interruptible?
-		return 0;
-	available = (device->head > device->tail ? device->head : RX_BUF_SIZE) - device->tail;
-	count = available > length ? length : available;
-	copied = count - copy_to_user(buf, device->buf + device->tail, count);
-	CIRC_OFFSET(device->tail, count, RX_BUF_SIZE);
-	mutex_unlock(&device->lock);
-	
-	return count && !copied ? -EFAULT : copied;
-}
-
-static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
-{
-	// struct dnt900_device *device = filp->private_data;
-	// TODO: pull a packet's worth of data from buf and send TxData message
-	return length;
-}
-
-static struct file_operations dnt900_fops = {
-	.owner = THIS_MODULE,
-	.open = dnt900_open,
-	.read = dnt900_read,
-	.write = dnt900_write
-};
-
 static irqreturn_t dnt900_avl_handler(int irq, void *dev_id)
 {
 	struct spi_device *spi = dev_id;
@@ -1058,7 +1114,7 @@ static int dnt900_probe(struct spi_device *spi)
 	if (error)
 		goto fail_spi_setup;
 
-	error = dnt900_alloc_device(driver, 0x000000, 0x000000, 1); // TODO: get local mac address & sys address?
+	error = dnt900_init_device(driver, 0x000000, 0x000000, 1); // TODO: get local mac address & sys address?
 	if (error)
 		goto fail_alloc_device;
 	 
@@ -1124,16 +1180,6 @@ static int dnt900_remove(struct spi_device *spi)
 	kfree(driver);
 	return 0;
 }
-
-static struct spi_driver dnt900_driver = {
-	.driver = {
-		.name = driver_name,
-		.bus = &spi_bus_type,
-		.owner = THIS_MODULE,
-	},
-	.probe = dnt900_probe,
-	.remove = __devexit_p(dnt900_remove),
-};
 
 int __init dnt900_init(void)
 {
