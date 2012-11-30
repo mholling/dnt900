@@ -25,7 +25,7 @@
 // #include <linux/fcntl.h>
 // #include <asm/system.h>
 
-#define MAX_PACKET_SIZE (258)
+#define MAX_PACKET_SIZE (2+255)
 
 // buffer sizes must be powers of 2
 #define DRIVER_BUF_SIZE (512)
@@ -64,78 +64,128 @@
 #define ATTR_W  (S_IWUSR | S_IWGRP)
 #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
 
+struct dnt900_message_header {
+	char start_of_packet;
+	char length;
+	char type;
+};
+
+struct dnt900_software_reset_message {
+	struct dnt900_message_header header;
+	char boot_select;
+};
+
+struct dnt900_get_register_message {
+	struct dnt900_message_header header;
+	char reg;
+	char bank;
+	char span;
+};
+
+struct dnt900_set_register_message {
+	struct dnt900_message_header header;
+	char reg;
+	char bank;
+	char span;
+	char value[32];
+};
+
+struct dnt900_tx_data_message {
+	struct dnt900_message_header header;
+	char sys_address[3];
+	char data[MAX_PACKET_SIZE-6];
+};
+
+struct dnt900_discover_message {
+	struct dnt900_message_header header;
+	char mac_address[3];
+};
+
+struct dnt900_get_remote_register_message {
+	struct dnt900_message_header header;
+	char sys_address[3];
+	char reg;
+	char bank;
+	char span;
+};
+
+struct dnt900_set_remote_register_message {
+	struct dnt900_message_header header;
+	char sys_address[3];
+	char reg;
+	char bank;
+	char span;
+	char value[32];
+};
+
 struct dnt900_packet {
-  struct spi_transfer transfer;
-  struct spi_message message;
-  struct list_head list;
-  struct completion completed;
-  char *result;
-  int status;
+	struct spi_transfer transfer;
+	struct spi_message message;
+	struct list_head list;
+	struct completion completed;
+	char *result;
+	int status;
+	void *payload;
 };
 
 struct dnt900_driver {
-  struct spi_device *spi;
-
-  int major;
-  int minor;
-
-  unsigned gpio_cfg;
-  unsigned gpio_avl;
-  unsigned gpio_cts;
-
-  struct list_head queued_packets;
-  struct list_head sent_packets;
-
-  spinlock_t lock;
-
-  char buf[DRIVER_BUF_SIZE + MAX_PACKET_SIZE];
-  int head;
-  int tail;
-
-  struct dnt900_packet empty_packet;
+	struct spi_device *spi;
+	int major;
+	int minor;
+	unsigned gpio_cfg;
+	unsigned gpio_avl;
+	unsigned gpio_cts;
+	struct list_head queued_packets;
+	struct list_head sent_packets;
+	spinlock_t lock;
+	char buf[DRIVER_BUF_SIZE + MAX_PACKET_SIZE];
+	int head;
+	int tail;
+	struct dnt900_packet empty_packet;
 };
 
 struct dnt900_device {
-  struct cdev cdev;
-  int is_local;
-  unsigned int mac_address;
-  unsigned int sys_address;
-
-  struct mutex lock;
-  
-  char buf[RX_BUF_SIZE];
-  int head;
-  int tail;
+	struct cdev cdev;
+	struct dnt900_driver *driver;
+	int is_local;
+	unsigned int sys_address;
+	struct mutex lock;
+	char buf[RX_BUF_SIZE];
+	int head;
+	int tail;
+	
+	unsigned int mac_address;
+	int slot_size;
 };
 
 struct dnt900_rxdata {
-  const char *buf;
-  int len;
+	const char *buf;
+	int len;
 };
 
 struct dnt900_attribute {
-  struct device_attribute attr;
-  char bank;
-  char offset;
-  char span;
-  int (*print)(const char *value, char *buf);
-  int (*parse)(const char *buf, size_t count, char *value);
+	struct device_attribute attr;
+	char bank;
+	char offset;
+	char span;
+	int (*print)(const char *value, char *buf);
+	int (*parse)(const char *buf, size_t count, char *value);
 };
 
 #define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse) { \
-  .attr = { \
-    .attr = { \
-      .name = _name, \
-      .mode = _mode \
-    }, \
-    .show = dnt900_show_attr, \
-    .store = dnt900_store_attr \
-  }, \
-  .bank = _bank, \
-  .offset = _offset, \
-  .span = _span, \
-  .print = _print, \
-  .parse = _parse \
+	.attr = { \
+		.attr = { \
+			.name = _name, \
+			.mode = _mode \
+		}, \
+		.show = dnt900_show_attr, \
+		.store = dnt900_store_attr \
+	}, \
+	.bank = _bank, \
+	.offset = _offset, \
+	.span = _span, \
+	.print = _print, \
+	.parse = _parse \
 }
 
 static int print_bytes(int bytes, const char *value, char *buf);
@@ -162,9 +212,12 @@ static int parse_16_ascii(const char *buf, size_t count, char *value);
 static int dnt900_add_attributes(struct device *dev);
 static void dnt900_remove_attributes(struct device *dev);
 
-static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result);
 static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value);
+static int dnt900_get_remote_register(struct dnt900_driver *driver, unsigned int sys_address, char bank, char offset, char span, char *value);
+static int dnt900_get_device_register(struct dnt900_device *device, char bank, char offset, char span, char *value);
 static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value);
+static int dnt900_set_remote_register(struct dnt900_driver *driver, unsigned int sys_address, char bank, char offset, char span, const char *value);
+static int dnt900_set_device_register(struct dnt900_device *device, char bank, char offset, char span, char *value);
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
@@ -175,9 +228,10 @@ static int dnt900_open(struct inode *inode, struct file *filp);
 static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
 static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
-static void dnt900_init_packet(struct dnt900_packet *packet, struct dnt900_driver *driver, unsigned len, const void *tx_buf, char *result);
+// static int dnt900_refresh_params(struct dnt900_device *device);
+
 static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local);
-static int dnt900_free_dev(struct device *dev, void *unused);
+static int dnt900_free_device(struct device *dev, void *unused);
 static void dnt900_free_devices(struct dnt900_driver *driver);
 
 static int dnt900_is_matching_device(struct device *dev, void *data);
@@ -185,6 +239,8 @@ static int dnt900_dispatch_to_device(struct dnt900_driver *driver, unsigned int 
 
 static int dnt900_receive_data(struct device *dev, void *data);
 static int dnt900_errno_from_txstatus(char txstatus);
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result);
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result);
 static void dnt900_send_queued_packets(struct dnt900_driver *driver);
 static void dnt900_complete_packet(void *context);
 
@@ -627,99 +683,151 @@ static void dnt900_remove_attributes(struct device *dev)
 			device_remove_file(dev, dnt900_local_attributes + n);
 }
 
-static int dnt900_send_command(struct dnt900_driver *driver, const char *buf, char *result)
-{
-	struct dnt900_packet packet;
-	int error;
-	unsigned long flags;
-
-	dnt900_init_packet(&packet, driver, buf[1] + 2, buf, result);
-	spin_lock_irqsave(&driver->lock, flags);
-	list_add_tail(&packet.list, &driver->queued_packets);
-	spin_unlock_irqrestore(&driver->lock, flags);
-	dnt900_send_queued_packets(driver);
-	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-	error = wait_for_completion_interruptible(&packet.completed);
-	// TODO: remove packet from queue if interrupted
-	// TODO: implement dnt900_destroy_packet to do this...
-	return error < 0 ? error : packet.status;
-}
-
 static int dnt900_get_register(struct dnt900_driver *driver, char bank, char offset, char span, char *value)
 {
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	char cmd[6] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
-	return dnt900_send_command(driver, cmd, value);
+	int error;
+	struct dnt900_get_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
+	if (!message)
+		return -ENOMEM;
+	message->bank = bank;
+	message->reg = offset;
+	message->span = span;
+	error = dnt900_send_message(driver, message, 3, COMMAND_GET_REGISTER, value);
+	kfree(message);
+	return error;
+}
+
+static int dnt900_get_remote_register(struct dnt900_driver *driver, unsigned int sys_address, char bank, char offset, char span, char *value)
+{
+	int error;
+	struct dnt900_get_remote_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
+	int byte;
+	if (!message)
+		return -ENOMEM;
+	for (byte = 0; byte < 3; ++byte, sys_address >>= 8)
+		message->sys_address[byte] = sys_address & 0xFF;
+	message->bank = bank;
+	message->reg = offset;
+	message->span = span;
+	error = dnt900_send_message(driver, message, 6, COMMAND_GET_REMOTE_REGISTER, value);
+	kfree(message);
+	return error;
+}
+
+static int dnt900_get_device_register(struct dnt900_device *device, char bank, char offset, char span, char *value)
+{
+	return device->is_local ?
+		dnt900_get_register(device->driver, bank, offset, span, value) :
+		dnt900_get_remote_register(device->driver, device->sys_address, bank, offset, span, value);;
 }
 
 static int dnt900_set_register(struct dnt900_driver *driver, char bank, char offset, char span, const char *value)
 {
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	char cmd[6 + 32] = { START_OF_PACKET, 4, COMMAND_GET_REGISTER, offset, bank, span };
-	int n;
-	for (n = 0; n < span; ++n)
-		cmd[6 + n] = value[n];
-	return dnt900_send_command(driver, cmd, NULL);
+	int error;
+	struct dnt900_set_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
+	if (!message)
+		return -ENOMEM;
+	message->bank = bank;
+	message->reg = offset;
+	message->span = span;
+	memcpy(&message->value, value, span);
+	error = dnt900_send_message(driver, message, 3 + span, COMMAND_SET_REGISTER, NULL);
+	kfree(message);
+	return error;
+}
+
+static int dnt900_set_remote_register(struct dnt900_driver *driver, unsigned int sys_address, char bank, char offset, char span, const char *value)
+{
+	int error;
+	struct dnt900_set_remote_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
+	int byte;
+	if (!message)
+		return -ENOMEM;
+	for (byte = 0; byte < 3; ++byte, sys_address >>= 8)
+		message->sys_address[byte] = sys_address & 0xFF;
+	message->bank = bank;
+	message->reg = offset;
+	message->span = span;
+	memcpy(&message->value, value, span);
+	error = dnt900_send_message(driver, message, 6 + span, COMMAND_SET_REMOTE_REGISTER, NULL);
+	kfree(message);
+	return error;
+}
+
+static int dnt900_set_device_register(struct dnt900_device *device, char bank, char offset, char span, char *value)
+{
+	return device->is_local ?
+		dnt900_set_register(device->driver, bank, offset, span, value) :
+		dnt900_set_remote_register(device->driver, device->sys_address, bank, offset, span, value);
 }
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct spi_device *spi = to_spi_device(dev->parent);
-	struct dnt900_driver *driver = spi_get_drvdata(spi);
+	struct dnt900_device *device = dev_get_drvdata(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	char value[32];
-	int error = dnt900_get_register(driver, attribute->offset, attribute->bank, attribute->span, value);
+	int error = dnt900_get_device_register(device, attribute->bank, attribute->offset, attribute->span, value);
 	return error < 0 ? error : attribute->print(value, buf);
 }
 
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct spi_device *spi = to_spi_device(dev->parent);
-	struct dnt900_driver *driver = spi_get_drvdata(spi);
+	struct dnt900_device *device = dev_get_drvdata(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	char value[32];
 	int error = attribute->parse(buf, count, value);
 	if (error)
 		return error;
-	error = dnt900_set_register(driver, attribute->offset, attribute->bank, attribute->span, value);
+	error = dnt900_set_device_register(device, attribute->bank, attribute->offset, attribute->span, value);
 	return error < 0 ? error : count;
 }
 
 static ssize_t dnt900_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	struct spi_device *spi = to_spi_device(dev->parent);
-	struct dnt900_driver *driver = spi_get_drvdata(spi);
-	char cmd[4] = { START_OF_PACKET, 2, COMMAND_SOFTWARE_RESET, 0 };
-	dnt900_send_command(driver, cmd, NULL);
-	return count;
+	int error;
+	struct dnt900_device *device = dev_get_drvdata(dev);
+	struct dnt900_software_reset_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
+	if (!message)
+		return -ENOMEM;
+	message->boot_select = 0;
+	error = dnt900_send_message(device->driver, message, 1, COMMAND_SOFTWARE_RESET, NULL);
+	kfree(message);
+	return error ? error : count;
 }
 
 static ssize_t dnt900_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct spi_device *spi = to_spi_device(dev->parent);
-	struct dnt900_driver *driver = spi_get_drvdata(spi);
+	int error;
+	char result[3];
 	unsigned int mac_address;
 	unsigned int sys_address;
-	
-	int error = kstrtouint(buf, 16, &mac_address);
+	int index;
+	struct dnt900_device *device = dev_get_drvdata(dev);
+	struct dnt900_discover_message *message;
+	error = kstrtouint(buf, 16, &mac_address);
 	if (error)
-		return -EINVAL;
+		return error;
 	if (mac_address & ~0xFFFFFF)
 		return -EINVAL;
-	if (false /* TODO: send Discover message to verify existence and set sys_address */)
-		return -ENODEV;
 	if (false /* TODO: check mac address does not correspond to the local dnt900 */)
 		return -EEXIST;
+	message = kzalloc(sizeof(*message), GFP_KERNEL);
+	if (!message)
+		return -ENOMEM;
+	for (index = 0; index < 3; ++index)
+		message->mac_address[index] = (mac_address >> 8 * index) && 0xFF;
+	error = dnt900_send_message(device->driver, message, 3, COMMAND_DISCOVER, result);
+	kfree(message);
+	if (error)
+		return -ENODEV; // TODO: check
+	for (sys_address = 0, index = 2; index >= 0; --index) {
+		sys_address <<= 8;
+		sys_address += result[index];
+	}
 	if (false /* TODO: check that the device has not already been discovered and registered */)
 		return -EEXIST;
-		
-	error = dnt900_init_device(driver, mac_address, sys_address, 0);
-	
-	return error ? error : count;
+	error = dnt900_init_device(device->driver, mac_address, sys_address, 0);
+	return error < 0 ? error : count;
 }
 
 static int dnt900_open(struct inode *inode, struct file *filp)
@@ -750,49 +858,56 @@ static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, l
 
 static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
+	int error;
 	struct dnt900_device *device = filp->private_data;
-	// TODO: cmd buffer should be DMA-safe i.e. allocated on the
-	// heap using kmalloc, not on the stack as here:
-	char cmd[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
+	struct dnt900_tx_data_message *message;
+	int byte;
+	unsigned int sys_address = device->sys_address;
+	int count, copied;
+	
 	if (device->is_local)
 		return -EPERM;
-	// TODO: pull a packet's worth of data from buf and send TxData message
-	return length;
+	message = kzalloc(sizeof(*message), GFP_KERNEL);
+	if (!message)
+		return -ENOMEM;
+	for (byte = 0; byte < 3; ++byte, sys_address >>= 8)
+		message->sys_address[byte] = sys_address & 0xFF;
+	// TODO: set device->slot_size in dnt900_init_device?
+	count = device->slot_size > length ? length : device->slot_size;
+	copied = count - copy_from_user(message->data, buf, count);
+	if (count && !copied)
+		error = -EFAULT;
+	else
+		error = dnt900_send_message(device->driver, message, 3 + copied, COMMAND_TX_DATA, NULL);
+	kfree(message);
+	*offp += copied;
+	return error < 0 ? error : copied;
 }
 
-static void dnt900_init_packet(struct dnt900_packet *packet, struct dnt900_driver *driver, unsigned len, const void *tx_buf, char *result)
-{
-	memset(packet, 0, sizeof(*packet));
-	INIT_LIST_HEAD(&packet->message.transfers);
-	packet->message.context = driver;
-	packet->message.complete = dnt900_complete_packet;
-	packet->transfer.len = len;
-	packet->transfer.tx_buf = tx_buf;
-	spi_message_add_tail(&packet->transfer, &packet->message);
-	INIT_LIST_HEAD(&packet->list);
-	init_completion(&packet->completed);
-	packet->result = result;
-	packet->status = 0;
-}
+// static int dnt900_refresh_params(struct dnt900_device *device)
+// {
+// 	dnt900_get_device_register(device, bank, offset, span, value)
+// }
 
 static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_address, unsigned int sys_address, int is_local)
 {
 	int error = 0;
 	struct device *dev;
 	dev_t devt;
-
+	
 	struct dnt900_device *device = kzalloc(sizeof(*device), GFP_KERNEL);
 	if (!device) {
 		error = -ENOMEM;
 		goto fail_device_alloc;
 	}
-
+	
+	device->driver = driver;
 	device->mac_address = mac_address;
 	device->sys_address = sys_address;
 	device->is_local = is_local;
 	
 	mutex_init(&device->lock);
-
+	
 	devt = MKDEV(driver->major, driver->minor++);
 	dev = is_local ? // TODO: make name using sprintf?
 		device_create(dnt900_class, &driver->spi->dev, devt, device, local_name) :
@@ -801,20 +916,20 @@ static int dnt900_init_device(struct dnt900_driver *driver, unsigned int mac_add
 		error = PTR_ERR(dev);
 		goto fail_device_create;
 	}
-
+	
 	error = dnt900_add_attributes(dev);
 	if (error)
 		goto fail_add_attributes;
-
+	
 	cdev_init(&device->cdev, &dnt900_fops);
 	device->cdev.owner = THIS_MODULE;
 	error = cdev_add(&device->cdev, devt, 1);
 	if (error)
 		goto fail_cdev_add;
 	// TODO: set permissions to read-only if is_local
-
+	
 	return 0;
-
+	
 fail_cdev_add:
 	dnt900_remove_attributes(dev);
 fail_add_attributes:
@@ -825,7 +940,7 @@ fail_device_alloc:
 	return error;
 }
 
-static int dnt900_free_dev(struct device *dev, void *unused)
+static int dnt900_free_device(struct device *dev, void *unused)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	cdev_del(&device->cdev);
@@ -837,7 +952,7 @@ static int dnt900_free_dev(struct device *dev, void *unused)
 
 static void dnt900_free_devices(struct dnt900_driver *driver)
 {
-	device_for_each_child(&driver->spi->dev, NULL, dnt900_free_dev);
+	device_for_each_child(&driver->spi->dev, NULL, dnt900_free_device);
 }
 
 static int dnt900_is_matching_device(struct device *dev, void *data)
@@ -893,15 +1008,51 @@ static inline int dnt900_errno_from_txstatus(char txstatus)
 	}
 }
 
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result)
+{
+	INIT_LIST_HEAD(&packet->list);
+	init_completion(&packet->completed);
+	packet->result = result;
+	packet->status = 0;
+	INIT_LIST_HEAD(&packet->message.transfers);
+	packet->message.context = driver;
+	packet->message.complete = dnt900_complete_packet;
+	packet->transfer.len = len;
+	packet->transfer.tx_buf = tx_buf;
+	spi_message_add_tail(&packet->transfer, &packet->message);
+}
+
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result)
+{
+	int error;
+	unsigned long flags;
+	struct dnt900_packet packet;
+	struct dnt900_message_header *header = payload;
+	
+	dnt900_init_packet(driver, &packet, payload, 3 + arg_length, result);
+	header->start_of_packet = START_OF_PACKET;
+	header->length = 1 + arg_length;
+	header->type = type;
+	
+	spin_lock_irqsave(&driver->lock, flags);
+	list_add_tail(&packet.list, &driver->queued_packets);
+	spin_unlock_irqrestore(&driver->lock, flags);
+	dnt900_send_queued_packets(driver);
+	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
+	error = wait_for_completion_interruptible(&packet.completed);
+	// TODO: remove packet from queue if interrupted
+	// TODO: implement dnt900_destroy_packet to do this...
+	return error < 0 ? error : packet.status;
+}
+
 static void dnt900_send_queued_packets(struct dnt900_driver *driver)
 {
 	unsigned long flags;
-
+	
+	// TODO: reduce time spent with spin lock...
 	spin_lock_irqsave(&driver->lock, flags);
-	if (gpio_get_value(driver->gpio_avl) && (list_empty(&driver->queued_packets) || gpio_get_value(driver->gpio_cts))) {
-		dnt900_init_packet(&driver->empty_packet, driver, EMPTY_PACKET_BYTES, NULL, NULL);
+	if (gpio_get_value(driver->gpio_avl) && (list_empty(&driver->queued_packets) || gpio_get_value(driver->gpio_cts)))
 		list_add(&driver->empty_packet.list, &driver->queued_packets);
-	}
 	if (!list_empty(&driver->queued_packets)) {
 		struct dnt900_packet *packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
 		// spinlock for accessing driver->head ??
@@ -1046,8 +1197,10 @@ static void dnt900_complete_packet(void *context)
 			struct dnt900_rxdata rxdata;
 			switch (type) {
 			case EVENT_RX_DATA:
-				for (sys_address = 0, offset = 5; offset > 2; sys_address <<= 8, --offset)
+				for (sys_address = 0, offset = 5; offset > 2; --offset) {
+					sys_address <<= 8;
 					sys_address += driver->buf[CIRC_INDEX(tail, offset, DRIVER_BUF_SIZE)];
+				}
 				start = CIRC_INDEX(tail,      7, DRIVER_BUF_SIZE);
 				end   = CIRC_INDEX(tail, length, DRIVER_BUF_SIZE);
 				
@@ -1063,6 +1216,7 @@ static void dnt900_complete_packet(void *context)
 				break;
 			case EVENT_ANNOUNCE:
 				// stringify the announcement and send to buffer for the local device
+				// call dnt900_refresh_params if announcement is 0xA0 (startup completed)
 				break;
 			case EVENT_RX_EVENT:
 				// ignore for now
@@ -1132,6 +1286,8 @@ static int dnt900_probe(struct spi_device *spi)
 	error = dnt900_init_device(driver, 0x000000, 0x000000, 1); // TODO: get local mac address & sys address?
 	if (error)
 		goto fail_alloc_device;
+	
+	dnt900_init_packet(driver, &driver->empty_packet, NULL, EMPTY_PACKET_BYTES, NULL);
 	 
 	driver->gpio_cfg = gpio_cfg; // how to make this per-instance?
 	driver->gpio_avl = gpio_avl; // how to make this per-instance?
