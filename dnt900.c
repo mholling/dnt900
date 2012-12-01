@@ -169,11 +169,6 @@ struct dnt900_device {
 	char slot_size;
 	char protocol_options;
 	char announce_options;
-	// SleepMode? (1)
-	// CurrNwkAddr? (1)
-	// CurrNwkID? (1)
-	// LinkStatus? (1)
-	// CurrBaseModeNetID? (1)
 };
 
 #define IS_BASE(device)   ((device)->device_mode == 1)
@@ -774,7 +769,7 @@ static struct file_operations dnt900_fops = {
 	.write = dnt900_write
 };
 
-static struct spi_driver dnt900_driver = {
+static struct spi_driver dnt900_spi_driver = {
 	.driver = {
 		.name = driver_name,
 		.bus = &spi_bus_type,
@@ -1275,14 +1270,12 @@ static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_
 static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
-	int n;
 	
 	int error = mutex_lock_interruptible(&device->lock);
 	if (error)
 		return error;
-	// TODO: can do this copy more efficiently using memcpy()
-	for (n = 0; n < rxdata->len; ++n) {
-		device->buf[device->head] = rxdata->buf[n];
+	for (; rxdata->len > 0; ++rxdata->buf, --rxdata->len) {
+		device->buf[device->head] = *rxdata->buf;
 		CIRC_OFFSET(device->head, 1, RX_BUF_SIZE);
 		if (device->head == device->tail)
 			CIRC_OFFSET(device->tail, 1, RX_BUF_SIZE);
@@ -1321,7 +1314,7 @@ static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packe
 
 static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result)
 {
-	int error;
+	int interrupted;
 	unsigned long flags;
 	struct dnt900_packet packet;
 	struct dnt900_message_header *header = payload;
@@ -1336,12 +1329,12 @@ static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int 
 	spin_unlock_irqrestore(&driver->lock, flags);
 	dnt900_send_queued_packets(driver);
 	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-	error = wait_for_completion_interruptible(&packet.completed);
-	if (error) {
+	interrupted = wait_for_completion_interruptible(&packet.completed);
+	if (interrupted) {
 		spin_lock_irqsave(&driver->lock, flags);
 		list_del(&packet.list);
 		spin_unlock_irqrestore(&driver->lock, flags);
-		return error;
+		return interrupted;
 	}
 	return packet.status;
 }
@@ -1544,9 +1537,9 @@ static irqreturn_t dnt900_avl_handler(int irq, void *dev_id)
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 {
-	// struct spi_device *spi = dev_id;
-	// struct dnt900_driver *driver = spi_get_drvdata(spi);
-	// dnt900_send_queued_packets(driver);
+	struct spi_device *spi = dev_id;
+	struct dnt900_driver *driver = spi_get_drvdata(spi);
+	dnt900_send_queued_packets(driver);
 	return IRQ_HANDLED;
 }
 
@@ -1561,9 +1554,11 @@ static int dnt900_probe(struct spi_device *spi)
 		goto fail_driver_alloc;
 	}
 	
-	// TODO: do we need to spi_dev_get(spi) here? (and spi_dev_put in dnt900_remove)
-	// (or better: is there some other better way to get the spi_device from the driver?)
-	driver->spi = spi;
+	driver->spi = spi_dev_get(spi);
+	if (!driver->spi) {
+		error = -EPERM;
+		goto fail_spi_get;
+	}
 	spin_lock_init(&driver->lock);
 	INIT_LIST_HEAD(&driver->queued_packets);
 	INIT_LIST_HEAD(&driver->sent_packets);
@@ -1630,6 +1625,8 @@ fail_gpio_cfg:
 fail_spi_setup:
 	unregister_chrdev_region(MKDEV(driver->major, 0), members);
 fail_alloc_chrdev_region:
+	spi_dev_put(spi);
+fail_spi_get:
 	kfree(driver);
 fail_driver_alloc:
 	return error;
@@ -1639,7 +1636,7 @@ static int dnt900_remove(struct spi_device *spi)
 {
 	struct dnt900_driver *driver = spi_get_drvdata(spi);
 
-	// code to sleep the dnt900 here?
+	// TODO: code to sleep the dnt900 here?
 	free_irq(gpio_to_irq(driver->gpio_avl), spi);
 	free_irq(gpio_to_irq(driver->gpio_cts), spi);
 	gpio_free(driver->gpio_cts);
@@ -1647,24 +1644,33 @@ static int dnt900_remove(struct spi_device *spi)
 	gpio_free(driver->gpio_cfg);
 	dnt900_free_devices(driver);
 	unregister_chrdev_region(MKDEV(driver->major, 0), members);
+	spi_dev_put(driver->spi);
 	kfree(driver);
 	return 0;
 }
 
 int __init dnt900_init(void)
 {
-	// TODO: error handling!
-	printk(KERN_INFO "inserting dnt900 module\n");
+	int error;
+	
 	dnt900_class = class_create(THIS_MODULE, class_name);
-	// dnt900_class->dev_attrs = dnt900_attribs;
-	spi_register_driver(&dnt900_driver);
+	if (IS_ERR(dnt900_class))
+		return PTR_ERR(dnt900_class);
+	error = spi_register_driver(&dnt900_spi_driver);
+	if (error)
+		goto fail_register;
+	printk(KERN_INFO "inserting dnt900 module\n");
 	return 0;
+	
+fail_register:
+	class_destroy(dnt900_class);
+	return error;
 }
 
 void __exit dnt900_exit(void)
 {
 	printk(KERN_INFO "removing dnt900 module\n");
-	spi_unregister_driver(&dnt900_driver);
+	spi_unregister_driver(&dnt900_spi_driver);
 	class_destroy(dnt900_class);
 }
 
