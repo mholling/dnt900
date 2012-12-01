@@ -130,7 +130,7 @@ struct dnt900_packet {
 	struct list_head list;
 	struct completion completed;
 	char *result;
-	int status;
+	int error;
 	void *payload;
 };
 
@@ -275,7 +275,6 @@ static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_ad
 static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *));
 
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
-static int dnt900_errno_from_txstatus(char txstatus);
 static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result);
 static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result);
 static void dnt900_send_queued_packets(struct dnt900_driver *driver);
@@ -1284,26 +1283,12 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 	return 0;
 }
 
-static inline int dnt900_errno_from_txstatus(char txstatus)
-{
-	switch (txstatus) {
-	case STATUS_ACKNOWLEDGED:
-		return 0;
-	case STATUS_HOLDING_FOR_FLOW:
-		return -ETIMEDOUT;
-	case STATUS_NOT_ACKNOWLEDGED:
-	case STATUS_NOT_LINKED:
-	default:
-		return -ECOMM;
-	}
-}
-
 static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result)
 {
 	INIT_LIST_HEAD(&packet->list);
 	init_completion(&packet->completed);
 	packet->result = result;
-	packet->status = 0;
+	packet->error = 0;
 	INIT_LIST_HEAD(&packet->message.transfers);
 	packet->message.context = driver;
 	packet->message.complete = dnt900_complete_packet;
@@ -1336,7 +1321,7 @@ static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int 
 		spin_unlock_irqrestore(&driver->lock, flags);
 		return interrupted;
 	}
-	return packet.status;
+	return packet.error;
 }
 
 static void dnt900_send_queued_packets(struct dnt900_driver *driver)
@@ -1380,7 +1365,7 @@ static void dnt900_complete_packet(void *context)
 		memcpy(driver->buf, buf_end, transfer_end - buf_end);
 
 	if (packet->message.status) {
-		packet->status = packet->message.status;
+		packet->error = packet->message.status;
 		complete(&packet->completed);
 	}
 
@@ -1413,11 +1398,11 @@ static void dnt900_complete_packet(void *context)
 			list_for_each_entry(packet, &driver->sent_packets, list) {
 				const char * const buf = packet->transfer.tx_buf;
 				int index;
+				char tx_status = 0;
 				if (buf[2] != command)
 					continue;
 				switch (command) {
 				case COMMAND_SOFTWARE_RESET:
-					packet->status = 0;
 					break;
 				case COMMAND_GET_REGISTER:
 					// match Reg, Bank, span:
@@ -1428,10 +1413,8 @@ static void dnt900_complete_packet(void *context)
 					// TODO: check buf[5] + 6 == length?
 					for (index = 0; index < buf[5]; ++index)
 						packet->result[index] = driver->buf[CIRC_INDEX(tail, 6 + index, DRIVER_BUF_SIZE)];
-					packet->status = 0;
 					break;
 				case COMMAND_SET_REGISTER:
-					packet->status = 0;
 					break;
 				case COMMAND_TX_DATA:
 					// match Addr:
@@ -1439,7 +1422,7 @@ static void dnt900_complete_packet(void *context)
 					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
 					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					packet->status = dnt900_errno_from_txstatus(driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)]);
+					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_DISCOVER:
 					// match MacAddr:
@@ -1447,8 +1430,8 @@ static void dnt900_complete_packet(void *context)
 					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
 					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					packet->status = dnt900_errno_from_txstatus(driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)]);
-					if (!packet->status)
+					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
+					if (tx_status == STATUS_ACKNOWLEDGED)
 						for (index = 0; index < 3; ++index)
 							packet->result[index] = driver->buf[CIRC_INDEX(tail, 7 + index, DRIVER_BUF_SIZE)];
 					break;
@@ -1466,9 +1449,9 @@ static void dnt900_complete_packet(void *context)
 							continue;
 						for (index = 0; index < buf[8]; ++index)
 							packet->result[index] = driver->buf[CIRC_INDEX(tail, 11 + index, DRIVER_BUF_SIZE)];
-						packet->status = 0;
+						tx_status = STATUS_ACKNOWLEDGED;
 					} else
-						packet->status = dnt900_errno_from_txstatus(driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)]);
+						tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_SET_REMOTE_REGISTER:
 					// match Addr:
@@ -1476,8 +1459,18 @@ static void dnt900_complete_packet(void *context)
 					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
 					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					packet->status = dnt900_errno_from_txstatus(driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)]);
+					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
 					break;
+				}
+				switch (tx_status) {
+				case STATUS_ACKNOWLEDGED:
+					packet->error = 0;
+				case STATUS_HOLDING_FOR_FLOW:
+					packet->error = -ETIMEDOUT;
+				case STATUS_NOT_ACKNOWLEDGED:
+				case STATUS_NOT_LINKED:
+				default:
+					packet->error = -ECOMM;
 				}
 				list_del(&packet->list);
 				complete(&packet->completed);
