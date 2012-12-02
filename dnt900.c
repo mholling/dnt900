@@ -59,6 +59,26 @@
 #define STATUS_NOT_LINKED       (0x02)
 #define STATUS_HOLDING_FOR_FLOW (0x03)
 
+#define ANNOUNCEMENT_STARTED       (0xA0)
+#define ANNOUNCEMENT_REMOTE_JOINED (0xA2)
+#define ANNOUNCEMENT_JOINED        (0xA3)
+#define ANNOUNCEMENT_EXITED        (0xA4)
+#define ANNOUNCEMENT_BASE_REBOOTED (0xA5)
+#define ANNOUNCEMENT_REMOTE_EXITED (0xA7)
+#define ANNOUNCEMENT_HEARTBEAT     (0xA8)
+
+#define ERROR_PROTOCOL_TYPE     (0xE0)
+#define ERROR_PROTOCOL_ARGUMENT (0xE1)
+#define ERROR_PROTOCOL_GENERAL  (0xE2)
+#define ERROR_PROTOCOL_TIMEOUT  (0xE3)
+#define ERROR_PROTOCOL_READONLY (0xE4)
+#define ERROR_UART_OVERFLOW     (0xE8)
+#define ERROR_UART_OVERRUN      (0xE9)
+#define ERROR_UART_FRAMING      (0xEA)
+#define ERROR_HARDWARE          (0xEE)
+
+#define RANGE_TO_METRES(range) (46671 * (unsigned char)(range) / 100)
+
 #define EMPTY_PACKET_BYTES (8)
 
 #define ATTR_R  (S_IRUGO)
@@ -72,7 +92,7 @@
 
 struct dnt900_message_header {
 	char start_of_packet;
-	char length;
+	unsigned char length;
 	char type;
 };
 
@@ -145,8 +165,8 @@ struct dnt900_driver {
 	struct list_head sent_packets;
 	spinlock_t lock;
 	char buf[DRIVER_BUF_SIZE + MAX_PACKET_SIZE];
-	int head;
-	int tail;
+	unsigned int head;
+	unsigned int tail;
 	struct dnt900_packet empty_packet;
 	
 	char tree_routing_en;
@@ -160,8 +180,8 @@ struct dnt900_device {
 	int is_local;
 	struct mutex lock;
 	char buf[RX_BUF_SIZE];
-	int head;
-	int tail;
+	unsigned int head;
+	unsigned int tail;
 	
 	char sys_address[3];
 	char mac_address[3];
@@ -184,7 +204,7 @@ struct dnt900_device {
 
 struct dnt900_rxdata {
 	const char *buf;
-	int len;
+	unsigned int len;
 };
 
 struct dnt900_register {
@@ -269,14 +289,16 @@ static void dnt900_free_devices(struct dnt900_driver *driver);
 
 static int dnt900_device_matches_sys_address(struct device *dev, void *data);
 static int dnt900_device_matches_mac_address(struct device *dev, void *data);
-// static int dnt900_device_is_local(struct device *dev, void *data);
+static int dnt900_device_is_local(struct device *dev, void *data);
 
 static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address);
 static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *));
 
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
-static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result);
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result);
+static int dnt900_process_announcement(struct dnt900_device *device, void *data);
+
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, char *result);
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, char *result);
 static void dnt900_send_queued_packets(struct dnt900_driver *driver);
 static void dnt900_complete_packet(void *context);
 
@@ -780,7 +802,7 @@ static struct spi_driver dnt900_spi_driver = {
 
 static int print_bytes(int bytes, const char *value, char *buf)
 {
-	int count = scnprintf(buf, PAGE_SIZE, "0x");
+	unsigned int count = scnprintf(buf, PAGE_SIZE, "0x");
 	for (; bytes > 0; --bytes)
 		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", value[bytes-1]);
 	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
@@ -1080,13 +1102,13 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 	error = kstrtouint(buf, 16, &mac_address_int);
 	if (error)
 		return error;
-	if (mac_address_int & ~0xFFFFFF)
-		return -EINVAL;
 	for (byte = 0; byte < 3; ++byte, mac_address_int >>= 8)
 		mac_address[byte] = mac_address_int & 0xFF;
+	if (mac_address_int)
+		return -EINVAL;
 	if (dnt900_device_exists(driver, mac_address))
 		return -EEXIST;
-	snprintf(name, 32, remote_name_template, mac_address[2], mac_address[1], mac_address[0]);
+	snprintf(name, ARRAY_SIZE(name), remote_name_template, mac_address[2], mac_address[1], mac_address[0]);
 	error = dnt900_alloc_device(driver, false, name);
 	return error < 0 ? error : count;
 }
@@ -1101,7 +1123,7 @@ static int dnt900_open(struct inode *inode, struct file *filp)
 static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
-	int available, count, copied;
+	unsigned int available, count, copied;
 	
 	if (!mutex_trylock(&device->lock))
 		return 0;
@@ -1122,7 +1144,7 @@ static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t le
 	int error;
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message *message;
-	int count, copied;
+	unsigned int count, copied;
 	
 	if (device->is_local)
 		return -EPERM;
@@ -1242,11 +1264,11 @@ static int dnt900_device_matches_mac_address(struct device *dev, void *data)
 	return EQUAL_ADDRESSES(device->mac_address, mac_address);
 }
 
-// static int dnt900_device_is_local(struct device *dev, void *data)
-// {
-// 	struct dnt900_device *device = dev_get_drvdata(dev);
-// 	return device->is_local;
-// }
+static int dnt900_device_is_local(struct device *dev, void *data)
+{
+	struct dnt900_device *device = dev_get_drvdata(dev);
+	return device->is_local;
+}
 
 static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address)
 {
@@ -1283,7 +1305,95 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 	return 0;
 }
 
-static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned len, char *result)
+static int dnt900_process_announcement(struct dnt900_device *device, void *data)
+{
+	char *annc = data;
+	char message[512];
+	struct dnt900_rxdata rxdata = { .buf = message };
+	
+	switch (annc[0]) {
+	case ANNOUNCEMENT_STARTED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"completed startup initialization\n");
+		break;
+	case ANNOUNCEMENT_REMOTE_JOINED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"radio joined:\n" \
+			"    MAC address 0x%02X%02X%02X\n" \
+			"    range %i metres\n", \
+			annc[3], annc[2], annc[1], RANGE_TO_METRES(annc[5]));
+		break;
+	case ANNOUNCEMENT_JOINED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"joined network:\n" \
+			"    network ID 0x%02X\n" \
+			"    base MAC address 0x%02X%02X%02X\n" \
+			"    range %i metres\n", \
+			annc[1], annc[4], annc[3], annc[2], RANGE_TO_METRES(annc[5]));
+		break;
+	case ANNOUNCEMENT_EXITED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"exited network:\n" \
+			"    network ID 0x%02X\n", \
+			annc[1]);
+		break;
+	case ANNOUNCEMENT_BASE_REBOOTED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"base rebooted\n");
+		break;
+	case ANNOUNCEMENT_REMOTE_EXITED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"radio exited:\n" \
+			"    MAC address 0x%02X%02X%02X\n", \
+			annc[3], annc[2], annc[1]);
+		break;
+	case ANNOUNCEMENT_HEARTBEAT:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"received radio heartbeat:\n" \
+			"    MAC address 0x%02X%02X%02X\n" \
+			"    network address 0x%02X\n" \
+			"    network ID 0x%02X\n" \
+			"    parent network ID 0x%02X\n" \
+			"    received RSSI %idBm\n" \
+			"    reported RSSI %idBm\n" \
+			"    range %i metres\n", \
+			annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], (signed char)annc[7], (signed char)annc[9], RANGE_TO_METRES(annc[10]));
+		break;
+	case ERROR_PROTOCOL_TYPE:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: invalid message type\n");
+		break;
+	case ERROR_PROTOCOL_ARGUMENT:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: invalid argument\n");
+		break;
+	case ERROR_PROTOCOL_GENERAL:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: general error\n");
+		break;
+	case ERROR_PROTOCOL_TIMEOUT:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: parser timeout\n");
+		break;
+	case ERROR_PROTOCOL_READONLY:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: register is read-only\n");
+		break;
+	case ERROR_UART_OVERFLOW:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: receive buffer overflow\n");
+		break;
+	case ERROR_UART_OVERRUN:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: receive overrun\n");
+		break;
+	case ERROR_UART_FRAMING:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: framing error\n");
+		break;
+	case ERROR_HARDWARE:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "hardware error\n");
+		break;
+	default:
+		return 0;
+	}
+	dnt900_receive_data(device, &rxdata);
+	return 0;
+}
+
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, char *result)
 {
 	INIT_LIST_HEAD(&packet->list);
 	init_completion(&packet->completed);
@@ -1297,7 +1407,7 @@ static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packe
 	spi_message_add_tail(&packet->transfer, &packet->message);
 }
 
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, int arg_length, char type, char *result)
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, char *result)
 {
 	int interrupted;
 	unsigned long flags;
@@ -1346,12 +1456,10 @@ static void dnt900_complete_packet(void *context)
 {
 	struct dnt900_driver *driver = context;
 	struct dnt900_packet *packet;
-	const int head = driver->head;
-	int tail = driver->tail;
 	char * const buf_end = driver->buf + DRIVER_BUF_SIZE;
 	char * transfer_end; // TODO: use C99!
 	unsigned long flags;
-
+	
 	spin_lock_irqsave(&driver->lock, flags);
 	packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
 	if (!packet->message.status && packet->transfer.tx_buf)
@@ -1359,41 +1467,41 @@ static void dnt900_complete_packet(void *context)
 	else
 		list_del(&packet->list);
 	spin_unlock_irqrestore(&driver->lock, flags);
-
+	
 	transfer_end = packet->transfer.rx_buf + packet->transfer.len;
 	if (transfer_end > buf_end)
 		memcpy(driver->buf, buf_end, transfer_end - buf_end);
-
+	
 	if (packet->message.status) {
 		packet->error = packet->message.status;
 		complete(&packet->completed);
 	}
-
+	
 	printk(KERN_INFO "scanning received data...\n");
-	while (head != tail) {
-		printk(KERN_INFO "[%03i]: %02x\n", tail, driver->buf[tail]);
-		CIRC_OFFSET(tail, 1, DRIVER_BUF_SIZE);
+	while (driver->head != driver->tail) {
+		printk(KERN_INFO "[%03i]: %02x\n", driver->tail, driver->buf[driver->tail]);
+		CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE);
 	}
-
-	while (head != tail) {
-		int bytes, length, type;
-
-		for (; tail != head && driver->buf[tail] != START_OF_PACKET; CIRC_OFFSET(tail, 1, DRIVER_BUF_SIZE))
+	
+	while (driver->head != driver->tail) {
+		unsigned int remaining, length;
+		char type;
+		
+		for (; driver->tail != driver->head && driver->buf[driver->tail] != START_OF_PACKET; CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE))
 			;
-
-		if (head == tail)
+		
+		if (driver->head == driver->tail)
 			break;
-
-		// bytes = (DRIVER_BUF_SIZE + head - tail) % DRIVER_BUF_SIZE;
-		bytes = CIRC_INDEX(DRIVER_BUF_SIZE - tail, head, DRIVER_BUF_SIZE);
-		length = driver->buf[CIRC_INDEX(tail, 1, DRIVER_BUF_SIZE)] + 2;
-		type = driver->buf[CIRC_INDEX(tail, 2, DRIVER_BUF_SIZE)];
-
-		if (bytes < 2 || length >= bytes)
+		
+		remaining = CIRC_INDEX(DRIVER_BUF_SIZE + driver->head - driver->tail, 0, DRIVER_BUF_SIZE);
+		length = driver->buf[CIRC_INDEX(driver->tail, 1, DRIVER_BUF_SIZE)] + 2;
+		type = driver->buf[CIRC_INDEX(driver->tail, 2, DRIVER_BUF_SIZE)];
+		
+		if (remaining < 2 || length >= remaining)
 			break;
-
+		
 		if (type & TYPE_REPLY) {
-			const int command = type & TYPE_COMMAND;
+			const char command = type & TYPE_COMMAND;
 			struct dnt900_packet *packet;
 			list_for_each_entry(packet, &driver->sent_packets, list) {
 				const char * const buf = packet->transfer.tx_buf;
@@ -1406,60 +1514,60 @@ static void dnt900_complete_packet(void *context)
 					break;
 				case COMMAND_GET_REGISTER:
 					// match Reg, Bank, span:
-					if (buf[3] != driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)])
+					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] 
+					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)])
 						continue;
 					// TODO: check buf[5] + 6 == length?
 					for (index = 0; index < buf[5]; ++index)
-						packet->result[index] = driver->buf[CIRC_INDEX(tail, 6 + index, DRIVER_BUF_SIZE)];
+						packet->result[index] = driver->buf[CIRC_INDEX(driver->tail, 6 + index, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_SET_REGISTER:
 					break;
 				case COMMAND_TX_DATA:
 					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
+					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
+					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_DISCOVER:
 					// match MacAddr:
-					if (buf[3] != driver->buf[CIRC_INDEX(tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
+					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
+					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
 					if (tx_status == STATUS_ACKNOWLEDGED)
 						for (index = 0; index < 3; ++index)
-							packet->result[index] = driver->buf[CIRC_INDEX(tail, 7 + index, DRIVER_BUF_SIZE)];
+							packet->result[index] = driver->buf[CIRC_INDEX(driver->tail, 7 + index, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_GET_REMOTE_REGISTER:
 					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
+					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					if (driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)] == STATUS_ACKNOWLEDGED) {
+					if (driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] == STATUS_ACKNOWLEDGED) {
 						// match Reg, Bank, span:
-						if (buf[6] != driver->buf[CIRC_INDEX(tail, 8, DRIVER_BUF_SIZE)] 
-						 || buf[7] != driver->buf[CIRC_INDEX(tail, 9, DRIVER_BUF_SIZE)] 
-						 || buf[8] != driver->buf[CIRC_INDEX(tail, 10, DRIVER_BUF_SIZE)])
+						if (buf[6] != driver->buf[CIRC_INDEX(driver->tail, 8, DRIVER_BUF_SIZE)] 
+						 || buf[7] != driver->buf[CIRC_INDEX(driver->tail, 9, DRIVER_BUF_SIZE)] 
+						 || buf[8] != driver->buf[CIRC_INDEX(driver->tail, 10, DRIVER_BUF_SIZE)])
 							continue;
 						for (index = 0; index < buf[8]; ++index)
-							packet->result[index] = driver->buf[CIRC_INDEX(tail, 11 + index, DRIVER_BUF_SIZE)];
+							packet->result[index] = driver->buf[CIRC_INDEX(driver->tail, 11 + index, DRIVER_BUF_SIZE)];
 						tx_status = STATUS_ACKNOWLEDGED;
 					} else
-						tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
+						tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
 					break;
 				case COMMAND_SET_REMOTE_REGISTER:
 					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(tail, 6, DRIVER_BUF_SIZE)])
+					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
 						continue;
-					tx_status = driver->buf[CIRC_INDEX(tail, 3, DRIVER_BUF_SIZE)];
+					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
 					break;
 				}
 				switch (tx_status) {
@@ -1477,17 +1585,18 @@ static void dnt900_complete_packet(void *context)
 				break;
 			}
 		}
-
+		
 		if (type & TYPE_EVENT) {
 			char sys_address[3];
-			int offset, start, end;
+			unsigned int offset, start, end;
 			struct dnt900_rxdata rxdata;
+			char announcement[13];
 			switch (type) {
 			case EVENT_RX_DATA:
-				for (offset = 2; offset < 5; ++offset)
-					sys_address[offset - 2] = driver->buf[CIRC_INDEX(tail, offset, DRIVER_BUF_SIZE)];
-				start = CIRC_INDEX(tail,      7, DRIVER_BUF_SIZE);
-				end   = CIRC_INDEX(tail, length, DRIVER_BUF_SIZE);
+				for (offset = 3; offset < 6; ++offset)
+					sys_address[offset-3] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
+				start = CIRC_INDEX(driver->tail,      7, DRIVER_BUF_SIZE);
+				end   = CIRC_INDEX(driver->tail, length, DRIVER_BUF_SIZE);
 				
 				rxdata.buf = driver->buf + start;
 				rxdata.len = (end < start ? DRIVER_BUF_SIZE : end) - start;
@@ -1500,9 +1609,11 @@ static void dnt900_complete_packet(void *context)
 				}
 				break;
 			case EVENT_ANNOUNCE:
-				// stringify the announcement and send to buffer for the local device
-				// call dnt900_refresh_device if announcement is 0xA0 (startup completed)
-				// use dnt900_dispatch_to_device(driver, NULL, dnt900_device_is_local, ???, dnt900_log_announcement);
+				start = 3;
+				end = min(length, start + ARRAY_SIZE(announcement));
+				for (offset = start; offset < end; ++offset)
+					announcement[offset-start] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
+				dnt900_dispatch_to_device(driver, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
 				break;
 			case EVENT_RX_EVENT:
 				// ignore for now
@@ -1512,11 +1623,10 @@ static void dnt900_complete_packet(void *context)
 				break;
 			}
 		}
-
-		CIRC_OFFSET(tail, length, DRIVER_BUF_SIZE);
+		
+		CIRC_OFFSET(driver->tail, length, DRIVER_BUF_SIZE);
 	}
-
-	driver->tail = tail;
+	
 	dnt900_send_queued_packets(driver);
 }
 
@@ -1674,3 +1784,5 @@ MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("SPI driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
+
+// TODO: use dev_error() etc
