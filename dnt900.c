@@ -1590,7 +1590,7 @@ static void dnt900_complete_packet(void *context)
 			char sys_address[3];
 			unsigned int offset, start, end;
 			struct dnt900_rxdata rxdata;
-			char announcement[13];
+			char announcement[11];
 			switch (type) {
 			case EVENT_RX_DATA:
 				for (offset = 3; offset < 6; ++offset)
@@ -1616,10 +1616,10 @@ static void dnt900_complete_packet(void *context)
 				dnt900_dispatch_to_device(driver, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
 				break;
 			case EVENT_RX_EVENT:
-				// ignore for now
+				// unimplemented for now
 				break;
 			case EVENT_JOIN_REQUEST:
-				// ignore for now
+				// unimplemented for now
 				break;
 			}
 		}
