@@ -1,3 +1,4 @@
+ccflags-y := -std=gnu99 -Wno-declaration-after-statement
 DRIVER = dnt900
 
 ifneq ($(KERNELRELEASE),)
