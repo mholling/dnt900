@@ -61,13 +61,14 @@
 #define STATUS_NOT_LINKED       (0x02)
 #define STATUS_HOLDING_FOR_FLOW (0x03)
 
-#define ANNOUNCEMENT_STARTED       (0xA0)
-#define ANNOUNCEMENT_REMOTE_JOINED (0xA2)
-#define ANNOUNCEMENT_JOINED        (0xA3)
-#define ANNOUNCEMENT_EXITED        (0xA4)
-#define ANNOUNCEMENT_BASE_REBOOTED (0xA5)
-#define ANNOUNCEMENT_REMOTE_EXITED (0xA7)
-#define ANNOUNCEMENT_HEARTBEAT     (0xA8)
+#define ANNOUNCEMENT_STARTED           (0xA0)
+#define ANNOUNCEMENT_REMOTE_JOINED     (0xA2)
+#define ANNOUNCEMENT_JOINED            (0xA3)
+#define ANNOUNCEMENT_EXITED            (0xA4)
+#define ANNOUNCEMENT_BASE_REBOOTED     (0xA5)
+#define ANNOUNCEMENT_REMOTE_EXITED     (0xA7)
+#define ANNOUNCEMENT_HEARTBEAT         (0xA8)
+#define ANNOUNCEMENT_HEARTBEAT_TIMEOUT (0xA9)
 
 #define ERROR_PROTOCOL_TYPE     (0xE0)
 #define ERROR_PROTOCOL_ARGUMENT (0xE1)
@@ -189,7 +190,8 @@ struct dnt900_device {
 	unsigned int head;
 	unsigned int tail;
 	
-	char sys_address[3];
+	// TODO: do we need a rw_semaphore for accessing these parameters?
+	char sys_address[3]; // only used for remotes
 	char mac_address[3];
 	char device_mode;
 	char slot_size;
@@ -219,8 +221,8 @@ struct dnt900_register {
 	char span;
 };
 
-struct dnt900_new_device {
-	struct work_struct work;
+struct dnt900_work {
+	struct work_struct ws;
 	char mac_address[3];
 	struct dnt900_driver *driver;
 };
@@ -293,6 +295,7 @@ static ssize_t dnt900_read(struct file *filp, char __user *buf, size_t length, l
 static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
 static int dnt900_get_device_params(struct dnt900_device *device);
+static int dnt900_get_device_sys_address(struct dnt900_device *device);
 
 static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, int is_local, const char *name);
 static int dnt900_alloc_device_remote(struct dnt900_driver *driver, const char *mac_address);
@@ -306,11 +309,16 @@ static int dnt900_device_is_local(struct device *dev, void *data);
 
 static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address);
 static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *));
+static int dnt900_dispatch_to_device_no_data(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), int (*action)(struct dnt900_device *));
 
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
 static int dnt900_process_announcement(struct dnt900_device *device, void *data);
-static void dnt900_schedule_new_device(struct dnt900_driver *driver, const char *mac_address);
-static void dnt900_add_new_device(struct work_struct *work);
+
+static void dnt900_schedule_work(struct dnt900_driver *driver, const char *mac_address, void (*work_function)(struct work_struct *));
+static void dnt900_add_new_device(struct work_struct *ws);
+static void dnt900_refresh_params(struct work_struct *ws);
+static void dnt900_refresh_sys_address(struct work_struct *ws);
 
 static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, char *result);
 static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, char *result);
@@ -1163,6 +1171,8 @@ static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t le
 	if (!message)
 		return -ENOMEM;
 	memcpy(message->sys_address, device->sys_address, 3);
+	
+	// TODO: should subtract packet header length from slot_size!
 	count = device->slot_size > length ? length : device->slot_size;
 	copied = count - copy_from_user(message->data, buf, count);
 	if (count && !copied)
@@ -1185,13 +1195,17 @@ static int dnt900_get_device_params(struct dnt900_device *device)
 	};
 	int error, index;
 	
+	// TODO: hook into sysfs writers to change these parameters too?
+	// TODO: warn if local announce_options is not full.
 	// TODO: use a mutex here?
 	for (error = 0, index = 0; !error && index < ARRAY_SIZE(params); ++index)
 		error = dnt900_get_device_register(device, params[index].reg, params[index].value);
-	if (error)
-		return error;
-	error = dnt900_discover(device->driver, device->mac_address, device->sys_address);
 	return error;
+}
+
+static int dnt900_get_device_sys_address(struct dnt900_device *device)
+{
+	return device->is_local ? 0 : dnt900_discover(device->driver, device->mac_address, device->sys_address);
 }
 
 static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, int is_local, const char *name)
@@ -1220,6 +1234,9 @@ static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_add
 	error = dnt900_get_device_params(device);
 	if (error)
 		goto fail_get_params;
+	error = dnt900_get_device_sys_address(device);
+	if (error)
+		goto fail_get_sys_address;
 	devt = MKDEV(driver->major, driver->minor++);
 	dev = device_create(dnt900_class, &driver->spi->dev, devt, device, name);
 	if (IS_ERR(dev)) {
@@ -1243,6 +1260,7 @@ fail_cdev_add:
 fail_add_attributes:
 	device_unregister(dev);
 fail_device_create:
+fail_get_sys_address:
 fail_get_params:
 	kfree(device);
 fail_device_alloc:
@@ -1313,7 +1331,20 @@ static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_
 		error = action(device, action_data);
 		put_device(dev);
 	} else 
-		error = -ENODEV; // TODO: if no device is found we should probably add it!
+		error = -ENODEV;
+	return error;
+}
+
+static int dnt900_dispatch_to_device_no_data(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), int (*action)(struct dnt900_device *))
+{
+	int error;
+	struct device *dev = device_find_child(&driver->spi->dev, finder_data, finder);
+	if (dev) {
+		struct dnt900_device *device = dev_get_drvdata(dev);
+		error = action(device);
+		put_device(dev);
+	} else 
+		error = -ENODEV;
 	return error;
 }
 
@@ -1334,32 +1365,26 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 	return 0;
 }
 
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
+{
+	const char *sys_address = data;
+	memcpy(device->sys_address, sys_address, 3);
+	return 0;
+}
+
 static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 {
 	char *annc = data;
 	char message[512];
 	struct dnt900_rxdata rxdata = { .buf = message };
+	struct dnt900_driver *driver = device->driver;
+	char sys_address[3];
 	
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
 			"completed startup initialization\n");
-		break;
-	case ANNOUNCEMENT_REMOTE_JOINED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
-			"radio joined:\n" \
-			"    MAC address 0x%02X%02X%02X\n" \
-			"    range %i metres\n", \
-			annc[3], annc[2], annc[1], RANGE_TO_METRES(annc[5]));
-		dnt900_schedule_new_device(device->driver, annc + 1);
-		// TODO: update remote sys_address as well (might have changed on reconnection)
-		// (use dnt900_discover())
-		break;
-	case ANNOUNCEMENT_REMOTE_EXITED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
-			"radio exited:\n" \
-			"    MAC address 0x%02X%02X%02X\n", \
-			annc[3], annc[2], annc[1]);
+		dnt900_schedule_work(driver, device->mac_address, dnt900_refresh_params);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
@@ -1368,14 +1393,33 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"    base MAC address 0x%02X%02X%02X\n" \
 			"    range %i metres\n", \
 			annc[1], annc[4], annc[3], annc[2], RANGE_TO_METRES(annc[5]));
-		// TODO: update local sys_address as well
-		// (use dnt900_discover())
+		if (dnt900_device_exists(driver, annc + 2))
+			dnt900_schedule_work(driver, annc + 2, dnt900_refresh_sys_address);
+		else
+			dnt900_schedule_work(driver, annc + 2, dnt900_add_new_device);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
 			"exited network:\n" \
 			"    network ID 0x%02X\n", \
 			annc[1]);
+		break;
+	case ANNOUNCEMENT_REMOTE_JOINED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"radio joined:\n" \
+			"    MAC address 0x%02X%02X%02X\n" \
+			"    range %i metres\n", \
+			annc[3], annc[2], annc[1], RANGE_TO_METRES(annc[5]));
+		if (dnt900_device_exists(driver, annc + 1))
+			dnt900_schedule_work(driver, annc + 1, dnt900_refresh_sys_address);
+		else
+			dnt900_schedule_work(driver, annc + 1, dnt900_add_new_device);
+		break;
+	case ANNOUNCEMENT_REMOTE_EXITED:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"radio exited:\n" \
+			"    MAC address 0x%02X%02X%02X\n", \
+			annc[3], annc[2], annc[1]);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
@@ -1395,9 +1439,16 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_METRES(annc[10]));
-		// TODO: update remote sys_address as well
-		// (set value from NwkAddr,NwkID,0xFF)
-		// (use mutex or rw_semaphore when accessing sys_address?)
+		sys_address[0] = annc[4];
+		sys_address[1] = annc[5];
+		sys_address[2] = 0xFF;
+		dnt900_dispatch_to_device(driver, annc + 1, dnt900_device_matches_mac_address, sys_address, dnt900_set_sys_address);
+		break;
+	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
+		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+			"router heartbeat timed out:\n" \
+			"    network ID 0x%02X\n",
+			annc[1]);
 		break;
 	case ERROR_PROTOCOL_TYPE:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: invalid message type\n");
@@ -1433,23 +1484,37 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	return 0;
 }
 
-static void dnt900_schedule_new_device(struct dnt900_driver *driver, const char *mac_address)
+static void dnt900_schedule_work(struct dnt900_driver *driver, const char *mac_address, void (*work_function)(struct work_struct *))
 {
-	struct dnt900_new_device *new_device;
+	struct dnt900_work *work;
 	if (!down_read_trylock(&driver->shutdown_lock))
 		return;
-	new_device = kmalloc(sizeof(*new_device), GFP_KERNEL);
-	memcpy(new_device->mac_address, mac_address, 3);
-	new_device->driver = driver;
-	INIT_WORK(&new_device->work, dnt900_add_new_device);
-	queue_work(driver->workqueue, &new_device->work);
+	work = kmalloc(sizeof(*work), GFP_KERNEL);
+	memcpy(work->mac_address, mac_address, 3);
+	work->driver = driver;
+	INIT_WORK(&work->ws, work_function);
+	queue_work(driver->workqueue, &work->ws);
 	up_read(&driver->shutdown_lock);
 }
 
-static void dnt900_add_new_device(struct work_struct *work)
+static void dnt900_add_new_device(struct work_struct *ws)
 {
-	struct dnt900_new_device *new_device = container_of(work, struct dnt900_new_device, work);
-	dnt900_alloc_device_remote(new_device->driver, new_device->mac_address);
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	dnt900_alloc_device_remote(work->driver, work->mac_address);
+	kfree((void *)work);
+}
+
+static void dnt900_refresh_params(struct work_struct *ws)
+{
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	dnt900_dispatch_to_device_no_data(work->driver, work->mac_address, dnt900_device_matches_mac_address, dnt900_get_device_params);
+	kfree((void *)work);
+}
+
+static void dnt900_refresh_sys_address(struct work_struct *ws)
+{
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	dnt900_dispatch_to_device_no_data(work->driver, work->mac_address, dnt900_device_matches_mac_address, dnt900_get_device_sys_address);
 	kfree((void *)work);
 }
 
@@ -1667,6 +1732,7 @@ static void dnt900_complete_packet(void *context)
 					rxdata.len = end;
 					dnt900_dispatch_to_device(driver, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
 				}
+				// TODO: add new device if it doesn't exist?
 				break;
 			case EVENT_ANNOUNCE:
 				start = 3;
