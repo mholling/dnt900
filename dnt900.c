@@ -50,7 +50,7 @@
 #define EVENT_RX_EVENT     (0x28)
 #define EVENT_JOIN_REQUEST (0x2C)
 
-#define TYPE_COMMAND (0x0F)
+#define MASK_COMMAND (0x0F)
 #define TYPE_REPLY   (0x10)
 #define TYPE_EVENT   (0x20)
 
@@ -317,21 +317,21 @@ static int dnt900_dispatch_to_device_no_data(struct dnt900_driver *driver, void 
 static int dnt900_apply_to_device(struct device *dev, void *data);
 static int dnt900_for_each_device(struct dnt900_driver *driver, int (*action)(struct dnt900_device *));
 
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, int expects_reply, char *result);
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result);
+static void dnt900_send_queued_packets(struct dnt900_driver *driver);
+static void dnt900_complete_packet(void *context);
+
+static void dnt900_process_reply(struct dnt900_driver *driver, char command);
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
-static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
+static void dnt900_process_event(struct dnt900_driver *driver, char event, unsigned int length);
 static int dnt900_process_announcement(struct dnt900_device *device, void *data);
 
 static void dnt900_schedule_work(struct dnt900_driver *driver, const char *mac_address, void (*work_function)(struct work_struct *));
 static void dnt900_add_new_device(struct work_struct *ws);
 static void dnt900_refresh_driver(struct work_struct *ws);
 static void dnt900_refresh_device(struct work_struct *ws);
-
-static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, int expects_reply, char *result);
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result);
-static void dnt900_send_queued_packets(struct dnt900_driver *driver);
-static void dnt900_complete_packet(void *context);
-
-static int dnt900_check_options(struct dnt900_driver *driver);
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
 
 static irqreturn_t dnt900_avl_handler(int irq, void *dev_id);
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
@@ -1209,18 +1209,24 @@ fail:
 
 static int dnt900_get_driver_params(struct dnt900_driver *driver)
 {
-	char device_mode, slot_size, tree_routing_en;
-	int error;
-	TRY(dnt900_check_options(driver));
+	char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en;
+	TRY(dnt900_get_register(driver, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
+	TRY(dnt900_get_register(driver, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
+	TRY(dnt900_get_register(driver, &dnt900_attributes[AuthMode].reg, &auth_mode));
+	if ((announce_options & 0x03) != 0x03)
+		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
+	if ((protocol_options & 0x05) != 0x05)
+		pr_err("set radio ProtocolOptions register to 0x05 for correct driver operation\n");
+	if (auth_mode == 0x02)
+		pr_warn("AuthMode register is set to 0x02 but host-based authentication is not supported\n");
+	TRY(dnt900_get_register(driver, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en));
+	TRY(dnt900_get_register(driver, &dnt900_attributes[DeviceMode].reg, &device_mode));
+	TRY(dnt900_get_register(driver, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
 	TRY(mutex_lock_interruptible(&driver->param_lock));
-	UNWIND(error, dnt900_get_register(driver, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en), fail);
-	UNWIND(error, dnt900_get_register(driver, &dnt900_attributes[DeviceMode].reg, &device_mode), fail);
-	UNWIND(error, dnt900_get_register(driver, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size), fail);
 	driver->slot_size = (unsigned char)slot_size;
-	driver->use_tree_routing = tree_routing_en == 1;
-fail:
+	driver->use_tree_routing = tree_routing_en == 0x01;
 	mutex_unlock(&driver->param_lock);
-	return error;
+	return 0;
 }
 
 static int dnt900_get_device_params(struct dnt900_device *device)
@@ -1374,6 +1380,244 @@ static int dnt900_for_each_device(struct dnt900_driver *driver, int (*action)(st
 	return device_for_each_child(&driver->spi->dev, action, dnt900_apply_to_device);
 }
 
+static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, int expects_reply, char *result)
+{
+	INIT_LIST_HEAD(&packet->list);
+	init_completion(&packet->completed);
+	packet->result = result;
+	packet->error = 0;
+	packet->expects_reply = expects_reply;
+	INIT_LIST_HEAD(&packet->message.transfers);
+	packet->message.context = driver;
+	packet->message.complete = dnt900_complete_packet;
+	packet->transfer.len = len;
+	packet->transfer.tx_buf = tx_buf;
+	spi_message_add_tail(&packet->transfer, &packet->message);
+}
+
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result)
+{
+	unsigned long flags;
+	struct dnt900_packet packet;
+	struct dnt900_message_header *header = payload;
+	
+	dnt900_init_packet(driver, &packet, payload, 3 + arg_length, expects_reply, result);
+	header->start_of_packet = START_OF_PACKET;
+	header->length = 1 + arg_length;
+	header->type = type;
+	
+	spin_lock_irqsave(&driver->queue_lock, flags);
+	list_add_tail(&packet.list, &driver->queued_packets);
+	spin_unlock_irqrestore(&driver->queue_lock, flags);
+	dnt900_send_queued_packets(driver);
+	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
+	int interrupted = wait_for_completion_interruptible(&packet.completed);
+	if (interrupted) {
+		spin_lock_irqsave(&driver->queue_lock, flags);
+		list_del(&packet.list);
+		spin_unlock_irqrestore(&driver->queue_lock, flags);
+		return interrupted;
+	}
+	return packet.error;
+}
+
+static void dnt900_send_queued_packets(struct dnt900_driver *driver)
+{
+	unsigned long flags;
+	
+	// TODO: reduce time spent with spin lock...
+	spin_lock_irqsave(&driver->queue_lock, flags);
+	if (gpio_get_value(driver->gpio_avl) && (list_empty(&driver->queued_packets) || gpio_get_value(driver->gpio_cts)))
+		list_add(&driver->empty_packet.list, &driver->queued_packets);
+	if (!list_empty(&driver->queued_packets)) {
+		struct dnt900_packet *packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
+		// spinlock for accessing driver->head ??
+		packet->transfer.rx_buf = driver->buf + driver->head;
+		CIRC_OFFSET(driver->head, packet->transfer.len, DRIVER_BUF_SIZE);
+		spi_async(driver->spi, &packet->message);
+	}
+	spin_unlock_irqrestore(&driver->queue_lock, flags);
+}
+
+static void dnt900_complete_packet(void *context)
+{
+	struct dnt900_driver *driver = context;
+	unsigned long flags;
+	
+	spin_lock_irqsave(&driver->queue_lock, flags);
+	struct dnt900_packet *packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
+	if (!packet->message.status && packet->transfer.tx_buf && packet->expects_reply)
+		list_move_tail(&packet->list, &driver->sent_packets);
+	else
+		list_del(&packet->list);
+	spin_unlock_irqrestore(&driver->queue_lock, flags);
+	
+	char * const buf_end = driver->buf + DRIVER_BUF_SIZE;
+	char * const transfer_end = packet->transfer.rx_buf + packet->transfer.len;
+	if (transfer_end > buf_end)
+		memcpy(driver->buf, buf_end, transfer_end - buf_end);
+	
+	if (packet->message.status || !packet->expects_reply) {
+		packet->error = packet->message.status;
+		complete(&packet->completed);
+	}
+	
+	// pr_info("scanning received data...\n");
+	// while (driver->head != driver->tail) {
+	// 	pr_info("[%03i]: %02x\n", driver->tail, driver->buf[driver->tail]);
+	// 	CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE);
+	// }
+	
+	while (driver->head != driver->tail) {
+		for (; driver->tail != driver->head && driver->buf[driver->tail] != START_OF_PACKET; CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE))
+			;
+		if (driver->head == driver->tail)
+			break;
+		
+		const unsigned int remaining = CIRC_INDEX(DRIVER_BUF_SIZE + driver->head - driver->tail, 0, DRIVER_BUF_SIZE);
+		const unsigned int length = driver->buf[CIRC_INDEX(driver->tail, 1, DRIVER_BUF_SIZE)] + 2;
+		if (remaining < 2 || length >= remaining)
+			break;
+
+		const char type = driver->buf[CIRC_INDEX(driver->tail, 2, DRIVER_BUF_SIZE)];
+		if (type & TYPE_REPLY)
+			dnt900_process_reply(driver, type & MASK_COMMAND);
+		if (type & TYPE_EVENT)
+			dnt900_process_event(driver, type, length);
+		
+		CIRC_OFFSET(driver->tail, length, DRIVER_BUF_SIZE);
+	}
+	
+	dnt900_send_queued_packets(driver);
+}
+
+static void dnt900_process_reply(struct dnt900_driver *driver, char command)
+{
+	struct dnt900_packet *packet;
+	list_for_each_entry(packet, &driver->sent_packets, list) {
+		const char * const buf = packet->transfer.tx_buf;
+		char tx_status = 0;
+		if (buf[2] != command)
+			continue;
+		switch (command) {
+		case COMMAND_SOFTWARE_RESET:
+			break;
+		case COMMAND_GET_REGISTER:
+			// match Reg, Bank, span:
+			if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] 
+			 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+			 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)])
+				continue;
+			// TODO: check buf[5] + 6 == length?
+			for (int n = 0; n < buf[5]; ++n)
+				packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 6 + n, DRIVER_BUF_SIZE)];
+			break;
+		case COMMAND_SET_REGISTER:
+			break;
+		case COMMAND_TX_DATA:
+			// match Addr:
+			if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+			 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+			 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
+				continue;
+			tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
+			break;
+		case COMMAND_DISCOVER:
+			// match MacAddr:
+			if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+			 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+			 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
+				continue;
+			tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
+			if (tx_status == STATUS_ACKNOWLEDGED)
+				for (int n = 0; n < 3; ++n)
+					packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 7 + n, DRIVER_BUF_SIZE)];
+			break;
+		case COMMAND_GET_REMOTE_REGISTER:
+			// match Addr:
+			if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+			 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+			 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
+				continue;
+			if (driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] == STATUS_ACKNOWLEDGED) {
+				// match Reg, Bank, span:
+				if (buf[6] != driver->buf[CIRC_INDEX(driver->tail, 8, DRIVER_BUF_SIZE)] 
+				 || buf[7] != driver->buf[CIRC_INDEX(driver->tail, 9, DRIVER_BUF_SIZE)] 
+				 || buf[8] != driver->buf[CIRC_INDEX(driver->tail, 10, DRIVER_BUF_SIZE)])
+					continue;
+				for (int n = 0; n < buf[8]; ++n)
+					packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 11 + n, DRIVER_BUF_SIZE)];
+				tx_status = STATUS_ACKNOWLEDGED;
+			} else
+				tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
+			break;
+		case COMMAND_SET_REMOTE_REGISTER:
+			// match Addr:
+			if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
+			 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
+			 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
+				continue;
+			tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
+			break;
+		}
+		switch (tx_status) {
+		case STATUS_ACKNOWLEDGED:
+			packet->error = 0;
+		case STATUS_HOLDING_FOR_FLOW:
+			packet->error = -ETIMEDOUT;
+		case STATUS_NOT_ACKNOWLEDGED:
+		case STATUS_NOT_LINKED:
+		default:
+			packet->error = -ECOMM;
+		}
+		list_del(&packet->list);
+		complete(&packet->completed);
+		break;
+	}
+}
+
+static void dnt900_process_event(struct dnt900_driver *driver, char event, unsigned int length)
+{
+	char sys_address[3];
+	unsigned int start, end;
+	struct dnt900_rxdata rxdata;
+	char announcement[11];
+	switch (event) {
+	case EVENT_RX_DATA:
+		for (int offset = 3; offset < 6; ++offset)
+			sys_address[offset-3] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
+		start = CIRC_INDEX(driver->tail,      7, DRIVER_BUF_SIZE);
+		end   = CIRC_INDEX(driver->tail, length, DRIVER_BUF_SIZE);
+		
+		rxdata.buf = driver->buf + start;
+		rxdata.len = (end < start ? DRIVER_BUF_SIZE : end) - start;
+		dnt900_dispatch_to_device(driver, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
+		
+		if (end < start) {
+			rxdata.buf = driver->buf;
+			rxdata.len = end;
+			dnt900_dispatch_to_device(driver, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
+		}
+		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
+		// and also do this in a workqueue job. The first packets of received data would likely
+		// be discarded.
+		break;
+	case EVENT_ANNOUNCE:
+		start = 3;
+		end = min(length, start + ARRAY_SIZE(announcement));
+		for (int offset = start; offset < end; ++offset)
+			announcement[offset-start] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
+		dnt900_dispatch_to_device(driver, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
+		break;
+	case EVENT_RX_EVENT:
+		// unimplemented for now (used for automatic I/O reporting)
+		break;
+	case EVENT_JOIN_REQUEST:
+		// unimplemented for now (used for host-based authentication)
+		break;
+	}
+}
+
 static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
@@ -1386,15 +1630,6 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 			CIRC_OFFSET(device->tail, 1, RX_BUF_SIZE);
 	}
 	mutex_unlock(&device->buf_lock);
-	return 0;
-}
-
-static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
-{
-	const char *sys_address = data;
-	TRY(mutex_lock_interruptible(&device->param_lock));
-	COPY3(device->sys_address, sys_address);
-	mutex_unlock(&device->param_lock);
 	return 0;
 }
 
@@ -1541,247 +1776,12 @@ static void dnt900_refresh_device(struct work_struct *ws)
 	kfree((void *)work);
 }
 
-static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, int expects_reply, char *result)
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
 {
-	INIT_LIST_HEAD(&packet->list);
-	init_completion(&packet->completed);
-	packet->result = result;
-	packet->error = 0;
-	packet->expects_reply = expects_reply;
-	INIT_LIST_HEAD(&packet->message.transfers);
-	packet->message.context = driver;
-	packet->message.complete = dnt900_complete_packet;
-	packet->transfer.len = len;
-	packet->transfer.tx_buf = tx_buf;
-	spi_message_add_tail(&packet->transfer, &packet->message);
-}
-
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result)
-{
-	unsigned long flags;
-	struct dnt900_packet packet;
-	struct dnt900_message_header *header = payload;
-	
-	dnt900_init_packet(driver, &packet, payload, 3 + arg_length, expects_reply, result);
-	header->start_of_packet = START_OF_PACKET;
-	header->length = 1 + arg_length;
-	header->type = type;
-	
-	spin_lock_irqsave(&driver->queue_lock, flags);
-	list_add_tail(&packet.list, &driver->queued_packets);
-	spin_unlock_irqrestore(&driver->queue_lock, flags);
-	dnt900_send_queued_packets(driver);
-	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-	int interrupted = wait_for_completion_interruptible(&packet.completed);
-	if (interrupted) {
-		spin_lock_irqsave(&driver->queue_lock, flags);
-		list_del(&packet.list);
-		spin_unlock_irqrestore(&driver->queue_lock, flags);
-		return interrupted;
-	}
-	return packet.error;
-}
-
-static void dnt900_send_queued_packets(struct dnt900_driver *driver)
-{
-	unsigned long flags;
-	
-	// TODO: reduce time spent with spin lock...
-	spin_lock_irqsave(&driver->queue_lock, flags);
-	if (gpio_get_value(driver->gpio_avl) && (list_empty(&driver->queued_packets) || gpio_get_value(driver->gpio_cts)))
-		list_add(&driver->empty_packet.list, &driver->queued_packets);
-	if (!list_empty(&driver->queued_packets)) {
-		struct dnt900_packet *packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
-		// spinlock for accessing driver->head ??
-		packet->transfer.rx_buf = driver->buf + driver->head;
-		CIRC_OFFSET(driver->head, packet->transfer.len, DRIVER_BUF_SIZE);
-		spi_async(driver->spi, &packet->message);
-	}
-	spin_unlock_irqrestore(&driver->queue_lock, flags);
-}
-
-static void dnt900_complete_packet(void *context)
-{
-	struct dnt900_driver *driver = context;
-	unsigned long flags;
-	
-	spin_lock_irqsave(&driver->queue_lock, flags);
-	struct dnt900_packet *packet = list_first_entry(&driver->queued_packets, struct dnt900_packet, list);
-	if (!packet->message.status && packet->transfer.tx_buf && packet->expects_reply)
-		list_move_tail(&packet->list, &driver->sent_packets);
-	else
-		list_del(&packet->list);
-	spin_unlock_irqrestore(&driver->queue_lock, flags);
-	
-	char * const buf_end = driver->buf + DRIVER_BUF_SIZE;
-	char * const transfer_end = packet->transfer.rx_buf + packet->transfer.len;
-	if (transfer_end > buf_end)
-		memcpy(driver->buf, buf_end, transfer_end - buf_end);
-	
-	if (packet->message.status || !packet->expects_reply) {
-		packet->error = packet->message.status;
-		complete(&packet->completed);
-	}
-	
-	// pr_info("scanning received data...\n");
-	// while (driver->head != driver->tail) {
-	// 	pr_info("[%03i]: %02x\n", driver->tail, driver->buf[driver->tail]);
-	// 	CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE);
-	// }
-	
-	while (driver->head != driver->tail) {
-		for (; driver->tail != driver->head && driver->buf[driver->tail] != START_OF_PACKET; CIRC_OFFSET(driver->tail, 1, DRIVER_BUF_SIZE))
-			;
-		if (driver->head == driver->tail)
-			break;
-		
-		unsigned int remaining = CIRC_INDEX(DRIVER_BUF_SIZE + driver->head - driver->tail, 0, DRIVER_BUF_SIZE);
-		unsigned int length = driver->buf[CIRC_INDEX(driver->tail, 1, DRIVER_BUF_SIZE)] + 2;
-		if (remaining < 2 || length >= remaining)
-			break;
-
-		const char type = driver->buf[CIRC_INDEX(driver->tail, 2, DRIVER_BUF_SIZE)];
-		if (type & TYPE_REPLY) {
-			const char command = type & TYPE_COMMAND;
-			struct dnt900_packet *packet;
-			list_for_each_entry(packet, &driver->sent_packets, list) {
-				const char * const buf = packet->transfer.tx_buf;
-				char tx_status = 0;
-				if (buf[2] != command)
-					continue;
-				switch (command) {
-				case COMMAND_SOFTWARE_RESET:
-					break;
-				case COMMAND_GET_REGISTER:
-					// match Reg, Bank, span:
-					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)])
-						continue;
-					// TODO: check buf[5] + 6 == length?
-					for (int n = 0; n < buf[5]; ++n)
-						packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 6 + n, DRIVER_BUF_SIZE)];
-					break;
-				case COMMAND_SET_REGISTER:
-					break;
-				case COMMAND_TX_DATA:
-					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
-						continue;
-					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
-					break;
-				case COMMAND_DISCOVER:
-					// match MacAddr:
-					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
-						continue;
-					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
-					if (tx_status == STATUS_ACKNOWLEDGED)
-						for (int n = 0; n < 3; ++n)
-							packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 7 + n, DRIVER_BUF_SIZE)];
-					break;
-				case COMMAND_GET_REMOTE_REGISTER:
-					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
-						continue;
-					if (driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)] == STATUS_ACKNOWLEDGED) {
-						// match Reg, Bank, span:
-						if (buf[6] != driver->buf[CIRC_INDEX(driver->tail, 8, DRIVER_BUF_SIZE)] 
-						 || buf[7] != driver->buf[CIRC_INDEX(driver->tail, 9, DRIVER_BUF_SIZE)] 
-						 || buf[8] != driver->buf[CIRC_INDEX(driver->tail, 10, DRIVER_BUF_SIZE)])
-							continue;
-						for (int n = 0; n < buf[8]; ++n)
-							packet->result[n] = driver->buf[CIRC_INDEX(driver->tail, 11 + n, DRIVER_BUF_SIZE)];
-						tx_status = STATUS_ACKNOWLEDGED;
-					} else
-						tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
-					break;
-				case COMMAND_SET_REMOTE_REGISTER:
-					// match Addr:
-					if (buf[3] != driver->buf[CIRC_INDEX(driver->tail, 4, DRIVER_BUF_SIZE)] 
-					 || buf[4] != driver->buf[CIRC_INDEX(driver->tail, 5, DRIVER_BUF_SIZE)] 
-					 || buf[5] != driver->buf[CIRC_INDEX(driver->tail, 6, DRIVER_BUF_SIZE)])
-						continue;
-					tx_status = driver->buf[CIRC_INDEX(driver->tail, 3, DRIVER_BUF_SIZE)];
-					break;
-				}
-				switch (tx_status) {
-				case STATUS_ACKNOWLEDGED:
-					packet->error = 0;
-				case STATUS_HOLDING_FOR_FLOW:
-					packet->error = -ETIMEDOUT;
-				case STATUS_NOT_ACKNOWLEDGED:
-				case STATUS_NOT_LINKED:
-				default:
-					packet->error = -ECOMM;
-				}
-				list_del(&packet->list);
-				complete(&packet->completed);
-				break;
-			}
-		}
-		
-		if (type & TYPE_EVENT) {
-			char sys_address[3];
-			unsigned int start, end;
-			struct dnt900_rxdata rxdata;
-			char announcement[11];
-			switch (type) {
-			case EVENT_RX_DATA:
-				for (int offset = 3; offset < 6; ++offset)
-					sys_address[offset-3] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
-				start = CIRC_INDEX(driver->tail,      7, DRIVER_BUF_SIZE);
-				end   = CIRC_INDEX(driver->tail, length, DRIVER_BUF_SIZE);
-				
-				rxdata.buf = driver->buf + start;
-				rxdata.len = (end < start ? DRIVER_BUF_SIZE : end) - start;
-				dnt900_dispatch_to_device(driver, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-				
-				if (end < start) {
-					rxdata.buf = driver->buf;
-					rxdata.len = end;
-					dnt900_dispatch_to_device(driver, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-				}
-				// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
-				// and also do this in a workqueue job. The first packets of received data would likely
-				// be discarded.
-				break;
-			case EVENT_ANNOUNCE:
-				start = 3;
-				end = min(length, start + ARRAY_SIZE(announcement));
-				for (int offset = start; offset < end; ++offset)
-					announcement[offset-start] = driver->buf[CIRC_INDEX(driver->tail, offset, DRIVER_BUF_SIZE)];
-				dnt900_dispatch_to_device(driver, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
-				break;
-			case EVENT_RX_EVENT:
-				// unimplemented for now
-				break;
-			case EVENT_JOIN_REQUEST:
-				// unimplemented for now
-				break;
-			}
-		}
-		
-		CIRC_OFFSET(driver->tail, length, DRIVER_BUF_SIZE);
-	}
-	
-	dnt900_send_queued_packets(driver);
-}
-
-static int dnt900_check_options(struct dnt900_driver *driver)
-{
-	char announce_options, protocol_options;
-	TRY(dnt900_get_register(driver, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
-	TRY(dnt900_get_register(driver, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
-	if ((announce_options & 0x03) != 0x03)
-		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
-	if ((protocol_options & 0x05) != 0x05)
-		pr_err("set radio ProtocolOptions register to 0x05 for correct driver operation\n");
+	const char *sys_address = data;
+	TRY(mutex_lock_interruptible(&device->param_lock));
+	COPY3(device->sys_address, sys_address);
+	mutex_unlock(&device->param_lock);
 	return 0;
 }
 
