@@ -211,14 +211,14 @@ struct dnt900_driver {
 	unsigned int tail;
 	struct dnt900_packet empty_packet;
 	struct workqueue_struct *workqueue;
-	int use_tree_routing;
+	bool use_tree_routing;
 	unsigned int slot_size;
 };
 
 struct dnt900_device {
 	struct cdev cdev;
 	struct dnt900_driver *driver;
-	int is_local;
+	bool is_local;
 	struct mutex buf_lock;
 	struct mutex param_lock;
 	char buf[RX_BUF_SIZE];
@@ -319,7 +319,7 @@ static ssize_t dnt900_write(struct file *filp, const char __user *buf, size_t le
 static int dnt900_get_driver_params(struct dnt900_driver *driver);
 static int dnt900_get_device_params(struct dnt900_device *device);
 
-static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, int is_local, const char *name);
+static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, bool is_local, const char *name);
 static int dnt900_alloc_device_remote(struct dnt900_driver *driver, const char *mac_address);
 static int dnt900_alloc_device_local(struct dnt900_driver *driver, const char *mac_address);
 static int dnt900_free_device(struct device *dev, void *unused);
@@ -329,14 +329,14 @@ static int dnt900_device_matches_sys_address(struct device *dev, void *data);
 static int dnt900_device_matches_mac_address(struct device *dev, void *data);
 static int dnt900_device_is_local(struct device *dev, void *data);
 
-static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address);
+static bool dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address);
 static int dnt900_dispatch_to_device(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *));
 static int dnt900_dispatch_to_device_no_data(struct dnt900_driver *driver, void *finder_data, int (*finder)(struct device *, void *), int (*action)(struct dnt900_device *));
 static int dnt900_apply_to_device(struct device *dev, void *data);
 static int dnt900_for_each_device(struct dnt900_driver *driver, int (*action)(struct dnt900_device *));
 
 static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packet *packet, const void *tx_buf, unsigned int len, int expects_reply, char *result);
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result);
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, bool expects_reply, char *result);
 static void dnt900_send_queued_packets(struct dnt900_driver *driver);
 static void dnt900_complete_packet(void *context);
 
@@ -1259,7 +1259,7 @@ static int dnt900_get_device_params(struct dnt900_device *device)
 	return 0;
 }
 
-static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, int is_local, const char *name)
+static int dnt900_alloc_device(struct dnt900_driver *driver, const char *mac_address, bool is_local, const char *name)
 {
 	TRY(mutex_lock_interruptible(&driver->devices_lock));
 	int error = 0;
@@ -1355,7 +1355,7 @@ static int dnt900_device_is_local(struct device *dev, void *data)
 	return device->is_local;
 }
 
-static int dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address)
+static bool dnt900_device_exists(struct dnt900_driver *driver, const char *mac_address)
 {
 	return device_for_each_child(&driver->spi->dev, (void *)mac_address, dnt900_device_matches_mac_address);
 }
@@ -1413,7 +1413,7 @@ static void dnt900_init_packet(struct dnt900_driver *driver, struct dnt900_packe
 	spi_message_add_tail(&packet->transfer, &packet->message);
 }
 
-static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, int expects_reply, char *result)
+static int dnt900_send_message(struct dnt900_driver *driver, void *payload, unsigned int arg_length, char type, bool expects_reply, char *result)
 {
 	unsigned long flags;
 	struct dnt900_packet packet;
@@ -1822,7 +1822,7 @@ static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 static int dnt900_probe(struct spi_device *spi)
 {
 	int error = 0;
-
+	
 	struct dnt900_driver *driver = kzalloc(sizeof(*driver), GFP_KERNEL);
 	if (!driver) {
 		error = -ENOMEM;
