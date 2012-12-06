@@ -19,9 +19,11 @@ clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 
 load: $(DRIVER).ko
-	sudo insmod $(DRIVER).ko
+	sudo insmod $(DRIVER).ko n_dnt900=29
+	ldattach 29 /dev/ttyAMA0
 
 unload:
+	killall ldattach
 	sudo rmmod dnt900
 
 endif
