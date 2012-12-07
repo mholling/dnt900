@@ -44,7 +44,7 @@
 #include <linux/workqueue.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
-    
+
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
 #define DEVICE_NAME "dnt900"
@@ -58,6 +58,8 @@
 
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
+
+#define TIMEOUT_MS (5000)
 
 #define START_OF_PACKET (0xFB)
 
@@ -209,6 +211,7 @@ struct dnt900_ldisc {
 	struct mutex packets_lock;
 	struct mutex devices_lock;
 	struct mutex param_lock;
+	struct mutex tty_lock;
 	struct rw_semaphore shutdown_lock;
 	char message[MAX_PACKET_SIZE];
 	unsigned int end;
@@ -304,6 +307,7 @@ static int dnt900_set_register(struct dnt900_ldisc *ldisc, const struct dnt900_r
 static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, const char *value);
 static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, char *sys_address);
 
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
 static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_address);
 static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size);
 static int dnt900_read_use_tree_routing(struct dnt900_ldisc *ldisc, bool *use_tree_routing);
@@ -351,7 +355,6 @@ static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_add
 static void dnt900_add_new_device(struct work_struct *ws);
 static void dnt900_refresh_ldisc(struct work_struct *ws);
 static void dnt900_refresh_device(struct work_struct *ws);
-static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
@@ -838,11 +841,12 @@ static struct file_operations dnt900_cdev_fops = {
 };
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
-	.magic = TTY_LDISC_MAGIC, // TODO: correct?
+	.magic = TTY_LDISC_MAGIC,
 	.name = DRIVER_NAME,
 	.open = dnt900_ldisc_open,
 	.close = dnt900_ldisc_close,
 	.receive_buf = dnt900_ldisc_receive_buf,
+
 	.owner = THIS_MODULE,
 };
 
@@ -1012,8 +1016,12 @@ static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 		gpio_set_value(ldisc->gpio_cfg, 0);
 	else {
 		char message[] = { 0, 0, 0, 'D', 'N', 'T', 'C', 'F', 'G' };
-		error = dnt900_send_message(ldisc, message, 6, COMMAND_ENTER_PROTOCOL_MODE, true, NULL);
+		error = dnt900_send_message(ldisc, message, 6, COMMAND_ENTER_PROTOCOL_MODE, false, NULL);
 	}
+	// flushing the DNT900 with zeroes seems to be needed for some reason...
+	char zeroes[1000] = { 0 };
+	ldisc->tty->ops->write(ldisc->tty, zeroes, ARRAY_SIZE(zeroes));
+	ldisc->tty->ops->flush_chars(ldisc->tty);
 	return error;
 }
 
@@ -1031,60 +1039,45 @@ static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc)
 
 static int dnt900_get_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, char *value)
 {
-	struct dnt900_get_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	message->bank = reg->bank;
-	message->reg = reg->offset;
-	message->span = reg->span;
-	int error = dnt900_send_message(ldisc, message, 3, COMMAND_GET_REGISTER, true, value);
-	kfree(message);
-	return error;
+	
+	struct dnt900_get_register_message message;
+	message.bank = reg->bank;
+	message.reg = reg->offset;
+	message.span = reg->span;
+	return dnt900_send_message(ldisc, &message, 3, COMMAND_GET_REGISTER, true, value);
 }
 
 static int dnt900_get_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, char *value)
 {
-	struct dnt900_get_remote_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	COPY3(message->sys_address, sys_address);
-	message->bank = reg->bank;
-	message->reg = reg->offset;
-	message->span = reg->span;
-	int error = dnt900_send_message(ldisc, message, 6, COMMAND_GET_REMOTE_REGISTER, true, value);
-	kfree(message);
-	return error;
+	struct dnt900_get_remote_register_message message;
+	COPY3(message.sys_address, sys_address);
+	message.bank = reg->bank;
+	message.reg = reg->offset;
+	message.span = reg->span;
+	return dnt900_send_message(ldisc, &message, 6, COMMAND_GET_REMOTE_REGISTER, true, value);
 }
 
 static int dnt900_set_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, const char *value)
 {
-	struct dnt900_set_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	message->bank = reg->bank;
-	message->reg = reg->offset;
-	message->span = reg->span;
-	memcpy(&message->value, value, reg->span);
+	struct dnt900_set_register_message message;
+	message.bank = reg->bank;
+	message.reg = reg->offset;
+	message.span = reg->span;
+	memcpy(&message.value, value, reg->span);
 	bool expects_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
-	int error = dnt900_send_message(ldisc, message, 3 + reg->span, COMMAND_SET_REGISTER, expects_reply, NULL);
-	kfree(message);
-	return error;
+	return dnt900_send_message(ldisc, &message, 3 + reg->span, COMMAND_SET_REGISTER, expects_reply, NULL);
 }
 
 static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, const char *value)
 {
-	struct dnt900_set_remote_register_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	COPY3(message->sys_address, sys_address);
-	message->bank = reg->bank;
-	message->reg = reg->offset;
-	message->span = reg->span;
-	memcpy(&message->value, value, reg->span);
+	struct dnt900_set_remote_register_message message;
+	COPY3(message.sys_address, sys_address);
+	message.bank = reg->bank;
+	message.reg = reg->offset;
+	message.span = reg->span;
+	memcpy(&message.value, value, reg->span);
 	bool expects_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
-	int error = dnt900_send_message(ldisc, message, 6 + reg->span, COMMAND_SET_REMOTE_REGISTER, expects_reply, NULL);
-	kfree(message);
-	return error;
+	return dnt900_send_message(ldisc, &message, 6 + reg->span, COMMAND_SET_REMOTE_REGISTER, expects_reply, NULL);
 }
 
 static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, char *sys_address)
@@ -1092,17 +1085,23 @@ static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, 
 	bool use_tree_routing;
 	TRY(dnt900_read_use_tree_routing(ldisc, &use_tree_routing));
 	if (use_tree_routing) {
-		struct dnt900_discover_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-		if (!message)
-			return -ENOMEM;
-		COPY3(message->mac_address, mac_address);
-		int error = dnt900_send_message(ldisc, message, 3, COMMAND_DISCOVER, true, sys_address);
-		kfree(message);
+		struct dnt900_discover_message message;
+		COPY3(message.mac_address, mac_address);
+		int error = dnt900_send_message(ldisc, &message, 3, COMMAND_DISCOVER, true, sys_address);
 		return error ? -ENODEV : 0;
 	} else {
 		COPY3(sys_address, mac_address);
 		return 0;
 	}
+}
+
+static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
+{
+	const char *sys_address = data;
+	TRY(mutex_lock_interruptible(&device->param_lock));
+	COPY3(device->sys_address, sys_address);
+	mutex_unlock(&device->param_lock);
+	return 0;
 }
 
 static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_address)
@@ -1418,6 +1417,7 @@ static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(stru
 
 static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsigned int arg_length, char type, bool expects_reply, char *result)
 {
+	int error = 0;
 	struct dnt900_packet packet;
 	struct dnt900_message_header *header = message;
 	unsigned int count = 3 + arg_length;
@@ -1431,41 +1431,45 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	header->length = 1 + arg_length;
 	header->type = type;
 	
-	if (expects_reply) {
-		TRY(mutex_lock_interruptible(&ldisc->packets_lock));
-		list_add_tail(&packet.list, &ldisc->packets);
-		mutex_unlock(&ldisc->packets_lock);
-	}
+	TRY(mutex_lock_interruptible(&ldisc->packets_lock));
+	list_add_tail(&packet.list, &ldisc->packets);
+	mutex_unlock(&ldisc->packets_lock);
+	
 	const char *buf = message;
-	while (count > 0) {
-		const int sent = ldisc->tty->driver->ops->write(ldisc->tty, buf, count);
-		count -= sent;
-		buf += sent; 
-		tty_wait_until_sent(ldisc->tty, 0);
-		if (signal_pending(current)) // TODO: ???
-			return -EINTR;
-		// alternatively, can we implement a write_wakeup()?
+	
+	// // TODO: remove
+	// pr_info("sending a message\n");
+	// for (int x = 0; x < count; ++x)
+	// 	pr_info("%02X\n", buf[x]);
+	// ///////////////
+	
+	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
+	for (int sent; count > 0; count -= sent, buf += sent) {
+		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
+		ldisc->tty->ops->flush_chars(ldisc->tty);
+		// TODO: error checking?
 	}
+	mutex_unlock(&ldisc->tty_lock);
+	
 	if (!expects_reply)
-		return 0;
-	// TODO: use wait_for_completion_interruptible_timeout to timeout if taking too long?
-	const int interrupted = wait_for_completion_interruptible(&packet.completed);
-	if (interrupted) {
-		TRY(mutex_lock_interruptible(&ldisc->packets_lock));
-		list_del(&packet.list);
-		mutex_unlock(&ldisc->packets_lock);
-		return interrupted;
-	}
+		goto exit;
+	
+	long remaining = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
+	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : 0;
+	if (error)
+		goto exit;
 	return packet.error;
+	
+exit:
+	mutex_lock(&ldisc->packets_lock); // TODO: use TRY and _interrupible?
+	list_del(&packet.list);
+	mutex_unlock(&ldisc->packets_lock);
+	return error;
 }
 
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count)
 {
 	struct dnt900_ldisc *ldisc = tty->disc_data;
-	
-	// pr_info("scanning received data...\n");
-	// for (; count > 0; --count, ++cp)
-	// 	pr_info("%02x\n", *cp);
 	
 	while (count > 0) {
 		// TODO: not testing flag bytes (fp) for now
@@ -1474,12 +1478,17 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 				;
 		for (; count > 0 && ldisc->end < 2; --count, ++cp, ++ldisc->end)
 			ldisc->message[ldisc->end] = *cp;
+		if (ldisc->end < 2)
+			break;
 		const unsigned int length = 2 + (unsigned char)ldisc->message[1];
-		if (length == 2)
-			continue;
 		for (; count > 0 && ldisc->end < length; --count, ++cp, ++ldisc->end)
 			ldisc->message[ldisc->end] = *cp;
-		if (ldisc->end == length) {
+		if (ldisc->end == length) { // TODO: need to also check length > 2?
+			// // TODO: remove
+			// pr_info("received a message\n");
+			// for (int x = 0; x < length; ++x)
+			// 	pr_info("0x%02X\n", ldisc->message[x]);
+			// ///////////////
 			const char type = ldisc->message[2];
 			if (type & TYPE_REPLY)
 				dnt900_process_reply(ldisc, type & MASK_COMMAND);
@@ -1565,8 +1574,10 @@ static void dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 		switch (tx_status) {
 		case STATUS_ACKNOWLEDGED:
 			packet->error = 0;
+			break;
 		case STATUS_HOLDING_FOR_FLOW:
 			packet->error = -ETIMEDOUT;
+			break;
 		case STATUS_NOT_ACKNOWLEDGED:
 		case STATUS_NOT_LINKED:
 		default:
@@ -1586,14 +1597,14 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 	char announcement[11];
 	switch (event) {
 	case EVENT_RX_DATA:
-		for (int offset = 3; offset < 6; ++offset)
-			sys_address[offset-3] = ldisc->message[offset];
-		rxdata.buf = ldisc->message + 6;
-		rxdata.len = ldisc->end - 6;
-		dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
-		// and also do this in a workqueue job. The first packets of received data would likely
-		// be discarded.
+		// for (int offset = 3; offset < 6; ++offset)
+		// 	sys_address[offset-3] = ldisc->message[offset];
+		// rxdata.buf = ldisc->message + 6;
+		// rxdata.len = ldisc->end - 6;
+		// dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
+		// // TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
+		// // and also do this in a workqueue job. The first packets of received data would likely
+		// // be discarded.
 		break;
 	case EVENT_ANNOUNCE:
 		for (int offset = 3; offset < ldisc->end && offset < 3 + ARRAY_SIZE(announcement); ++offset)
@@ -1604,7 +1615,7 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 		// unimplemented for now (used for automatic I/O reporting)
 		break;
 	case EVENT_JOIN_REQUEST:
-		// unimplemented for now (used for host-based authentication)
+		// unimplemented for now (use for host-based authentication)
 		break;
 	}
 }
@@ -1635,7 +1646,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	case ANNOUNCEMENT_STARTED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
 			"completed startup initialization\n");
-		dnt900_schedule_work(ldisc, device->mac_address, dnt900_refresh_ldisc);
+		dnt900_schedule_work(ldisc, NULL, dnt900_refresh_ldisc);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
@@ -1737,9 +1748,10 @@ static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_add
 {
 	if (!down_read_trylock(&ldisc->shutdown_lock))
 		return;
-	struct dnt900_work *work = kmalloc(sizeof(*work), GFP_KERNEL);
-	COPY3(work->mac_address, mac_address);
+	struct dnt900_work *work = kzalloc(sizeof(*work), GFP_KERNEL);
 	work->ldisc = ldisc;
+	if (mac_address)
+		COPY3(work->mac_address, mac_address);
 	INIT_WORK(&work->ws, work_function);
 	queue_work(ldisc->workqueue, &work->ws);
 	up_read(&ldisc->shutdown_lock);
@@ -1767,13 +1779,18 @@ static void dnt900_refresh_device(struct work_struct *ws)
 	kfree((void *)work);
 }
 
-static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
+static void dnt900_init_ldisc(struct work_struct *ws)
 {
-	const char *sys_address = data;
-	TRY(mutex_lock_interruptible(&device->param_lock));
-	COPY3(device->sys_address, sys_address);
-	mutex_unlock(&device->param_lock);
-	return 0;
+	// TODO: need to fail & close the line discipline somehow
+	// (or at least log a failure) if any of the calls below
+	// give an error (e.g. if the device is not connected)
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	dnt900_enter_protocol_mode(work->ldisc);
+	dnt900_get_ldisc_params(work->ldisc);
+	char mac_address[3];
+	dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address);
+	dnt900_alloc_device_local(work->ldisc, mac_address);
+	kfree((void *)work);
 }
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
@@ -1787,7 +1804,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 {
 	int error = 0;
 	
-	if (!tty->driver->ops->write)
+	if (!tty->ops->write || ! tty->ops->flush_chars)
 		return -EPERM;
 	
 	struct dnt900_ldisc *ldisc = kzalloc(sizeof(*ldisc), GFP_KERNEL);
@@ -1804,6 +1821,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	mutex_init(&ldisc->packets_lock);
 	mutex_init(&ldisc->devices_lock);
 	mutex_init(&ldisc->param_lock);
+	mutex_init(&ldisc->tty_lock);
 	init_rwsem(&ldisc->shutdown_lock);
 	INIT_LIST_HEAD(&ldisc->packets);
 	
@@ -1828,23 +1846,9 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 		UNWIND(error, request_irq(gpio_to_irq(ldisc->gpio_cts), dnt900_cts_handler, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, DRIVER_NAME, ldisc), fail_irq_cts);
 	}
 	
-	UNWIND(error, dnt900_enter_protocol_mode(ldisc), fail_protocol_mode);
-	UNWIND(error, dnt900_get_ldisc_params(ldisc), fail_get_params);
-
-	char local_mac_address[3];
-	UNWIND(error, dnt900_get_register(ldisc, &dnt900_attributes[MacAddress].reg, local_mac_address), fail_mac_address);
-	UNWIND(error, dnt900_alloc_device_local(ldisc, local_mac_address), fail_alloc_device);
+	dnt900_schedule_work(ldisc, NULL, dnt900_init_ldisc);
 	goto success;
 	
-fail_alloc_device:
-fail_mac_address:
-fail_get_params:
-	down_write(&ldisc->shutdown_lock);
-	dnt900_free_devices(ldisc);
-	dnt900_exit_protocol_mode(ldisc);
-fail_protocol_mode:
-	if (ldisc->gpio_cts >= 0)
-		free_irq(gpio_to_irq(ldisc->gpio_cts), ldisc);
 fail_irq_cts:
 	if (ldisc->gpio_cts >= 0)
 		gpio_free(ldisc->gpio_cts);
@@ -1917,4 +1921,3 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
-// TODO: use tty_throttle and tty_unthrotle when a device rxbuf is close to full?

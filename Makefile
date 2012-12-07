@@ -20,10 +20,10 @@ clean:
 
 load: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29
-	ldattach 29 /dev/ttyAMA0
+	ldattach --debug --eightbits --noparity --onestopbit --speed 9600 29 /dev/ttyAMA0 &
 
 unload:
-	killall ldattach
+	killall ldattach || true
 	sudo rmmod dnt900
 
 endif
