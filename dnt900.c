@@ -1,5 +1,5 @@
 /*
-    Driver for RFM DNT900 radio transceiver modules running in SPI mode.
+    Line discipline for RFM DNT900 radio transceiver modules.
     Copyright (C) 2012 Matthew Hollingworth.
 
     This program is free software: you can redistribute it and/or modify
