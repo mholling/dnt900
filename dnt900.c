@@ -47,7 +47,6 @@
 
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
-#define DEVICE_NAME "dnt900"
 
 #define LINE() pr_info("DEBUG: Passed %s %d \n",__FUNCTION__,__LINE__)
 
@@ -312,8 +311,8 @@ static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_addre
 static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size);
 static int dnt900_read_use_tree_routing(struct dnt900_ldisc *ldisc, bool *use_tree_routing);
 
-static int dnt900_get_device_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
-static int dnt900_set_device_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
+static int dnt900_device_get_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
+static int dnt900_device_set_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
@@ -324,8 +323,8 @@ static int dnt900_cdev_open(struct inode *inode, struct file *filp);
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
-static int dnt900_get_ldisc_params(struct dnt900_ldisc *ldisc);
-static int dnt900_get_device_params(struct dnt900_device *device);
+static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
+static int dnt900_device_get_params(struct dnt900_device *device);
 
 static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
 static int dnt900_alloc_device_remote(struct dnt900_ldisc *ldisc, const char *mac_address);
@@ -360,7 +359,6 @@ static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
 static int dnt900_ldisc_open(struct tty_struct *tty);
 static void dnt900_ldisc_close(struct tty_struct *tty);
-
 
 int __init dnt900_init(void);
 void __exit dnt900_exit(void);
@@ -1129,7 +1127,7 @@ static int dnt900_read_use_tree_routing(struct dnt900_ldisc *ldisc, bool *use_tr
 	return 0;
 }
 
-static int dnt900_get_device_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value)
+static int dnt900_device_get_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value)
 {
 	if (device->is_local)
 		return dnt900_get_register(device->ldisc, reg, value);
@@ -1138,7 +1136,7 @@ static int dnt900_get_device_register(struct dnt900_device *device, const struct
 	return dnt900_get_remote_register(device->ldisc, sys_address, reg, value);
 }
 
-static int dnt900_set_device_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value)
+static int dnt900_device_set_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value)
 {
 	if (device->is_local)
 		return dnt900_set_register(device->ldisc, reg, value);
@@ -1152,8 +1150,8 @@ static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *att
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	char value[32];
-	int error = dnt900_get_device_register(device, &attribute->reg, value);
-	return error < 0 ? error : attribute->print(value, buf);
+	int error = dnt900_device_get_register(device, &attribute->reg, value);
+	return error ? error : attribute->print(value, buf);
 }
 
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -1162,7 +1160,7 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	char value[32];
 	TRY(attribute->parse(buf, count, value));
-	TRY(dnt900_set_device_register(device, &attribute->reg, value));
+	TRY(dnt900_device_set_register(device, &attribute->reg, value));
 	return count;
 }
 
@@ -1242,7 +1240,7 @@ fail:
 	return error ? error : copied;
 }
 
-static int dnt900_get_ldisc_params(struct dnt900_ldisc *ldisc)
+static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
 {
 	char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en;
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
@@ -1264,7 +1262,7 @@ static int dnt900_get_ldisc_params(struct dnt900_ldisc *ldisc)
 	return 0;
 }
 
-static int dnt900_get_device_params(struct dnt900_device *device)
+static int dnt900_device_get_params(struct dnt900_device *device)
 {
 	if (device->is_local)
 		return 0;
@@ -1273,6 +1271,8 @@ static int dnt900_get_device_params(struct dnt900_device *device)
 	TRY(mutex_lock_interruptible(&device->param_lock));
 	COPY3(device->sys_address, sys_address);
 	mutex_unlock(&device->param_lock);
+	char mac_address[3];
+	TRY(dnt900_device_get_register(device, &dnt900_attributes[MacAddress].reg, mac_address));
 	return 0;
 }
 
@@ -1294,7 +1294,7 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	COPY3(device->mac_address, mac_address);
 	mutex_init(&device->buf_lock);
 	mutex_init(&device->param_lock);
-	UNWIND(error, dnt900_get_device_params(device), fail_get_params);
+	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
 	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
 	if (IS_ERR(dev)) {
@@ -1325,14 +1325,16 @@ success:
 
 static int dnt900_alloc_device_remote(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	char name[32];
-	snprintf(name, ARRAY_SIZE(name), DEVICE_NAME ".0x%02X%02X%02X", mac_address[2], mac_address[1], mac_address[0]);
+	char name[80];
+	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", ldisc->tty->name, mac_address[2], mac_address[1], mac_address[0]);
 	return dnt900_alloc_device(ldisc, mac_address, false, name);
 }
 
 static int dnt900_alloc_device_local(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	return dnt900_alloc_device(ldisc, mac_address, true, DEVICE_NAME ".local");
+	char name[80];
+	snprintf(name, ARRAY_SIZE(name), "%s.local", ldisc->tty->name);
+	return dnt900_alloc_device(ldisc, mac_address, true, name);
 }
 
 static int dnt900_free_device(struct device *dev, void *unused)
@@ -1653,7 +1655,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"joined network:\n" \
 			"    network ID 0x%02X\n" \
 			"    base MAC address 0x%02X%02X%02X\n" \
-			"    range %i metres\n", \
+			"    range %d metres\n", \
 			annc[1], annc[4], annc[3], annc[2], RANGE_TO_METRES(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 2))
 			dnt900_schedule_work(ldisc, annc + 2, dnt900_refresh_device);
@@ -1670,7 +1672,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
 			"radio joined:\n" \
 			"    MAC address 0x%02X%02X%02X\n" \
-			"    range %i metres\n", \
+			"    range %d metres\n", \
 			annc[3], annc[2], annc[1], RANGE_TO_METRES(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 1))
 			dnt900_schedule_work(ldisc, annc + 1, dnt900_refresh_device);
@@ -1694,10 +1696,10 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"    network address 0x%02X\n" \
 			"    network ID 0x%02X\n" \
 			"    parent network ID 0x%02X\n" \
-			"    received RSSI %idBm\n" \
-			"    reported RSSI %idBm\n" \
-			"    packet success rate %i%%\n" \
-			"    range %i metres\n", \
+			"    received RSSI %ddBm\n" \
+			"    reported RSSI %ddBm\n" \
+			"    packet success rate %d%%\n" \
+			"    range %d metres\n", \
 			annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_METRES(annc[10]));
@@ -1767,29 +1769,32 @@ static void dnt900_add_new_device(struct work_struct *ws)
 static void dnt900_refresh_ldisc(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_get_ldisc_params(work->ldisc);
-	dnt900_for_each_device(work->ldisc, dnt900_get_device_params);
+	dnt900_ldisc_get_params(work->ldisc);
+	dnt900_for_each_device(work->ldisc, dnt900_device_get_params);
 	kfree((void *)work);
 }
 
 static void dnt900_refresh_device(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_dispatch_to_device_no_data(work->ldisc, work->mac_address, dnt900_device_matches_mac_address, dnt900_get_device_params);
+	dnt900_dispatch_to_device_no_data(work->ldisc, work->mac_address, dnt900_device_matches_mac_address, dnt900_device_get_params);
 	kfree((void *)work);
 }
 
 static void dnt900_init_ldisc(struct work_struct *ws)
 {
-	// TODO: need to fail & close the line discipline somehow
-	// (or at least log a failure) if any of the calls below
-	// give an error (e.g. if the device is not connected)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_enter_protocol_mode(work->ldisc);
-	dnt900_get_ldisc_params(work->ldisc);
+	int error;
+	UNWIND(error, dnt900_enter_protocol_mode(work->ldisc), fail);
+	UNWIND(error, dnt900_ldisc_get_params(work->ldisc), fail);
 	char mac_address[3];
-	dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address);
-	dnt900_alloc_device_local(work->ldisc, mac_address);
+	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address), fail);
+	UNWIND(error, dnt900_alloc_device_local(work->ldisc, mac_address), fail);
+	goto success;
+	
+fail:
+	pr_err("could not connect to dnt900 module on %s (error %d)\n", work->ldisc->tty->name, -error);
+success:
 	kfree((void *)work);
 }
 
