@@ -116,7 +116,7 @@
 	address1[1] == address2[1] && \
 	address1[2] == address2[2])
 
-#define RANGE_TO_METRES(range) (46671 * (unsigned char)(range) / 100)
+#define RANGE_TO_KMS(range) (4667 * (unsigned char)(range) / 10000)
 #define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
 
 #define TRY(function_call) do { \
@@ -835,7 +835,7 @@ static struct file_operations dnt900_cdev_fops = {
 	.owner = THIS_MODULE,
 	.open = dnt900_cdev_open,
 	.read = dnt900_cdev_read,
-	.write = dnt900_cdev_write
+	.write = dnt900_cdev_write,
 };
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
@@ -1204,7 +1204,7 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 	
 	if (!mutex_trylock(&device->buf_lock))
 		return 0;
-	unsigned int available = (device->head > device->tail ? device->head : RX_BUF_SIZE) - device->tail;
+	unsigned int available = (device->head > device->tail ? device->head : device->head < device->tail ? RX_BUF_SIZE : device->tail) - device->tail;
 	unsigned int count = available > length ? length : available;
 	unsigned int copied = count - copy_to_user(buf, device->buf + device->tail, count);
 	CIRC_OFFSET(device->tail, count, RX_BUF_SIZE);
@@ -1439,12 +1439,6 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	
 	const char *buf = message;
 	
-	// // TODO: remove
-	// pr_info("sending a message\n");
-	// for (int x = 0; x < count; ++x)
-	// 	pr_info("%02X\n", buf[x]);
-	// ///////////////
-	
 	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
 	for (int sent; count > 0; count -= sent, buf += sent) {
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
@@ -1486,11 +1480,6 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 		for (; count > 0 && ldisc->end < length; --count, ++cp, ++ldisc->end)
 			ldisc->message[ldisc->end] = *cp;
 		if (ldisc->end == length) { // TODO: need to also check length > 2?
-			// // TODO: remove
-			// pr_info("received a message\n");
-			// for (int x = 0; x < length; ++x)
-			// 	pr_info("0x%02X\n", ldisc->message[x]);
-			// ///////////////
 			const char type = ldisc->message[2];
 			if (type & TYPE_REPLY)
 				dnt900_process_reply(ldisc, type & MASK_COMMAND);
@@ -1599,14 +1588,14 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 	char announcement[11];
 	switch (event) {
 	case EVENT_RX_DATA:
-		// for (int offset = 3; offset < 6; ++offset)
-		// 	sys_address[offset-3] = ldisc->message[offset];
-		// rxdata.buf = ldisc->message + 6;
-		// rxdata.len = ldisc->end - 6;
-		// dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-		// // TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
-		// // and also do this in a workqueue job. The first packets of received data would likely
-		// // be discarded.
+		for (int offset = 3; offset < 6; ++offset)
+			sys_address[offset-3] = ldisc->message[offset];
+		rxdata.buf = ldisc->message + 6;
+		rxdata.len = ldisc->end - 6;
+		dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
+		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
+		// and also do this in a workqueue job. The first packets of received data would likely
+		// be discarded.
 		break;
 	case EVENT_ANNOUNCE:
 		for (int offset = 3; offset < ldisc->end && offset < 3 + ARRAY_SIZE(announcement); ++offset)
@@ -1641,7 +1630,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 {
 	char *annc = data;
 	char message[512];
-	struct dnt900_rxdata rxdata = { .buf = message };
+	struct dnt900_rxdata rxdata = { .buf = message, .len = 0 };
 	struct dnt900_ldisc *ldisc = device->ldisc;
 	
 	switch (annc[0]) {
@@ -1655,8 +1644,8 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"joined network:\n" \
 			"    network ID 0x%02X\n" \
 			"    base MAC address 0x%02X%02X%02X\n" \
-			"    range %d metres\n", \
-			annc[1], annc[4], annc[3], annc[2], RANGE_TO_METRES(annc[5]));
+			"    range %d km\n", \
+			annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 2))
 			dnt900_schedule_work(ldisc, annc + 2, dnt900_refresh_device);
 		else
@@ -1672,8 +1661,8 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
 			"radio joined:\n" \
 			"    MAC address 0x%02X%02X%02X\n" \
-			"    range %d metres\n", \
-			annc[3], annc[2], annc[1], RANGE_TO_METRES(annc[5]));
+			"    range %d km\n", \
+			annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 1))
 			dnt900_schedule_work(ldisc, annc + 1, dnt900_refresh_device);
 		else
@@ -1699,10 +1688,10 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"    received RSSI %ddBm\n" \
 			"    reported RSSI %ddBm\n" \
 			"    packet success rate %d%%\n" \
-			"    range %d metres\n", \
+			"    range %d km\n", \
 			annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
 			(signed char)annc[7], (signed char)annc[9], \
-			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_METRES(annc[10]));
+			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
 		char sys_address[] = { annc[4], annc[5], 0xFF };
 		dnt900_dispatch_to_device(ldisc, annc + 1, dnt900_device_matches_mac_address, sys_address, dnt900_set_sys_address);
 		break;
