@@ -45,6 +45,7 @@
 #include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/semaphore.h>
+#include <linux/kfifo.h>
 
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
@@ -224,11 +225,11 @@ struct dnt900_device {
 	struct cdev cdev;
 	struct dnt900_ldisc *ldisc;
 	bool is_local;
-	struct mutex buf_lock;
 	struct mutex param_lock;
 	struct mutex read_lock;
 	struct mutex write_lock;
 	struct semaphore data_ready;
+	struct kfifo fifo;
 	char buf[RX_BUF_SIZE];
 	unsigned int head;
 	unsigned int tail;
@@ -350,9 +351,9 @@ static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(stru
 static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsigned int arg_length, char type, bool expects_reply, char *result);
 
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
-static void dnt900_process_reply(struct dnt900_ldisc *ldisc, char command);
+static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command);
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
-static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event);
+static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event);
 static int dnt900_process_announcement(struct dnt900_device *device, void *data);
 
 static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_address, void (*work_function)(struct work_struct *));
@@ -1019,6 +1020,7 @@ static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 	if (ldisc->gpio_cfg >= 0)
 		gpio_set_value(ldisc->gpio_cfg, 0);
 	else {
+		// TODO: test this case
 		char message[] = { 0, 0, 0, 'D', 'N', 'T', 'C', 'F', 'G' };
 		error = dnt900_send_message(ldisc, message, 6, COMMAND_ENTER_PROTOCOL_MODE, false, NULL);
 	}
@@ -1173,13 +1175,10 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
-	struct dnt900_software_reset_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	message->boot_select = 0;
-	int error = dnt900_send_message(device->ldisc, message, 1, COMMAND_SOFTWARE_RESET, true, NULL);
-	kfree(message);
-	return error ? error : count;
+	struct dnt900_software_reset_message message;
+	message.boot_select = 0;
+	TRY(dnt900_send_message(device->ldisc, &message, 1, COMMAND_SOFTWARE_RESET, true, NULL));
+	return count;
 }
 
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -1231,47 +1230,36 @@ static int dnt900_cdev_release(struct inode *inode, struct file *filp)
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
+	// TODO: this signaling strategy won't work if length is less than the
+	// amount of data available in the fifo. need to replace it! maybe a
+	// wait queue with condition !kfifo_is_empty(&device->fifo)
 	if (filp->f_flags & O_NONBLOCK)
 		TRY(down_trylock(&device->data_ready) == 0 ? 0 : -EAGAIN);
 	else
 		TRY(down_interruptible(&device->data_ready));
-	
-	// TODO: can we remove the buf_lock by using kfifo?
-	TRY(mutex_lock_interruptible(&device->buf_lock));
-	unsigned int available = (device->head > device->tail ? device->head : device->head < device->tail ? RX_BUF_SIZE : device->tail) - device->tail;
-	unsigned int count = available > length ? length : available;
-	unsigned int copied = count - copy_to_user(buf, device->buf + device->tail, count);
-	CIRC_OFFSET(device->tail, count, RX_BUF_SIZE);
-	mutex_unlock(&device->buf_lock);
-	
-	if (count && !copied)
-		return -EFAULT;
+	unsigned int copied;
+	TRY(kfifo_to_user(&device->fifo, buf, length, &copied));
 	*offp += copied;
 	return copied;
 }
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
-	// TODO: implement a write buffer?
-	// TODO: how to handle blocking/non-blocking here when the serial port is being overrun?
+	if (!length)
+		return length;
+	// TODO: implement a write fifo for each device? (or, per tty) if so, why?
+	// TODO: how to handle blocking/non-blocking here when the tty is being overrun?
 	struct dnt900_device *device = filp->private_data;
-	
-	struct dnt900_tx_data_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
-	if (!message)
-		return -ENOMEM;
-	unsigned int copied = 0;
-	int error;
-	UNWIND(error, dnt900_read_sys_address(device, message->sys_address), fail);
-	
+	struct dnt900_tx_data_message message;
+	TRY(dnt900_read_sys_address(device, message.sys_address));
 	unsigned int slot_size;
-	UNWIND(error, dnt900_read_slot_size(device->ldisc, &slot_size), fail);
-	unsigned int count = slot_size - 6 < length ? slot_size - 6 : length;
-	copied = count - copy_from_user(message->data, buf, count);
-	error = count && !copied ? -EFAULT : dnt900_send_message(device->ldisc, message, 3 + copied, COMMAND_TX_DATA, true, NULL);
-fail:
-	kfree(message);
-	*offp += copied;
-	return error ? error : copied;
+	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
+	unsigned long count = slot_size - 6 < length ? slot_size - 6 : length;
+	if (copy_from_user(message.data, buf, count))
+		return -EFAULT;
+	TRY(dnt900_send_message(device->ldisc, &message, 3 + count, COMMAND_TX_DATA, true, NULL));
+	*offp += count;
+	return count;
 }
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
@@ -1326,11 +1314,11 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	device->ldisc = ldisc;
 	device->is_local = is_local;
 	COPY3(device->mac_address, mac_address);
-	mutex_init(&device->buf_lock);
 	mutex_init(&device->param_lock);
 	mutex_init(&device->read_lock);
 	mutex_init(&device->write_lock);
 	sema_init(&device->data_ready, 0);
+	kfifo_init(&device->fifo, &device->buf, RX_BUF_SIZE);
 	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
 	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
@@ -1519,6 +1507,8 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 			ldisc->message[ldisc->end] = *cp;
 		if (ldisc->end == length) { // TODO: need to also check length > 2?
 			const char type = ldisc->message[2];
+			// TODO: need to process possible errors returned by
+			// dnt900_process_... below:
 			if (type & TYPE_REPLY)
 				dnt900_process_reply(ldisc, type & MASK_COMMAND);
 			if (type & TYPE_EVENT)
@@ -1528,12 +1518,11 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 	}
 }
 
-static void dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
+static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 {
-	struct dnt900_packet *packet;
-	if (mutex_lock_interruptible(&ldisc->packets_lock))
-		return;
+	TRY(mutex_lock_interruptible(&ldisc->packets_lock));
 	// TODO: do we have to hold the mutex for this whole loop?
+	struct dnt900_packet *packet;
 	list_for_each_entry(packet, &ldisc->packets, list) {
 		char tx_status = 0;
 		if (packet->message[2] != command)
@@ -1617,20 +1606,23 @@ static void dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 		break;
 	}
 	mutex_unlock(&ldisc->packets_lock);
+	return 0;
 }
 
-static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
+static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 {
 	char sys_address[3];
 	struct dnt900_rxdata rxdata;
 	char announcement[11];
+	int error = 0;
+	
 	switch (event) {
 	case EVENT_RX_DATA:
 		for (int offset = 3; offset < 6; ++offset)
 			sys_address[offset-3] = ldisc->message[offset];
 		rxdata.buf = ldisc->message + 6;
 		rxdata.len = ldisc->end - 6;
-		dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
+		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
 		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
 		// and also do this in a workqueue job. The first packets of received data would likely
 		// be discarded.
@@ -1638,7 +1630,7 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 	case EVENT_ANNOUNCE:
 		for (int offset = 3; offset < ldisc->end && offset < 3 + ARRAY_SIZE(announcement); ++offset)
 			announcement[offset-3] = ldisc->message[offset];
-		dnt900_dispatch_to_device(ldisc, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
+		error = dnt900_dispatch_to_device(ldisc, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
 		break;
 	case EVENT_RX_EVENT:
 		// unimplemented for now (used for automatic I/O reporting)
@@ -1647,30 +1639,26 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 		// unimplemented for now (use for host-based authentication)
 		break;
 	}
+	return error;
 }
 
 static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
-	if (rxdata->len <= 0)
-		return 0;
+	unsigned int copied = kfifo_in(&device->fifo, rxdata->buf, rxdata->len);
 	
-	TRY(mutex_lock_interruptible(&device->buf_lock));
-	for (; rxdata->len > 0; ++rxdata->buf, --rxdata->len) {
-		device->buf[device->head] = *rxdata->buf;
-		CIRC_OFFSET(device->head, 1, RX_BUF_SIZE);
-		if (device->head == device->tail)
-			CIRC_OFFSET(device->tail, 1, RX_BUF_SIZE);
-	}
-	mutex_unlock(&device->buf_lock);
+	// TODO: deal with full buffer! we need to throttle the dnt900 somehow
+	// (use /HOST_RTS maybe). As it stands we are potentially throwing out
+	// received data here, i.e. new data gets ditched once buffer is full.
+	// could we sleep while the buffer is full?
 	
-	// TODO: not very sure this is the correct way to signal new data.
-	// other options: wait queue, producer/consumer using two semaphores.
+	// TODO: pretty sure this isn't the best way to signal new data.
+	// other options: wait queue, producer/consumer using two semaphores?
 	
 	do { } while (!down_trylock(&device->data_ready));
 	up(&device->data_ready);
 	
-	return 0;
+	return 0; // TODO: or some error code?
 }
 
 static int dnt900_process_announcement(struct dnt900_device *device, void *data)
@@ -1740,7 +1728,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
 		char sys_address[] = { annc[4], annc[5], 0xFF };
-		dnt900_dispatch_to_device(ldisc, annc + 1, dnt900_device_matches_mac_address, sys_address, dnt900_set_sys_address);
+		TRY(dnt900_dispatch_to_device(ldisc, annc + 1, dnt900_device_matches_mac_address, sys_address, dnt900_set_sys_address));
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
@@ -1778,8 +1766,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	default:
 		return 0;
 	}
-	dnt900_receive_data(device, &rxdata);
-	return 0;
+	return dnt900_receive_data(device, &rxdata);
 }
 
 static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_address, void (*work_function)(struct work_struct *))
@@ -1962,3 +1949,4 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
+// TODO: fix error where module unloading breaks if any of the char devices are still open
