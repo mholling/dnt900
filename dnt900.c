@@ -44,6 +44,7 @@
 #include <linux/workqueue.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
+#include <linux/semaphore.h>
 
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
@@ -120,13 +121,13 @@
 #define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
 
 #define TRY(function_call) do { \
-	int error = function_call; \
+	int error = (function_call); \
 	if (error) \
 		return error; \
 } while (0)
 	
 #define UNWIND(error, function_call, exit) do { \
-	error = function_call; \
+	error = (function_call); \
 	if (error) \
 		goto exit; \
 } while (0)
@@ -225,6 +226,9 @@ struct dnt900_device {
 	bool is_local;
 	struct mutex buf_lock;
 	struct mutex param_lock;
+	struct mutex read_lock;
+	struct mutex write_lock;
+	struct semaphore data_ready;
 	char buf[RX_BUF_SIZE];
 	unsigned int head;
 	unsigned int tail;
@@ -320,6 +324,7 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static int dnt900_cdev_open(struct inode *inode, struct file *filp);
+static int dnt900_cdev_release(struct inode *inode, struct file *filp);
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
@@ -834,6 +839,7 @@ static struct class *dnt900_class;
 static struct file_operations dnt900_cdev_fops = {
 	.owner = THIS_MODULE,
 	.open = dnt900_cdev_open,
+	.release = dnt900_cdev_release,
 	.read = dnt900_cdev_read,
 	.write = dnt900_cdev_write,
 };
@@ -1194,16 +1200,44 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 {
 	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
+	int error = 0;
+	
+	if (device->is_local && (filp->f_mode & FMODE_WRITE))
+		return -EPERM;
+	if (filp->f_mode & FMODE_READ)
+		UNWIND(error, !mutex_trylock(&device->read_lock), fail_lock_read);
+	if (filp->f_mode & FMODE_WRITE)
+		UNWIND(error, !mutex_trylock(&device->write_lock), fail_lock_write);
 	filp->private_data = device;
+	return 0;
+	
+fail_lock_write:
+	if (filp->f_mode & FMODE_READ)
+		mutex_unlock(&device->read_lock);
+fail_lock_read:
+	return -EBUSY;
+}
+
+static int dnt900_cdev_release(struct inode *inode, struct file *filp)
+{
+	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
+	if (filp->f_mode & FMODE_READ)
+		mutex_unlock(&device->read_lock);
+	if (filp->f_mode & FMODE_WRITE)
+		mutex_unlock(&device->write_lock);
 	return 0;
 }
 
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
+	if (filp->f_flags & O_NONBLOCK)
+		TRY(down_trylock(&device->data_ready) == 0 ? 0 : -EAGAIN);
+	else
+		TRY(down_interruptible(&device->data_ready));
 	
-	if (!mutex_trylock(&device->buf_lock))
-		return 0;
+	// TODO: can we remove the buf_lock by using kfifo?
+	TRY(mutex_lock_interruptible(&device->buf_lock));
 	unsigned int available = (device->head > device->tail ? device->head : device->head < device->tail ? RX_BUF_SIZE : device->tail) - device->tail;
 	unsigned int count = available > length ? length : available;
 	unsigned int copied = count - copy_to_user(buf, device->buf + device->tail, count);
@@ -1218,10 +1252,10 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
+	// TODO: implement a write buffer?
+	// TODO: how to handle blocking/non-blocking here when the serial port is being overrun?
 	struct dnt900_device *device = filp->private_data;
 	
-	if (device->is_local)
-		return -EPERM;
 	struct dnt900_tx_data_message *message = kzalloc(sizeof(*message), GFP_KERNEL);
 	if (!message)
 		return -ENOMEM;
@@ -1294,6 +1328,9 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	COPY3(device->mac_address, mac_address);
 	mutex_init(&device->buf_lock);
 	mutex_init(&device->param_lock);
+	mutex_init(&device->read_lock);
+	mutex_init(&device->write_lock);
+	sema_init(&device->data_ready, 0);
 	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
 	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
@@ -1444,6 +1481,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
 		ldisc->tty->ops->flush_chars(ldisc->tty);
 		// TODO: error checking?
+		// TODO: implement non-blocking option using tty->ops->write_room?
 	}
 	mutex_unlock(&ldisc->tty_lock);
 	
@@ -1614,6 +1652,8 @@ static void dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
+	if (rxdata->len <= 0)
+		return 0;
 	
 	TRY(mutex_lock_interruptible(&device->buf_lock));
 	for (; rxdata->len > 0; ++rxdata->buf, --rxdata->len) {
@@ -1623,6 +1663,13 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 			CIRC_OFFSET(device->tail, 1, RX_BUF_SIZE);
 	}
 	mutex_unlock(&device->buf_lock);
+	
+	// TODO: not very sure this is the correct way to signal new data.
+	// other options: wait queue, producer/consumer using two semaphores.
+	
+	do { } while (!down_trylock(&device->data_ready));
+	up(&device->data_ready);
+	
 	return 0;
 }
 
