@@ -44,7 +44,7 @@
 #include <linux/workqueue.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
-#include <linux/semaphore.h>
+#include <linux/wait.h>
 #include <linux/kfifo.h>
 
 #define DRIVER_NAME "dnt900"
@@ -228,7 +228,7 @@ struct dnt900_device {
 	struct mutex param_lock;
 	struct mutex read_lock;
 	struct mutex write_lock;
-	struct semaphore data_ready;
+	wait_queue_head_t queue;
 	struct kfifo fifo;
 	char buf[RX_BUF_SIZE];
 	unsigned int head;
@@ -1230,13 +1230,9 @@ static int dnt900_cdev_release(struct inode *inode, struct file *filp)
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
-	// TODO: this signaling strategy won't work if length is less than the
-	// amount of data available in the fifo. need to replace it! maybe a
-	// wait queue with condition !kfifo_is_empty(&device->fifo)
-	if (filp->f_flags & O_NONBLOCK)
-		TRY(down_trylock(&device->data_ready) == 0 ? 0 : -EAGAIN);
-	else
-		TRY(down_interruptible(&device->data_ready));
+	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&device->fifo))
+		return -EAGAIN;
+	TRY(wait_event_interruptible(device->queue, !kfifo_is_empty(&device->fifo)));
 	unsigned int copied;
 	TRY(kfifo_to_user(&device->fifo, buf, length, &copied));
 	*offp += copied;
@@ -1252,7 +1248,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message message;
 	TRY(dnt900_read_sys_address(device, message.sys_address));
-	unsigned int slot_size;
+	unsigned int slot_size; // TODO: check case where slot_size < 6
 	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
 	unsigned long count = slot_size - 6 < length ? slot_size - 6 : length;
 	if (copy_from_user(message.data, buf, count))
@@ -1317,7 +1313,7 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	mutex_init(&device->param_lock);
 	mutex_init(&device->read_lock);
 	mutex_init(&device->write_lock);
-	sema_init(&device->data_ready, 0);
+	init_waitqueue_head(&device->queue);
 	kfifo_init(&device->fifo, &device->buf, RX_BUF_SIZE);
 	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
 	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
@@ -1646,19 +1642,8 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
 	unsigned int copied = kfifo_in(&device->fifo, rxdata->buf, rxdata->len);
-	
-	// TODO: deal with full buffer! we need to throttle the dnt900 somehow
-	// (use /HOST_RTS maybe). As it stands we are potentially throwing out
-	// received data here, i.e. new data gets ditched once buffer is full.
-	// could we sleep while the buffer is full?
-	
-	// TODO: pretty sure this isn't the best way to signal new data.
-	// other options: wait queue, producer/consumer using two semaphores?
-	
-	do { } while (!down_trylock(&device->data_ready));
-	up(&device->data_ready);
-	
-	return 0; // TODO: or some error code?
+	wake_up_interruptible(&device->queue);
+	return copied == rxdata->len ? 0 : -ENOSPC; // TODO: better error code? (or even needed?)
 }
 
 static int dnt900_process_announcement(struct dnt900_device *device, void *data)
@@ -1950,3 +1935,5 @@ MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
 // TODO: fix error where module unloading breaks if any of the char devices are still open
+// TODO: move tty.local char device functions into the tty char device itself. would requre
+//       dnt900_for_each_device to be changed to dnt900_for_each_remote, etc.
