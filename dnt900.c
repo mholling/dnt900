@@ -55,7 +55,7 @@
 #define MAX_PACKET_SIZE (2+255)
 
 // buffer sizes must be powers of 2
-#define RX_BUF_SIZE     (2048)
+#define RX_BUF_SIZE (2048)
 
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
@@ -226,13 +226,10 @@ struct dnt900_device {
 	struct dnt900_ldisc *ldisc;
 	bool is_local;
 	struct mutex param_lock;
-	struct mutex read_lock;
-	struct mutex write_lock;
-	wait_queue_head_t queue;
-	struct kfifo fifo;
-	char buf[RX_BUF_SIZE];
-	unsigned int head;
-	unsigned int tail;
+	struct mutex rx_lock;
+	struct mutex tx_lock;
+	wait_queue_head_t rx_queue;
+	DECLARE_KFIFO(rx_fifo, char, RX_BUF_SIZE);
 	char mac_address[3];
 	char sys_address[3];
 };
@@ -1204,16 +1201,16 @@ static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 	if (device->is_local && (filp->f_mode & FMODE_WRITE))
 		return -EPERM;
 	if (filp->f_mode & FMODE_READ)
-		UNWIND(error, !mutex_trylock(&device->read_lock), fail_lock_read);
+		UNWIND(error, !mutex_trylock(&device->rx_lock), fail_lock_rx);
 	if (filp->f_mode & FMODE_WRITE)
-		UNWIND(error, !mutex_trylock(&device->write_lock), fail_lock_write);
+		UNWIND(error, !mutex_trylock(&device->tx_lock), fail_lock_tx);
 	filp->private_data = device;
 	return 0;
 	
-fail_lock_write:
+fail_lock_tx:
 	if (filp->f_mode & FMODE_READ)
-		mutex_unlock(&device->read_lock);
-fail_lock_read:
+		mutex_unlock(&device->rx_lock);
+fail_lock_rx:
 	return -EBUSY;
 }
 
@@ -1221,41 +1218,51 @@ static int dnt900_cdev_release(struct inode *inode, struct file *filp)
 {
 	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
 	if (filp->f_mode & FMODE_READ)
-		mutex_unlock(&device->read_lock);
+		mutex_unlock(&device->rx_lock);
 	if (filp->f_mode & FMODE_WRITE)
-		mutex_unlock(&device->write_lock);
+		mutex_unlock(&device->tx_lock);
 	return 0;
 }
 
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
-	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&device->fifo))
+	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&device->rx_fifo))
 		return -EAGAIN;
-	TRY(wait_event_interruptible(device->queue, !kfifo_is_empty(&device->fifo)));
+	TRY(wait_event_interruptible(device->rx_queue, !kfifo_is_empty(&device->rx_fifo)));
 	unsigned int copied;
-	TRY(kfifo_to_user(&device->fifo, buf, length, &copied));
+	TRY(kfifo_to_user(&device->rx_fifo, buf, length, &copied));
 	*offp += copied;
 	return copied;
 }
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
-	if (!length)
-		return length;
-	// TODO: implement a write fifo for each device? (or, per tty) if so, why?
 	// TODO: how to handle blocking/non-blocking here when the tty is being overrun?
+	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message message;
-	TRY(dnt900_read_sys_address(device, message.sys_address));
 	unsigned int slot_size; // TODO: check case where slot_size < 6
+	TRY(dnt900_read_sys_address(device, message.sys_address));
 	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
-	unsigned long count = slot_size - 6 < length ? slot_size - 6 : length;
-	if (copy_from_user(message.data, buf, count))
-		return -EFAULT;
-	TRY(dnt900_send_message(device->ldisc, &message, 3 + count, COMMAND_TX_DATA, true, NULL));
-	*offp += count;
-	return count;
+	size_t sent = 0;
+	int error = 0;
+	while (length > 0) {
+		size_t count = slot_size - 6 < length ? slot_size - 6 : length;
+		if (copy_from_user(message.data, buf, count))
+			error = -EFAULT;
+		else
+			error = dnt900_send_message(device->ldisc, &message, 3 + count, COMMAND_TX_DATA, true, NULL);
+		if (error == -EAGAIN && !sent && blocking)
+			continue; // TODO: is this the best way to handle STATUS_HOLDING_FOR_FLOW?
+		if (error)
+			break;
+		sent += count;
+		buf += count;
+		length -= count;
+	}
+	*offp += sent;
+	return sent ? sent : error;
 }
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
@@ -1311,10 +1318,10 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	device->is_local = is_local;
 	COPY3(device->mac_address, mac_address);
 	mutex_init(&device->param_lock);
-	mutex_init(&device->read_lock);
-	mutex_init(&device->write_lock);
-	init_waitqueue_head(&device->queue);
-	kfifo_init(&device->fifo, &device->buf, RX_BUF_SIZE);
+	mutex_init(&device->rx_lock);
+	mutex_init(&device->tx_lock);
+	init_waitqueue_head(&device->rx_queue);
+	INIT_KFIFO(device->rx_fifo);
 	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
 	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
@@ -1590,7 +1597,7 @@ static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 			packet->error = 0;
 			break;
 		case STATUS_HOLDING_FOR_FLOW:
-			packet->error = -ETIMEDOUT;
+			packet->error = -EAGAIN;
 			break;
 		case STATUS_NOT_ACKNOWLEDGED:
 		case STATUS_NOT_LINKED:
@@ -1641,8 +1648,8 @@ static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 static int dnt900_receive_data(struct dnt900_device *device, void *data)
 {
 	struct dnt900_rxdata *rxdata = data;
-	unsigned int copied = kfifo_in(&device->fifo, rxdata->buf, rxdata->len);
-	wake_up_interruptible(&device->queue);
+	unsigned int copied = kfifo_in(&device->rx_fifo, rxdata->buf, rxdata->len);
+	wake_up_interruptible(&device->rx_queue);
 	return copied == rxdata->len ? 0 : -ENOSPC; // TODO: better error code? (or even needed?)
 }
 
@@ -1937,3 +1944,4 @@ MODULE_VERSION("0.1");
 // TODO: fix error where module unloading breaks if any of the char devices are still open
 // TODO: move tty.local char device functions into the tty char device itself. would requre
 //       dnt900_for_each_device to be changed to dnt900_for_each_remote, etc.
+// TODO: reset doesn't work!
