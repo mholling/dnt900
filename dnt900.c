@@ -1623,8 +1623,9 @@ static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 	case EVENT_RX_DATA:
 		for (int offset = 3; offset < 6; ++offset)
 			sys_address[offset-3] = ldisc->message[offset];
-		rxdata.buf = ldisc->message + 6;
-		rxdata.len = ldisc->end - 6;
+		rxdata.buf = ldisc->message + 7;
+		rxdata.len = ldisc->end - 7;
+		// TODO: can we do anything with the RSSI value at message[6]?
 		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
 		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
 		// and also do this in a workqueue job. The first packets of received data would likely
