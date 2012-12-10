@@ -1332,11 +1332,10 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	UNWIND(error, dnt900_add_attributes(dev), fail_add_attributes);
 	cdev_init(&device->cdev, &dnt900_cdev_fops);
 	device->cdev.owner = THIS_MODULE;
+	kobject_set_name(&device->cdev.kobj, name);
 	UNWIND(error, cdev_add(&device->cdev, devt, 1), fail_cdev_add);
-	// TODO: set cdev permissions to read-only if is_local?
 	goto success;
 	
-	cdev_del(&device->cdev);
 fail_cdev_add:
 	dnt900_remove_attributes(dev);
 fail_add_attributes:
@@ -1942,7 +1941,8 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
-// TODO: fix error where module unloading breaks if any of the char devices are still open
+// TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
+//       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 // TODO: move tty.local char device functions into the tty char device itself. would requre
 //       dnt900_for_each_device to be changed to dnt900_for_each_remote, etc.
 // TODO: reset doesn't work!
