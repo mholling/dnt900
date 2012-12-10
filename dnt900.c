@@ -55,7 +55,7 @@
 #define MAX_PACKET_SIZE (2+255)
 
 // buffer sizes must be powers of 2
-#define RX_BUF_SIZE (2048)
+#define RX_BUF_SIZE (4096)
 
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
@@ -206,8 +206,8 @@ struct dnt900_ldisc {
 	struct tty_struct *tty;
 	int major;
 	int minor;
-	unsigned gpio_cfg;
-	unsigned gpio_cts;
+	int gpio_cfg;
+	int gpio_cts;
 	struct list_head packets;
 	struct mutex packets_lock;
 	struct mutex devices_lock;
@@ -368,8 +368,8 @@ void __exit dnt900_exit(void);
 
 static int n_dnt900 = NR_LDISCS - 1;
 static int members = 126;
-static int gpio_cfg = 25;
-static int gpio_cts = 27;
+static int gpio_cfg = -1;
+static int gpio_cts = -1;
 
 module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
@@ -848,7 +848,6 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.open = dnt900_ldisc_open,
 	.close = dnt900_ldisc_close,
 	.receive_buf = dnt900_ldisc_receive_buf,
-
 	.owner = THIS_MODULE,
 };
 
@@ -1014,17 +1013,16 @@ static void dnt900_remove_attributes(struct device *dev)
 static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 {
 	int error = 0;
-	if (ldisc->gpio_cfg >= 0)
+	if (ldisc->gpio_cfg >= 0) {
 		gpio_set_value(ldisc->gpio_cfg, 0);
-	else {
-		// TODO: test this case
-		char message[] = { 0, 0, 0, 'D', 'N', 'T', 'C', 'F', 'G' };
-		error = dnt900_send_message(ldisc, message, 6, COMMAND_ENTER_PROTOCOL_MODE, false, NULL);
+		// flushing the DNT900 with zeroes seems to be needed for some reason...
+		char zeroes[100] = { 0 };
+		ldisc->tty->ops->write(ldisc->tty, zeroes, ARRAY_SIZE(zeroes));
+		ldisc->tty->ops->flush_chars(ldisc->tty);
+	} else {
+		char enter_protocol_message[] = { 0, 0, 0, 'D', 'N', 'T', 'C', 'F', 'G' };
+		error = dnt900_send_message(ldisc, enter_protocol_message, 6, COMMAND_ENTER_PROTOCOL_MODE, false, NULL);
 	}
-	// flushing the DNT900 with zeroes seems to be needed for some reason...
-	char zeroes[1000] = { 0 };
-	ldisc->tty->ops->write(ldisc->tty, zeroes, ARRAY_SIZE(zeroes));
-	ldisc->tty->ops->flush_chars(ldisc->tty);
 	return error;
 }
 
@@ -1370,6 +1368,7 @@ static int dnt900_free_device(struct device *dev, void *unused)
 	cdev_del(&device->cdev);
 	dnt900_remove_attributes(dev);
 	device_unregister(dev);
+	// TODO: this needs to be done after the cdev is released:
 	kfree(device);
 	return 0;
 }
@@ -1446,6 +1445,8 @@ static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(stru
 
 static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsigned int arg_length, char type, bool expects_reply, char *result)
 {
+	if (ldisc->tty->flags & (1 << TTY_IO_ERROR))
+		return -EIO;
 	int error = 0;
 	struct dnt900_packet packet;
 	struct dnt900_message_header *header = message;
@@ -1467,11 +1468,9 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	const char *buf = message;
 	
 	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
-	for (int sent; count > 0; count -= sent, buf += sent) {
+	for (int sent; count; count -= sent, buf += sent) {
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
 		ldisc->tty->ops->flush_chars(ldisc->tty);
-		// TODO: error checking?
-		// TODO: implement non-blocking option using tty->ops->write_room?
 	}
 	mutex_unlock(&ldisc->tty_lock);
 	
@@ -1825,7 +1824,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	int error = 0;
 	
 	if (!tty->ops->write || ! tty->ops->flush_chars)
-		return -EPERM;
+		return -EIO;
 	
 	struct dnt900_ldisc *ldisc = kzalloc(sizeof(*ldisc), GFP_KERNEL);
 	if (!ldisc)
@@ -1890,9 +1889,12 @@ success:
 
 static void dnt900_ldisc_close(struct tty_struct *tty)
 {
+	// TTY_IO_ERROR is set here so we can't do any more I/O via the serial
+	// port. This prevents us from e.g. sleeping or resetting the radio.
+	// (TODO)
+	
 	struct dnt900_ldisc *ldisc = tty->disc_data;
-
-	// TODO: code to sleep the dnt900 here?
+	
 	down_write(&ldisc->shutdown_lock);
 	destroy_workqueue(ldisc->workqueue);
 	dnt900_free_devices(ldisc);
@@ -1946,3 +1948,5 @@ MODULE_VERSION("0.1");
 // TODO: move tty.local char device functions into the tty char device itself. would requre
 //       dnt900_for_each_device to be changed to dnt900_for_each_remote, etc.
 // TODO: reset doesn't work!
+// TODO: possible for a base to automatically map the entire network?
+// TODO: add module parameter array of MAC addresses to pre-load?
