@@ -321,6 +321,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
+static ssize_t dnt900_device_read(struct dnt900_device *device, struct file *filp, char __user *buf, size_t length);
+
 static int dnt900_cdev_open(struct inode *inode, struct file *filp);
 static int dnt900_cdev_release(struct inode *inode, struct file *filp);
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
@@ -329,9 +331,11 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
 static int dnt900_device_get_params(struct dnt900_device *device);
 
-static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
-static int dnt900_alloc_device_remote(struct dnt900_ldisc *ldisc, const char *mac_address);
-static int dnt900_alloc_device_local(struct dnt900_ldisc *ldisc, const char *mac_address);
+static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
+static int dnt900_ldisc_add_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
+static int dnt900_ldisc_add_remote_device(struct dnt900_ldisc *ldisc, const char *mac_address);
+static int dnt900_ldisc_add_local_device(struct dnt900_ldisc *ldisc, const char *mac_address);
+
 static int dnt900_free_device(struct device *dev, void *unused);
 static void dnt900_free_devices(struct dnt900_ldisc *ldisc);
 
@@ -362,6 +366,8 @@ static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
 static int dnt900_ldisc_open(struct tty_struct *tty);
 static void dnt900_ldisc_close(struct tty_struct *tty);
+static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr);
+static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr);
 
 int __init dnt900_init(void);
 void __exit dnt900_exit(void);
@@ -383,9 +389,6 @@ static const struct device_attribute dnt900_local_attributes[] = {
 	__ATTR(discover, ATTR_W, NULL, dnt900_store_discover)
 };
 
-// TODO: hook into sysfs writers when necessary to update device configs, etc.
-// (maybe set callbacks on the attribute writers?)
-
 enum {
 	DeviceMode = 0,
 	RF_DataRate,
@@ -406,7 +409,7 @@ enum {
 	StaticNetAddr,
 	HeartbeatIntrvl,
 	TreeRoutingSysID,
-	enableRtAcks,
+	EnableRtAcks,
 	FrequencyBand,
 	AccessMode,
 	BaseSlotSize,
@@ -629,7 +632,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("StaticNetAddr",      ATTR_RW, 0x00, 0x36, 0x01, print_1_bytes, parse_1_bytes),
 	DNT900_ATTR("HeartbeatIntrvl",    ATTR_RW, 0x00, 0x37, 0x02, print_2_bytes, parse_2_bytes),
 	DNT900_ATTR("TreeRoutingSysID",   ATTR_RW, 0x00, 0x39, 0x01, print_1_bytes, parse_1_bytes),
-	DNT900_ATTR("enableRtAcks",       ATTR_RW, 0x00, 0x3A, 0x01, print_1_bytes, parse_1_bytes),
+	DNT900_ATTR("EnableRtAcks",       ATTR_RW, 0x00, 0x3A, 0x01, print_1_bytes, parse_1_bytes),
 	DNT900_ATTR("FrequencyBand",      ATTR_RW, 0x01, 0x00, 0x01, print_1_bytes, parse_1_bytes),
 	DNT900_ATTR("AccessMode",         ATTR_RW, 0x01, 0x01, 0x01, print_1_bytes, parse_1_bytes),
 	DNT900_ATTR("BaseSlotSize",       ATTR_RW, 0x01, 0x02, 0x01, print_1_bytes, parse_1_bytes),
@@ -847,6 +850,8 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.name = DRIVER_NAME,
 	.open = dnt900_ldisc_open,
 	.close = dnt900_ldisc_close,
+	.read = dnt900_ldisc_read,
+	.write = dnt900_ldisc_write,
 	.receive_buf = dnt900_ldisc_receive_buf,
 	.owner = THIS_MODULE,
 };
@@ -986,17 +991,12 @@ static int parse_16_ascii(const char *buf, size_t count, char *value)
 static int dnt900_add_attributes(struct device *dev)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
-	for (int n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n) {
-		int result = device_create_file(dev, &dnt900_attributes[n].attr);
-		if (result)
-			return result;
-	}
-	if (device->is_local)
-		for (int n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n) {
-			int result = device_create_file(dev, dnt900_local_attributes + n);
-			if (result)
-				return result;
-		}
+	for (int n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
+		TRY(device_create_file(dev, &dnt900_attributes[n].attr));
+	if (!device->is_local)
+		return 0;
+	for (int n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
+		TRY(device_create_file(dev, dnt900_local_attributes + n));
 	return 0;
 }
 
@@ -1005,9 +1005,10 @@ static void dnt900_remove_attributes(struct device *dev)
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	for (int n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
 		device_remove_file(dev, &dnt900_attributes[n].attr);
-	if (device->is_local)
-		for (int n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
-			device_remove_file(dev, dnt900_local_attributes + n);
+	if (!device->is_local)
+		return;
+	for (int n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
+		device_remove_file(dev, dnt900_local_attributes + n);
 }
 
 static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
@@ -1187,8 +1188,18 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 		mac_address[n] = mac_address_int & 0xFF;
 	if (mac_address_int)
 		return -EINVAL;
-	TRY(dnt900_alloc_device_remote(ldisc, mac_address));
+	TRY(dnt900_ldisc_add_remote_device(ldisc, mac_address));
 	return count;
+}
+
+static ssize_t dnt900_device_read(struct dnt900_device *device, struct file *filp, char __user *buf, size_t length)
+{
+	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&device->rx_fifo))
+		return -EAGAIN;
+	TRY(wait_event_interruptible(device->rx_queue, !kfifo_is_empty(&device->rx_fifo)));
+	unsigned int copied;
+	TRY(kfifo_to_user(&device->rx_fifo, buf, length, &copied));
+	return copied;
 }
 
 static int dnt900_cdev_open(struct inode *inode, struct file *filp)
@@ -1225,13 +1236,7 @@ static int dnt900_cdev_release(struct inode *inode, struct file *filp)
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
-	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&device->rx_fifo))
-		return -EAGAIN;
-	TRY(wait_event_interruptible(device->rx_queue, !kfifo_is_empty(&device->rx_fifo)));
-	unsigned int copied;
-	TRY(kfifo_to_user(&device->rx_fifo, buf, length, &copied));
-	*offp += copied;
-	return copied;
+	return dnt900_device_read(device, filp, buf, length);
 }
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
@@ -1240,9 +1245,11 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message message;
-	unsigned int slot_size; // TODO: check case where slot_size < 6
+	unsigned int slot_size;
 	TRY(dnt900_read_sys_address(device, message.sys_address));
 	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
+	if (slot_size <= 6)
+		return -ECOMM;
 	size_t sent = 0;
 	int error = 0;
 	while (length > 0) {
@@ -1252,7 +1259,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 		else
 			error = dnt900_send_message(device->ldisc, &message, 3 + count, COMMAND_TX_DATA, true, NULL);
 		if (error == -EAGAIN && !sent && blocking)
-			continue; // TODO: is this the best way to handle STATUS_HOLDING_FOR_FLOW?
+			continue;
 		if (error)
 			break;
 		sent += count;
@@ -1299,14 +1306,9 @@ static int dnt900_device_get_params(struct dnt900_device *device)
 	return 0;
 }
 
-static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name)
+static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name)
 {
-	TRY(mutex_lock_interruptible(&ldisc->devices_lock));
 	int error = 0;
-	if (dnt900_device_exists(ldisc, mac_address)) {
-		error = -EEXIST;
-		goto fail_exists;
-	}
 	struct dnt900_device *device = kzalloc(sizeof(*device), GFP_KERNEL);
 	if (!device) {
 		error = -ENOMEM;
@@ -1321,7 +1323,7 @@ static int dnt900_alloc_device(struct dnt900_ldisc *ldisc, const char *mac_addre
 	init_waitqueue_head(&device->rx_queue);
 	INIT_KFIFO(device->rx_fifo);
 	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
-	dev_t devt = MKDEV(ldisc->major, ldisc->minor++);
+	dev_t devt = is_local ? MKDEV(0, 0) : MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
 	if (IS_ERR(dev)) {
 		error = PTR_ERR(dev);
@@ -1342,24 +1344,31 @@ fail_dev_create:
 fail_get_params:
 	kfree(device);
 fail_alloc:
-fail_exists:
 success:
+	return error;
+}
+
+static int dnt900_ldisc_add_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name)
+{
+	int error = 0;
+	TRY(mutex_lock_interruptible(&ldisc->devices_lock));
+	UNWIND(error, dnt900_device_exists(ldisc, mac_address) ? -EEXIST : 0, exit);
+	UNWIND(error, dnt900_create_device(ldisc, mac_address, is_local, name), exit);
+exit:
 	mutex_unlock(&ldisc->devices_lock);
 	return error;
 }
 
-static int dnt900_alloc_device_remote(struct dnt900_ldisc *ldisc, const char *mac_address)
+static int dnt900_ldisc_add_remote_device(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
 	char name[80];
 	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", ldisc->tty->name, mac_address[2], mac_address[1], mac_address[0]);
-	return dnt900_alloc_device(ldisc, mac_address, false, name);
+	return dnt900_ldisc_add_device(ldisc, mac_address, false, name);
 }
 
-static int dnt900_alloc_device_local(struct dnt900_ldisc *ldisc, const char *mac_address)
+static int dnt900_ldisc_add_local_device(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	char name[80];
-	snprintf(name, ARRAY_SIZE(name), "%s.local", ldisc->tty->name);
-	return dnt900_alloc_device(ldisc, mac_address, true, name);
+	return dnt900_ldisc_add_device(ldisc, mac_address, true, ldisc->tty->name);
 }
 
 static int dnt900_free_device(struct device *dev, void *unused)
@@ -1375,7 +1384,7 @@ static int dnt900_free_device(struct device *dev, void *unused)
 
 static void dnt900_free_devices(struct dnt900_ldisc *ldisc)
 {
-	device_for_each_child(ldisc->tty->dev, NULL, dnt900_free_device);
+	class_for_each_device(dnt900_class, NULL, NULL, dnt900_free_device);
 }
 
 static int dnt900_device_matches_sys_address(struct device *dev, void *data)
@@ -1402,12 +1411,13 @@ static int dnt900_device_is_local(struct device *dev, void *data)
 
 static bool dnt900_device_exists(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	return device_for_each_child(ldisc->tty->dev, (void *)mac_address, dnt900_device_matches_mac_address);
+	return class_for_each_device(dnt900_class, NULL, (void *)mac_address, dnt900_device_matches_mac_address);
 }
 
 static int dnt900_dispatch_to_device(struct dnt900_ldisc *ldisc, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *))
 {
 	int error;
+	// TODO: what if the tty device has other children which aren't ours?
 	struct device *dev = device_find_child(ldisc->tty->dev, finder_data, finder);
 	if (dev) {
 		struct dnt900_device *device = dev_get_drvdata(dev);
@@ -1484,7 +1494,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	return packet.error;
 	
 exit:
-	mutex_lock(&ldisc->packets_lock); // TODO: use TRY and _interrupible?
+	mutex_lock(&ldisc->packets_lock);
 	list_del(&packet.list);
 	mutex_unlock(&ldisc->packets_lock);
 	return error;
@@ -1506,14 +1516,16 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 		const unsigned int length = 2 + (unsigned char)ldisc->message[1];
 		for (; count > 0 && ldisc->end < length; --count, ++cp, ++ldisc->end)
 			ldisc->message[ldisc->end] = *cp;
-		if (ldisc->end == length) { // TODO: need to also check length > 2?
-			const char type = ldisc->message[2];
-			// TODO: need to process possible errors returned by
-			// dnt900_process_... below:
-			if (type & TYPE_REPLY)
-				dnt900_process_reply(ldisc, type & MASK_COMMAND);
-			if (type & TYPE_EVENT)
-				dnt900_process_event(ldisc, type);
+		if (ldisc->end == length) {
+			if (length > 2) {
+				const char type = ldisc->message[2];
+				// TODO: need to process possible errors returned by
+				// dnt900_process_... below:
+				if (type & TYPE_REPLY)
+					dnt900_process_reply(ldisc, type & MASK_COMMAND);
+				if (type & TYPE_EVENT)
+					dnt900_process_event(ldisc, type);
+			}
 			ldisc->end = 0;
 		}
 	}
@@ -1543,7 +1555,6 @@ static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 			 || packet->message[4] != ldisc->message[4] 
 			 || packet->message[5] != ldisc->message[5])
 				continue;
-			// TODO: check packet->message[5] + 6 == length?
 			for (int n = 0; n < packet->message[5]; ++n)
 				packet->result[n] = ldisc->message[6 + n];
 			break;
@@ -1623,11 +1634,9 @@ static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 			sys_address[offset-3] = ldisc->message[offset];
 		rxdata.buf = ldisc->message + 7;
 		rxdata.len = ldisc->end - 7;
-		// TODO: can we do anything with the RSSI value at message[6]?
 		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-		// TODO: add new device if it doesn't exist? You would have to retrieve its MAC first,
-		// and also do this in a workqueue job. The first packets of received data would likely
-		// be discarded.
+		// TODO: can we do anything with the RSSI value at message[6]?
+		// TODO: can we add a new device if the sender doesn't exist?
 		break;
 	case EVENT_ANNOUNCE:
 		for (int offset = 3; offset < ldisc->end && offset < 3 + ARRAY_SIZE(announcement); ++offset)
@@ -1649,7 +1658,9 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 	struct dnt900_rxdata *rxdata = data;
 	unsigned int copied = kfifo_in(&device->rx_fifo, rxdata->buf, rxdata->len);
 	wake_up_interruptible(&device->rx_queue);
-	return copied == rxdata->len ? 0 : -ENOSPC; // TODO: better error code? (or even needed?)
+	rxdata->len -= copied;
+	rxdata->buf += copied;
+	return rxdata->len ? -EAGAIN : 0;
 }
 
 static int dnt900_process_announcement(struct dnt900_device *device, void *data)
@@ -1776,7 +1787,7 @@ static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_add
 static void dnt900_add_new_device(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_alloc_device_remote(work->ldisc, work->mac_address);
+	dnt900_ldisc_add_remote_device(work->ldisc, work->mac_address);
 	kfree((void *)work);
 }
 
@@ -1803,7 +1814,7 @@ static void dnt900_init_ldisc(struct work_struct *ws)
 	UNWIND(error, dnt900_ldisc_get_params(work->ldisc), fail);
 	char mac_address[3];
 	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address), fail);
-	UNWIND(error, dnt900_alloc_device_local(work->ldisc, mac_address), fail);
+	UNWIND(error, dnt900_ldisc_add_local_device(work->ldisc, mac_address), fail);
 	goto success;
 	
 fail:
@@ -1911,6 +1922,41 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	kfree(ldisc);
 }
 
+static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr)
+{
+	struct dnt900_ldisc *ldisc = tty->disc_data;
+	ssize_t result;
+	struct device *dev = device_find_child(ldisc->tty->dev, NULL, dnt900_device_is_local);
+	UNWIND(result, dev ? 0 : -ENODEV, fail_find);
+	struct dnt900_device *device = dev_get_drvdata(dev);
+	result = dnt900_device_read(device, filp, buf, nr);
+	put_device(dev);
+fail_find:
+	return result;
+}
+
+static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr)
+{
+	struct dnt900_ldisc *ldisc = tty->disc_data;
+	struct dnt900_tx_data_message message = { .sys_address = { 0xFF, 0xFF, 0xFF } };
+	unsigned int slot_size;
+	TRY(dnt900_read_slot_size(ldisc, &slot_size));
+	if (slot_size <= 6)
+		return -ECOMM;
+	size_t sent = 0;
+	int error = 0;
+	while (nr > 0) {
+		size_t count = slot_size - 6 < nr ? slot_size - 6 : nr;
+		memcpy(message.data, buf, count);
+		UNWIND(error, dnt900_send_message(ldisc, &message, 3 + count, COMMAND_TX_DATA, false, NULL), exit);
+		sent += count;
+		buf += count;
+		nr -= count;
+	}
+exit:
+	return sent ? sent : error;
+}
+
 int __init dnt900_init(void)
 {
 	dnt900_class = class_create(THIS_MODULE, CLASS_NAME);
@@ -1943,10 +1989,19 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
+
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
-// TODO: move tty.local char device functions into the tty char device itself. would requre
-//       dnt900_for_each_device to be changed to dnt900_for_each_remote, etc.
+
 // TODO: reset doesn't work!
+
 // TODO: possible for a base to automatically map the entire network?
-// TODO: add module parameter array of MAC addresses to pre-load?
+
+// TODO: add a module parameter array for MAC addresses to auto-load?
+
+// TODO: how to detect changes in slot_size when TDMA is used?
+
+// TODO: hook into sysfs writers when necessary to update device configs, etc.
+// (maybe set callbacks on the attribute writers?)
+
+// TODO: limit number of devices created using 'members' module parameter
