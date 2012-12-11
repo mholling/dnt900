@@ -107,8 +107,6 @@
 #define ERROR_UART_FRAMING      (0xEA)
 #define ERROR_HARDWARE          (0xEE)
 
-#define EMPTY_PACKET_BYTES (50)
-
 #define ATTR_R  (S_IRUGO)
 #define ATTR_W  (S_IWUSR | S_IWGRP)
 #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
@@ -247,7 +245,7 @@ struct dnt900_register {
 
 struct dnt900_work {
 	struct work_struct ws;
-	char mac_address[3];
+	char address[3];
 	struct dnt900_ldisc *ldisc;
 };
 
@@ -354,11 +352,13 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command);
 static int dnt900_receive_data(struct dnt900_device *device, void *data);
+static int dnt900_process_rx_event(struct dnt900_device *device, void *data);
 static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event);
 static int dnt900_process_announcement(struct dnt900_device *device, void *data);
 
-static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_address, void (*work_function)(struct work_struct *));
-static void dnt900_add_new_device(struct work_struct *ws);
+static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *address, void (*work_function)(struct work_struct *));
+static void dnt900_add_new_mac_address(struct work_struct *ws);
+static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_ldisc(struct work_struct *ws);
 static void dnt900_refresh_device(struct work_struct *ws);
 
@@ -1625,7 +1625,6 @@ static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 {
 	char sys_address[3];
 	struct dnt900_rxdata rxdata;
-	char announcement[11];
 	int error = 0;
 	
 	switch (event) {
@@ -1636,18 +1635,21 @@ static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 		rxdata.len = ldisc->end - 7;
 		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
 		// TODO: can we do anything with the RSSI value at message[6]?
-		// TODO: can we add a new device if the sender doesn't exist?
+		if (error == -ENODEV)
+			dnt900_schedule_work(ldisc, sys_address, dnt900_add_new_sys_address);
 		break;
 	case EVENT_ANNOUNCE:
-		for (int offset = 3; offset < ldisc->end && offset < 3 + ARRAY_SIZE(announcement); ++offset)
-			announcement[offset-3] = ldisc->message[offset];
-		error = dnt900_dispatch_to_device(ldisc, NULL, dnt900_device_is_local, announcement, dnt900_process_announcement);
+		error = dnt900_dispatch_to_device(ldisc, NULL, dnt900_device_is_local, ldisc->message + 3, dnt900_process_announcement);
 		break;
 	case EVENT_RX_EVENT:
-		// unimplemented for now (used for automatic I/O reporting)
+		for (int offset = 3; offset < 6; ++offset)
+			sys_address[offset-3] = ldisc->message[offset];
+		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, ldisc->message + 10, dnt900_process_rx_event);
+		if (error == -ENODEV)
+			dnt900_schedule_work(ldisc, sys_address, dnt900_add_new_sys_address);
 		break;
 	case EVENT_JOIN_REQUEST:
-		// unimplemented for now (use for host-based authentication)
+		// unimplemented for now (used for host-based authentication)
 		break;
 	}
 	return error;
@@ -1663,21 +1665,47 @@ static int dnt900_receive_data(struct dnt900_device *device, void *data)
 	return rxdata->len ? -EAGAIN : 0;
 }
 
+static int dnt900_process_rx_event(struct dnt900_device *device, void *data)
+{
+	char *io = data;
+	char text[512];
+	struct dnt900_rxdata rxdata = { .buf = text };
+	
+	rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+		"received I/O report:\n" \
+		"    MAC address 0x%02X%02X%02X\n" \
+		"    GPIO0 0x%02X\n" \
+		"    GPIO1 0x%02X\n" \
+		"    GPIO2 0x%02X\n" \
+		"    GPIO3 0x%02X\n" \
+		"    GPIO4 0x%02X\n" \
+		"    GPIO5 0x%02X\n" \
+		"    ADC0 0x%02X%02X\n" \
+		"    ADC1 0x%02X%02X\n" \
+		"    ADC2 0x%02X%02X\n" \
+		"    event flags 0x%02X%02X\n", \
+		device->mac_address[2], device->mac_address[1], device->mac_address[0], \
+		io[0], io[1], io[2], io[3], io[4], io[5], \
+		io[7], io[6], io[9], io[8], io[11], io[10], \
+		io[13], io[12]);
+	return dnt900_dispatch_to_device(device->ldisc, NULL, dnt900_device_is_local, &rxdata, dnt900_receive_data);
+}
+
 static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 {
 	char *annc = data;
-	char message[512];
-	struct dnt900_rxdata rxdata = { .buf = message, .len = 0 };
+	char text[512];
+	struct dnt900_rxdata rxdata = { .buf = text };
 	struct dnt900_ldisc *ldisc = device->ldisc;
 	
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"completed startup initialization\n");
 		dnt900_schedule_work(ldisc, NULL, dnt900_refresh_ldisc);
 		break;
 	case ANNOUNCEMENT_JOINED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"joined network:\n" \
 			"    network ID 0x%02X\n" \
 			"    base MAC address 0x%02X%02X%02X\n" \
@@ -1686,16 +1714,16 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		if (dnt900_device_exists(ldisc, annc + 2))
 			dnt900_schedule_work(ldisc, annc + 2, dnt900_refresh_device);
 		else
-			dnt900_schedule_work(ldisc, annc + 2, dnt900_add_new_device);
+			dnt900_schedule_work(ldisc, annc + 2, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"exited network:\n" \
 			"    network ID 0x%02X\n", \
 			annc[1]);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"radio joined:\n" \
 			"    MAC address 0x%02X%02X%02X\n" \
 			"    range %d km\n", \
@@ -1703,20 +1731,20 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		if (dnt900_device_exists(ldisc, annc + 1))
 			dnt900_schedule_work(ldisc, annc + 1, dnt900_refresh_device);
 		else
-			dnt900_schedule_work(ldisc, annc + 1, dnt900_add_new_device);
+			dnt900_schedule_work(ldisc, annc + 1, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"radio exited:\n" \
 			"    MAC address 0x%02X%02X%02X\n", \
 			annc[3], annc[2], annc[1]);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"base rebooted\n");
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"received radio heartbeat:\n" \
 			"    MAC address 0x%02X%02X%02X\n" \
 			"    network address 0x%02X\n" \
@@ -1733,37 +1761,37 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		TRY(dnt900_dispatch_to_device(ldisc, annc + 1, dnt900_device_matches_mac_address, sys_address, dnt900_set_sys_address));
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), \
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
 			"router heartbeat timed out:\n" \
 			"    network ID 0x%02X\n",
 			annc[1]);
 		break;
 	case ERROR_PROTOCOL_TYPE:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: invalid message type\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: invalid message type\n");
 		break;
 	case ERROR_PROTOCOL_ARGUMENT:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: invalid argument\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: invalid argument\n");
 		break;
 	case ERROR_PROTOCOL_GENERAL:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: general error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: general error\n");
 		break;
 	case ERROR_PROTOCOL_TIMEOUT:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: parser timeout\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: parser timeout\n");
 		break;
 	case ERROR_PROTOCOL_READONLY:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "protocol error: register is read-only\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: register is read-only\n");
 		break;
 	case ERROR_UART_OVERFLOW:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: receive buffer overflow\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: receive buffer overflow\n");
 		break;
 	case ERROR_UART_OVERRUN:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: receive overrun\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: receive overrun\n");
 		break;
 	case ERROR_UART_FRAMING:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "UART error: framing error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: framing error\n");
 		break;
 	case ERROR_HARDWARE:
-		rxdata.len = scnprintf(message, ARRAY_SIZE(message), "hardware error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "hardware error\n");
 		break;
 	default:
 		return 0;
@@ -1771,23 +1799,34 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	return dnt900_receive_data(device, &rxdata);
 }
 
-static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *mac_address, void (*work_function)(struct work_struct *))
+static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *address, void (*work_function)(struct work_struct *))
 {
 	if (!down_read_trylock(&ldisc->shutdown_lock))
 		return;
 	struct dnt900_work *work = kzalloc(sizeof(*work), GFP_KERNEL);
 	work->ldisc = ldisc;
-	if (mac_address)
-		COPY3(work->mac_address, mac_address);
+	if (address)
+		COPY3(work->address, address);
 	INIT_WORK(&work->ws, work_function);
 	queue_work(ldisc->workqueue, &work->ws);
 	up_read(&ldisc->shutdown_lock);
 }
 
-static void dnt900_add_new_device(struct work_struct *ws)
+static void dnt900_add_new_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_ldisc_add_remote_device(work->ldisc, work->mac_address);
+	dnt900_ldisc_add_remote_device(work->ldisc, work->address);
+	kfree((void *)work);
+}
+
+static void dnt900_add_new_sys_address(struct work_struct *ws)
+{
+	int error;
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	char mac_address[3];
+	UNWIND(error, dnt900_get_remote_register(work->ldisc, work->address, &dnt900_attributes[MacAddress].reg, mac_address), exit);
+	dnt900_ldisc_add_remote_device(work->ldisc, mac_address);
+exit:
 	kfree((void *)work);
 }
 
@@ -1802,7 +1841,7 @@ static void dnt900_refresh_ldisc(struct work_struct *ws)
 static void dnt900_refresh_device(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_dispatch_to_device_no_data(work->ldisc, work->mac_address, dnt900_device_matches_mac_address, dnt900_device_get_params);
+	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_get_params);
 	kfree((void *)work);
 }
 
@@ -2005,3 +2044,7 @@ MODULE_VERSION("0.1");
 // (maybe set callbacks on the attribute writers?)
 
 // TODO: limit number of devices created using 'members' module parameter
+
+// TODO: convert announcements and rx events to json?
+
+// TODO: do we need peer-to-peer ACKs? (EnableRtAcks)
