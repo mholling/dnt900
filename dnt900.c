@@ -112,9 +112,11 @@
 #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
 
 #define EQUAL_ADDRESSES(address1, address2) ( \
-	address1[0] == address2[0] && \
-	address1[1] == address2[1] && \
-	address1[2] == address2[2])
+	(address1)[0] == (address2)[0] && \
+	(address1)[1] == (address2)[1] && \
+	(address1)[2] == (address2)[2])
+
+#define VALID_MAC_ADDRESS(address) (!(address)[2] || !(address)[1] || !(address)[0])
 
 #define RANGE_TO_KMS(range) (4667 * (unsigned char)(range) / 10000)
 #define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
@@ -328,6 +330,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
 static int dnt900_device_get_params(struct dnt900_device *device);
+static int dnt900_device_map_radios(struct dnt900_device *device);
 
 static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
 static int dnt900_ldisc_add_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
@@ -361,6 +364,7 @@ static void dnt900_add_new_mac_address(struct work_struct *ws);
 static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_ldisc(struct work_struct *ws);
 static void dnt900_refresh_device(struct work_struct *ws);
+static void dnt900_map_radios(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
@@ -1306,6 +1310,19 @@ static int dnt900_device_get_params(struct dnt900_device *device)
 	return 0;
 }
 
+static int dnt900_device_map_radios(struct dnt900_device *device)
+{
+	char mac_addresses[3 * 5 * 26];
+	for (int n = 0; n < 26; ++n)
+		TRY(dnt900_device_get_register(device, &dnt900_attributes[RegMACAddr00 + n].reg, mac_addresses + 3 * 5 * n));
+	for (int n = 0; n < 26 * 5; ++n) {
+		char *mac_address = mac_addresses + 3 * n;
+		if (VALID_MAC_ADDRESS(mac_address))
+			dnt900_ldisc_add_remote_device(device->ldisc, mac_address);
+	}
+	return 0;
+}
+
 static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name)
 {
 	int error = 0;
@@ -1334,6 +1351,7 @@ static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_addr
 	device->cdev.owner = THIS_MODULE;
 	kobject_set_name(&device->cdev.kobj, name);
 	UNWIND(error, cdev_add(&device->cdev, devt, 1), fail_cdev_add);
+	dnt900_schedule_work(ldisc, mac_address, dnt900_map_radios);
 	goto success;
 	
 fail_cdev_add:
@@ -1816,7 +1834,7 @@ static void dnt900_add_new_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	dnt900_ldisc_add_remote_device(work->ldisc, work->address);
-	kfree((void *)work);
+	kfree(work);
 }
 
 static void dnt900_add_new_sys_address(struct work_struct *ws)
@@ -1827,7 +1845,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 	UNWIND(error, dnt900_get_remote_register(work->ldisc, work->address, &dnt900_attributes[MacAddress].reg, mac_address), exit);
 	dnt900_ldisc_add_remote_device(work->ldisc, mac_address);
 exit:
-	kfree((void *)work);
+	kfree(work);
 }
 
 static void dnt900_refresh_ldisc(struct work_struct *ws)
@@ -1835,14 +1853,14 @@ static void dnt900_refresh_ldisc(struct work_struct *ws)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	dnt900_ldisc_get_params(work->ldisc);
 	dnt900_for_each_device(work->ldisc, dnt900_device_get_params);
-	kfree((void *)work);
+	kfree(work);
 }
 
 static void dnt900_refresh_device(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_get_params);
-	kfree((void *)work);
+	kfree(work);
 }
 
 static void dnt900_init_ldisc(struct work_struct *ws)
@@ -1859,7 +1877,14 @@ static void dnt900_init_ldisc(struct work_struct *ws)
 fail:
 	pr_err("could not connect to dnt900 module on %s (error %d)\n", work->ldisc->tty->name, -error);
 success:
-	kfree((void *)work);
+	kfree(work);
+}
+
+static void dnt900_map_radios(struct work_struct *ws)
+{
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_map_radios);
+	kfree(work);
 }
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
@@ -1963,6 +1988,7 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr)
 {
+	// TODO: need to lock device->rx_lock
 	struct dnt900_ldisc *ldisc = tty->disc_data;
 	ssize_t result;
 	struct device *dev = device_find_child(ldisc->tty->dev, NULL, dnt900_device_is_local);
@@ -2045,6 +2071,6 @@ MODULE_VERSION("0.1");
 
 // TODO: limit number of devices created using 'members' module parameter
 
-// TODO: convert announcements and rx events to json?
+// TODO: convert announcements and rx events to json or yaml?
 
 // TODO: do we need peer-to-peer ACKs? (EnableRtAcks)
