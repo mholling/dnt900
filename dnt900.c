@@ -60,7 +60,7 @@
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
-#define TIMEOUT_MS (5000)
+#define TIMEOUT_MS (2500)
 
 #define START_OF_PACKET (0xFB)
 
@@ -1473,7 +1473,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 {
 	if (ldisc->tty->flags & (1 << TTY_IO_ERROR))
 		return -EIO;
-	int error = 0;
+	int error;
 	struct dnt900_packet packet;
 	struct dnt900_message_header *header = message;
 	unsigned int count = 3 + arg_length;
@@ -1496,18 +1496,18 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
 	for (int sent; count; count -= sent, buf += sent) {
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
-		tty_wait_until_sent(ldisc->tty, 0);
+		if (sent < count)
+			tty_wakeup(ldisc->tty);
 	}
 	mutex_unlock(&ldisc->tty_lock);
 	
 	if (!expects_reply)
 		goto exit;
 	
-	long remaining = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : 0;
-	if (error)
-		goto exit;
-	return packet.error;
+	long completed = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
+	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : 0;
+	if (!error)
+		return packet.error;
 	
 exit:
 	mutex_lock(&ldisc->packets_lock);
