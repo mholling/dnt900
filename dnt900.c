@@ -364,6 +364,7 @@ static void dnt900_add_new_mac_address(struct work_struct *ws);
 static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_ldisc(struct work_struct *ws);
 static void dnt900_refresh_device(struct work_struct *ws);
+static void dnt900_init_ldisc(struct work_struct *ws);
 static void dnt900_map_radios(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
@@ -1023,7 +1024,6 @@ static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 		// flushing the DNT900 with zeroes seems to be needed for some reason...
 		char zeroes[100] = { 0 };
 		ldisc->tty->ops->write(ldisc->tty, zeroes, ARRAY_SIZE(zeroes));
-		ldisc->tty->ops->flush_chars(ldisc->tty);
 	} else {
 		char enter_protocol_message[] = { 0, 0, 0, 'D', 'N', 'T', 'C', 'F', 'G' };
 		error = dnt900_send_message(ldisc, enter_protocol_message, 6, COMMAND_ENTER_PROTOCOL_MODE, false, NULL);
@@ -1120,7 +1120,6 @@ static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_addre
 
 static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size)
 {
-	// TODO: Is this expensive (given that it is called for every TxData packet)?
 	TRY(mutex_lock_interruptible(&ldisc->param_lock));
 	*slot_size = ldisc->slot_size;
 	mutex_unlock(&ldisc->param_lock);
@@ -1245,8 +1244,6 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
-	// TODO: how to handle blocking/non-blocking here when the tty is being overrun?
-	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message message;
 	unsigned int slot_size;
@@ -1254,6 +1251,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
 	if (slot_size <= 6)
 		return -ECOMM;
+	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	size_t sent = 0;
 	int error = 0;
 	while (length > 0) {
@@ -1402,7 +1400,7 @@ static int dnt900_free_device(struct device *dev, void *unused)
 
 static void dnt900_free_devices(struct dnt900_ldisc *ldisc)
 {
-	class_for_each_device(dnt900_class, NULL, NULL, dnt900_free_device);
+	device_for_each_child(ldisc->tty->dev, NULL, dnt900_free_device);
 }
 
 static int dnt900_device_matches_sys_address(struct device *dev, void *data)
@@ -1429,7 +1427,7 @@ static int dnt900_device_is_local(struct device *dev, void *data)
 
 static bool dnt900_device_exists(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	return class_for_each_device(dnt900_class, NULL, (void *)mac_address, dnt900_device_matches_mac_address);
+	return device_for_each_child(ldisc->tty->dev, (void *)mac_address, dnt900_device_matches_mac_address);
 }
 
 static int dnt900_dispatch_to_device(struct dnt900_ldisc *ldisc, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *))
@@ -1498,7 +1496,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
 	for (int sent; count; count -= sent, buf += sent) {
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
-		ldisc->tty->ops->flush_chars(ldisc->tty);
+		tty_wait_until_sent(ldisc->tty, 0);
 	}
 	mutex_unlock(&ldisc->tty_lock);
 	
@@ -1898,7 +1896,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 {
 	int error = 0;
 	
-	if (!tty->ops->write || ! tty->ops->flush_chars)
+	if (!tty->ops->write)
 		return -EIO;
 	
 	struct dnt900_ldisc *ldisc = kzalloc(sizeof(*ldisc), GFP_KERNEL);
@@ -1988,13 +1986,15 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr)
 {
-	// TODO: need to lock device->rx_lock
 	struct dnt900_ldisc *ldisc = tty->disc_data;
 	ssize_t result;
 	struct device *dev = device_find_child(ldisc->tty->dev, NULL, dnt900_device_is_local);
 	UNWIND(result, dev ? 0 : -ENODEV, fail_find);
 	struct dnt900_device *device = dev_get_drvdata(dev);
+	UNWIND(result, mutex_lock_interruptible(&device->rx_lock), fail_lock);
 	result = dnt900_device_read(device, filp, buf, nr);
+	mutex_unlock(&device->rx_lock);
+fail_lock:
 	put_device(dev);
 fail_find:
 	return result;
@@ -2055,14 +2055,17 @@ MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
 
+// TODO: deal with absences of tty->ops->flush_chars()
+// (tty_wait_until_send doesn't seem to work)
+
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 
-// TODO: reset doesn't work!
+// TODO: We could map the network more reliably simply by reading RegMACAddrXX
+// from the base radio and going from there (trigger on startup and on network join)
 
-// TODO: possible for a base to automatically map the entire network?
-
-// TODO: add a module parameter array for MAC addresses to auto-load?
+// TODO: should we rx_lock and tx_lock on a per-read/per-write basis
+// instead of excluding multiple openers?
 
 // TODO: how to detect changes in slot_size when TDMA is used?
 
@@ -2073,4 +2076,5 @@ MODULE_VERSION("0.1");
 
 // TODO: convert announcements and rx events to json or yaml?
 
-// TODO: do we need peer-to-peer ACKs? (EnableRtAcks)
+// TODO: do we need peer-to-peer ACKs? (EnableRtAcks and so on)
+// (maybe add bool expects_ack argument to dnt900_send_message?)
