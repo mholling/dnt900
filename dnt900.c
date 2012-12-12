@@ -1120,7 +1120,6 @@ static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_addre
 
 static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size)
 {
-	// TODO: Is this expensive (given that it is called for every TxData packet)?
 	TRY(mutex_lock_interruptible(&ldisc->param_lock));
 	*slot_size = ldisc->slot_size;
 	mutex_unlock(&ldisc->param_lock);
@@ -1245,8 +1244,6 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
-	// TODO: how to handle blocking/non-blocking here when the tty is being overrun?
-	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	struct dnt900_device *device = filp->private_data;
 	struct dnt900_tx_data_message message;
 	unsigned int slot_size;
@@ -1254,6 +1251,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 	TRY(dnt900_read_slot_size(device->ldisc, &slot_size));
 	if (slot_size <= 6)
 		return -ECOMM;
+	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	size_t sent = 0;
 	int error = 0;
 	while (length > 0) {
@@ -1402,7 +1400,7 @@ static int dnt900_free_device(struct device *dev, void *unused)
 
 static void dnt900_free_devices(struct dnt900_ldisc *ldisc)
 {
-	class_for_each_device(dnt900_class, NULL, NULL, dnt900_free_device);
+	device_for_each_child(ldisc->tty->dev, NULL, dnt900_free_device);
 }
 
 static int dnt900_device_matches_sys_address(struct device *dev, void *data)
@@ -1429,7 +1427,7 @@ static int dnt900_device_is_local(struct device *dev, void *data)
 
 static bool dnt900_device_exists(struct dnt900_ldisc *ldisc, const char *mac_address)
 {
-	return class_for_each_device(dnt900_class, NULL, (void *)mac_address, dnt900_device_matches_mac_address);
+	return device_for_each_child(ldisc->tty->dev, (void *)mac_address, dnt900_device_matches_mac_address);
 }
 
 static int dnt900_dispatch_to_device(struct dnt900_ldisc *ldisc, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_device *, void *))
@@ -1506,10 +1504,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 		goto exit;
 	
 	long remaining = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : 0;
-	if (error)
-		goto exit;
-	return packet.error;
+	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : packet.error;
 	
 exit:
 	mutex_lock(&ldisc->packets_lock);
@@ -2078,4 +2073,5 @@ MODULE_VERSION("0.1");
 
 // TODO: convert announcements and rx events to json or yaml?
 
-// TODO: do we need peer-to-peer ACKs? (EnableRtAcks)
+// TODO: do we need peer-to-peer ACKs? (EnableRtAcks and so on)
+// (maybe add bool expects_ack argument to dnt900_send_message?)
