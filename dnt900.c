@@ -1688,18 +1688,18 @@ static int dnt900_process_rx_event(struct dnt900_device *device, void *data)
 	struct dnt900_rxdata rxdata = { .buf = text };
 	
 	rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-		"received I/O report:\n" \
-		"    MAC address 0x%02X%02X%02X\n" \
-		"    GPIO0 0x%02X\n" \
-		"    GPIO1 0x%02X\n" \
-		"    GPIO2 0x%02X\n" \
-		"    GPIO3 0x%02X\n" \
-		"    GPIO4 0x%02X\n" \
-		"    GPIO5 0x%02X\n" \
-		"    ADC0 0x%02X%02X\n" \
-		"    ADC1 0x%02X%02X\n" \
-		"    ADC2 0x%02X%02X\n" \
-		"    event flags 0x%02X%02X\n", \
+		"- event: I/O report\n" \
+		"  MAC address: 0x%02X%02X%02X\n" \
+		"  GPIO0: 0x%02X\n" \
+		"  GPIO1: 0x%02X\n" \
+		"  GPIO2: 0x%02X\n" \
+		"  GPIO3: 0x%02X\n" \
+		"  GPIO4: 0x%02X\n" \
+		"  GPIO5: 0x%02X\n" \
+		"  ADC0: 0x%02X%02X\n" \
+		"  ADC1: 0x%02X%02X\n" \
+		"  ADC2: 0x%02X%02X\n" \
+		"  flags: 0x%02X%02X\n", \
 		device->mac_address[2], device->mac_address[1], device->mac_address[0], \
 		io[0], io[1], io[2], io[3], io[4], io[5], \
 		io[7], io[6], io[9], io[8], io[11], io[10], \
@@ -1717,16 +1717,19 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"completed startup initialization\n");
+			"- event: startup complete\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		dnt900_schedule_work(ldisc, NULL, dnt900_refresh_ldisc);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"joined network:\n" \
-			"    network ID 0x%02X\n" \
-			"    base MAC address 0x%02X%02X%02X\n" \
-			"    range %d km\n", \
-			annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
+			"- event: joined network\n" \
+			"  code: 0x%02X\n" \
+			"  network ID: 0x%02X\n" \
+			"  base MAC address: 0x%02X%02X%02X\n" \
+			"  range: %d km\n", \
+			annc[0], annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 2))
 			dnt900_schedule_work(ldisc, annc + 2, dnt900_refresh_device);
 		else
@@ -1734,16 +1737,18 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		break;
 	case ANNOUNCEMENT_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"exited network:\n" \
-			"    network ID 0x%02X\n", \
-			annc[1]);
+			"- event: departed network\n" \
+			"  code: 0x%02X\n" \
+			"  network ID 0x%02X\n", \
+			annc[0], annc[1]);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"radio joined:\n" \
-			"    MAC address 0x%02X%02X%02X\n" \
-			"    range %d km\n", \
-			annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
+			"- event: remote joined\n" \
+			"  code: 0x%02X\n" \
+			"  MAC address: 0x%02X%02X%02X\n" \
+			"  range: %d km\n", \
+			annc[0], annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
 		if (dnt900_device_exists(ldisc, annc + 1))
 			dnt900_schedule_work(ldisc, annc + 1, dnt900_refresh_device);
 		else
@@ -1751,26 +1756,30 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"radio exited:\n" \
-			"    MAC address 0x%02X%02X%02X\n", \
-			annc[3], annc[2], annc[1]);
+			"- event: remote departed\n" \
+			"  code: 0x%02X\n" \
+			"  MAC address: 0x%02X%02X%02X\n", \
+			annc[0], annc[3], annc[2], annc[1]);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"base rebooted\n");
+			"- event: base rebooted\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"received radio heartbeat:\n" \
-			"    MAC address 0x%02X%02X%02X\n" \
-			"    network address 0x%02X\n" \
-			"    network ID 0x%02X\n" \
-			"    parent network ID 0x%02X\n" \
-			"    received RSSI %ddBm\n" \
-			"    reported RSSI %ddBm\n" \
-			"    packet success rate %d%%\n" \
-			"    range %d km\n", \
-			annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
+			"- event: received heartbeat\n" \
+			"  code: 0x%02X\n" \
+			"  MAC address: 0x%02X%02X%02X\n" \
+			"  network address: 0x%02X\n" \
+			"  network ID: 0x%02X\n" \
+			"  parent network ID: 0x%02X\n" \
+			"  received RSSI: %d dBm\n" \
+			"  reported RSSI: %d dBm\n" \
+			"  packet success rate: %d%%\n" \
+			"  range: %d km\n", \
+			annc[0], annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
 		char sys_address[] = { annc[4], annc[5], 0xFF };
@@ -1778,36 +1787,64 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
-			"router heartbeat timed out:\n" \
-			"    network ID 0x%02X\n",
-			annc[1]);
+			"- event: router heartbeat timed out\n" \
+			"  code: 0x%02X\n" \
+			"  network ID: 0x%02X\n",
+			annc[0], annc[1]);
 		break;
 	case ERROR_PROTOCOL_TYPE:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: invalid message type\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: invalid message type\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_PROTOCOL_ARGUMENT:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: invalid argument\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: invalid argument\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_PROTOCOL_GENERAL:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: general error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: general error\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_PROTOCOL_TIMEOUT:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: parser timeout\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: parser timeout\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_PROTOCOL_READONLY:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "protocol error: register is read-only\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: register is read-only\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_UART_OVERFLOW:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: receive buffer overflow\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: UART receive buffer overflow\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_UART_OVERRUN:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: receive overrun\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: UART receive overrun\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_UART_FRAMING:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "UART error: framing error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- error: UART framing error\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	case ERROR_HARDWARE:
-		rxdata.len = scnprintf(text, ARRAY_SIZE(text), "hardware error\n");
+		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
+			"- hardware error\n" \
+			"  code: 0x%02X\n", \
+			annc[0]);
 		break;
 	default:
 		return 0;
