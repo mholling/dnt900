@@ -1504,7 +1504,10 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 		goto exit;
 	
 	long remaining = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : packet.error;
+	error = !remaining ? -ETIMEDOUT : remaining < 0 ? remaining : 0;
+	if (error)
+		goto exit;
+	return packet.error;
 	
 exit:
 	mutex_lock(&ldisc->packets_lock);
@@ -2005,7 +2008,6 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 	TRY(dnt900_read_slot_size(ldisc, &slot_size));
 	if (slot_size <= 6)
 		return -ECOMM;
-	TRY(mutex_lock_interruptible(&device->tx_lock));
 	size_t sent = 0;
 	int error = 0;
 	while (nr > 0) {
@@ -2016,7 +2018,6 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 		buf += count;
 		nr -= count;
 	}
-	mutex_unlock(&device->tx_lock);
 exit:
 	return sent ? sent : error;
 }
