@@ -2054,12 +2054,14 @@ MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
 
+// TODO: deal with absences of tty->ops->flush_chars()
+// (tty_wait_until_send doesn't seem to work)
+
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 
-// TODO: reset doesn't work!
-
-// TODO: possible for a base to automatically map the entire network?
+// TODO: We could map the network more reliably simply by reading RegMACAddrXX
+// from the base radio and going from there (trigger on startup and on network join)
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
