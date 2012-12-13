@@ -332,7 +332,8 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
-static int dnt900_device_get_params(struct dnt900_device *device);
+static int dnt900_device_get_sys_address(struct dnt900_device *device);
+static int dnt900_device_check_presence(struct dnt900_device *device);
 static int dnt900_device_map_remotes(struct dnt900_device *device);
 
 static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
@@ -1295,13 +1296,18 @@ static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
 	return 0;
 }
 
-static int dnt900_device_get_params(struct dnt900_device *device)
+static int dnt900_device_get_sys_address(struct dnt900_device *device)
 {
 	char sys_address[3];
 	TRY(dnt900_discover(device->ldisc, device->mac_address, sys_address));
 	TRY(mutex_lock_interruptible(&device->param_lock));
 	COPY3(device->sys_address, sys_address);
 	mutex_unlock(&device->param_lock);
+	return 0;
+}
+
+static int dnt900_device_check_presence(struct dnt900_device *device)
+{
 	char mac_address[3];
 	TRY(dnt900_device_get_register(device, &dnt900_attributes[MacAddress].reg, mac_address));
 	return 0;
@@ -1336,7 +1342,8 @@ static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_addr
 	mutex_init(&device->tx_lock);
 	init_waitqueue_head(&device->rx_queue);
 	INIT_KFIFO(device->rx_fifo);
-	UNWIND(error, dnt900_device_get_params(device), fail_get_params);
+	UNWIND(error, dnt900_device_get_sys_address(device), fail_get_sys_address);
+	UNWIND(error, dnt900_device_check_presence(device), fail_presence);
 	dev_t devt = is_local ? MKDEV(0, 0) : MKDEV(ldisc->major, ldisc->minor++);
 	struct device *dev = device_create(dnt900_class, ldisc->tty->dev, devt, device, name);
 	if (IS_ERR(dev)) {
@@ -1356,7 +1363,8 @@ fail_cdev_add:
 fail_add_attributes:
 	device_unregister(dev);
 fail_dev_create:
-fail_get_params:
+fail_presence:
+fail_get_sys_address:
 	kfree(device);
 fail_alloc:
 success:
@@ -1866,7 +1874,7 @@ static void dnt900_add_new_mac_address(struct work_struct *ws)
 	struct dnt900_ldisc *ldisc = work->ldisc;
 	char *mac_address = work->address;
 	if (dnt900_device_exists(ldisc, mac_address))
-		dnt900_dispatch_to_device_no_data(ldisc, mac_address, dnt900_device_matches_mac_address, dnt900_device_get_params);
+		dnt900_dispatch_to_device_no_data(ldisc, mac_address, dnt900_device_matches_mac_address, dnt900_device_get_sys_address);
 	else
 		dnt900_ldisc_add_remote_device(ldisc, mac_address);
 	kfree(work);
@@ -1885,7 +1893,7 @@ static void dnt900_refresh_ldisc(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	dnt900_ldisc_get_params(work->ldisc);
-	dnt900_for_each_device(work->ldisc, dnt900_device_get_params);
+	dnt900_for_each_device(work->ldisc, dnt900_device_get_sys_address);
 	kfree(work);
 }
 
@@ -2091,9 +2099,6 @@ MODULE_VERSION("0.1");
 
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
-
-// TODO: We could map the network more reliably simply by reading RegMACAddrXX
-// from the base radio and going from there (trigger on startup and on network join)
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
