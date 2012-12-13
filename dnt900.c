@@ -46,6 +46,7 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/kfifo.h>
+#include <linux/delay.h>
 
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
@@ -107,6 +108,10 @@
 #define ERROR_UART_FRAMING      (0xEA)
 #define ERROR_HARDWARE          (0xEE)
 
+#define DEVICE_MODE_REMOTE (0x00)
+#define DEVICE_MODE_BASE   (0x01)
+#define DEVICE_MODE_ROUTER (0x03)
+
 #define ATTR_R  (S_IRUGO)
 #define ATTR_W  (S_IWUSR | S_IWGRP)
 #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
@@ -115,8 +120,6 @@
 	(address1)[0] == (address2)[0] && \
 	(address1)[1] == (address2)[1] && \
 	(address1)[2] == (address2)[2])
-
-#define VALID_MAC_ADDRESS(address) (!(address)[2] || !(address)[1] || !(address)[0])
 
 #define RANGE_TO_KMS(range) (4667 * (unsigned char)(range) / 10000)
 #define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
@@ -134,9 +137,9 @@
 } while (0)
 
 #define COPY3(dest, src) do { \
-	dest[0] = src[0]; \
-	dest[1] = src[1]; \
-	dest[2] = src[2]; \
+	(dest)[0] = (src)[0]; \
+	(dest)[1] = (src)[1]; \
+	(dest)[2] = (src)[2]; \
 } while (0)
 
 struct dnt900_message_header {
@@ -330,7 +333,7 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
 static int dnt900_device_get_params(struct dnt900_device *device);
-static int dnt900_device_map_radios(struct dnt900_device *device);
+static int dnt900_device_map_remotes(struct dnt900_device *device);
 
 static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
 static int dnt900_ldisc_add_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name);
@@ -363,9 +366,8 @@ static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *address
 static void dnt900_add_new_mac_address(struct work_struct *ws);
 static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_ldisc(struct work_struct *ws);
-static void dnt900_refresh_device(struct work_struct *ws);
 static void dnt900_init_ldisc(struct work_struct *ws);
-static void dnt900_map_radios(struct work_struct *ws);
+static void dnt900_map_remotes(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
@@ -1045,7 +1047,6 @@ static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc)
 
 static int dnt900_get_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, char *value)
 {
-	
 	struct dnt900_get_register_message message;
 	message.bank = reg->bank;
 	message.reg = reg->offset;
@@ -1094,7 +1095,7 @@ static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, 
 		struct dnt900_discover_message message;
 		COPY3(message.mac_address, mac_address);
 		int error = dnt900_send_message(ldisc, &message, 3, COMMAND_DISCOVER, true, sys_address);
-		return error ? -ENODEV : 0;
+		return error ? -ENODEV : 0; // TODO: do we need to translate this error code?
 	} else {
 		COPY3(sys_address, mac_address);
 		return 0;
@@ -1296,8 +1297,6 @@ static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
 
 static int dnt900_device_get_params(struct dnt900_device *device)
 {
-	if (device->is_local)
-		return 0;
 	char sys_address[3];
 	TRY(dnt900_discover(device->ldisc, device->mac_address, sys_address));
 	TRY(mutex_lock_interruptible(&device->param_lock));
@@ -1308,14 +1307,14 @@ static int dnt900_device_get_params(struct dnt900_device *device)
 	return 0;
 }
 
-static int dnt900_device_map_radios(struct dnt900_device *device)
+static int dnt900_device_map_remotes(struct dnt900_device *device)
 {
 	char mac_addresses[3 * 5 * 26];
 	for (int n = 0; n < 26; ++n)
 		TRY(dnt900_device_get_register(device, &dnt900_attributes[RegMACAddr00 + n].reg, mac_addresses + 3 * 5 * n));
 	for (int n = 0; n < 26 * 5; ++n) {
 		char *mac_address = mac_addresses + 3 * n;
-		if (VALID_MAC_ADDRESS(mac_address))
+		if (!mac_address[0] || !mac_address[1] || !mac_address[2])
 			dnt900_ldisc_add_remote_device(device->ldisc, mac_address);
 	}
 	return 0;
@@ -1349,7 +1348,7 @@ static int dnt900_create_device(struct dnt900_ldisc *ldisc, const char *mac_addr
 	device->cdev.owner = THIS_MODULE;
 	kobject_set_name(&device->cdev.kobj, name);
 	UNWIND(error, cdev_add(&device->cdev, devt, 1), fail_cdev_add);
-	dnt900_schedule_work(ldisc, mac_address, dnt900_map_radios);
+	dnt900_schedule_work(ldisc, mac_address, dnt900_map_remotes);
 	goto success;
 	
 fail_cdev_add:
@@ -1361,7 +1360,7 @@ fail_get_params:
 	kfree(device);
 fail_alloc:
 success:
-	return error;
+	return error == -ECOMM ? -ENODEV : error;
 }
 
 static int dnt900_ldisc_add_device(struct dnt900_ldisc *ldisc, const char *mac_address, bool is_local, const char *name)
@@ -1494,6 +1493,7 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, void *message, unsign
 	const char *buf = message;
 	
 	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
+	// TODO: use tty_lock()/tty_unlock instead?
 	for (int sent; count; count -= sent, buf += sent) {
 		sent = ldisc->tty->ops->write(ldisc->tty, buf, count);
 		if (sent < count)
@@ -1713,6 +1713,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 	char text[512];
 	struct dnt900_rxdata rxdata = { .buf = text };
 	struct dnt900_ldisc *ldisc = device->ldisc;
+	char base_mac_address[3] = { 0, 0, 0 };
 	
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
@@ -1730,10 +1731,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  base MAC address: 0x%02X%02X%02X\n" \
 			"  range: %d km\n", \
 			annc[0], annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
-		if (dnt900_device_exists(ldisc, annc + 2))
-			dnt900_schedule_work(ldisc, annc + 2, dnt900_refresh_device);
-		else
-			dnt900_schedule_work(ldisc, annc + 2, dnt900_add_new_mac_address);
+		dnt900_schedule_work(ldisc, base_mac_address, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1749,10 +1747,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  MAC address: 0x%02X%02X%02X\n" \
 			"  range: %d km\n", \
 			annc[0], annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
-		if (dnt900_device_exists(ldisc, annc + 1))
-			dnt900_schedule_work(ldisc, annc + 1, dnt900_refresh_device);
-		else
-			dnt900_schedule_work(ldisc, annc + 1, dnt900_add_new_mac_address);
+		dnt900_schedule_work(ldisc, annc + 1, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1868,18 +1863,21 @@ static void dnt900_schedule_work(struct dnt900_ldisc *ldisc, const char *address
 static void dnt900_add_new_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_ldisc_add_remote_device(work->ldisc, work->address);
+	struct dnt900_ldisc *ldisc = work->ldisc;
+	char *mac_address = work->address;
+	if (dnt900_device_exists(ldisc, mac_address))
+		dnt900_dispatch_to_device_no_data(ldisc, mac_address, dnt900_device_matches_mac_address, dnt900_device_get_params);
+	else
+		dnt900_ldisc_add_remote_device(ldisc, mac_address);
 	kfree(work);
 }
 
 static void dnt900_add_new_sys_address(struct work_struct *ws)
 {
-	int error;
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	char mac_address[3];
-	UNWIND(error, dnt900_get_remote_register(work->ldisc, work->address, &dnt900_attributes[MacAddress].reg, mac_address), exit);
-	dnt900_ldisc_add_remote_device(work->ldisc, mac_address);
-exit:
+	if (!dnt900_get_remote_register(work->ldisc, work->address, &dnt900_attributes[MacAddress].reg, mac_address))
+		dnt900_ldisc_add_remote_device(work->ldisc, mac_address);
 	kfree(work);
 }
 
@@ -1891,22 +1889,21 @@ static void dnt900_refresh_ldisc(struct work_struct *ws)
 	kfree(work);
 }
 
-static void dnt900_refresh_device(struct work_struct *ws)
-{
-	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_get_params);
-	kfree(work);
-}
-
 static void dnt900_init_ldisc(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	int error;
+	msleep_interruptible(1000); // wait for radio to possibly wake up from sleep
 	UNWIND(error, dnt900_enter_protocol_mode(work->ldisc), fail);
 	UNWIND(error, dnt900_ldisc_get_params(work->ldisc), fail);
 	char mac_address[3];
 	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address), fail);
 	UNWIND(error, dnt900_ldisc_add_local_device(work->ldisc, mac_address), fail);
+	char device_mode;
+	char base_mac_address[3] = { 0, 0, 0 };
+	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[DeviceMode].reg, &device_mode), fail);
+	if (device_mode != DEVICE_MODE_BASE)
+		dnt900_ldisc_add_remote_device(work->ldisc, base_mac_address);
 	goto success;
 	
 fail:
@@ -1915,10 +1912,10 @@ success:
 	kfree(work);
 }
 
-static void dnt900_map_radios(struct work_struct *ws)
+static void dnt900_map_remotes(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_map_radios);
+	dnt900_dispatch_to_device_no_data(work->ldisc, work->address, dnt900_device_matches_mac_address, dnt900_device_map_remotes);
 	kfree(work);
 }
 
@@ -2092,9 +2089,6 @@ MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
 
-// TODO: deal with absences of tty->ops->flush_chars()
-// (tty_wait_until_send doesn't seem to work)
-
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 
@@ -2111,7 +2105,7 @@ MODULE_VERSION("0.1");
 
 // TODO: limit number of devices created using 'members' module parameter
 
-// TODO: convert announcements and rx events to json or yaml?
-
 // TODO: do we need peer-to-peer ACKs? (EnableRtAcks and so on)
 // (maybe add bool expects_ack argument to dnt900_send_message?)
+
+// TODO: would be better to have correct MAC address for the base, rather than 0x000000
