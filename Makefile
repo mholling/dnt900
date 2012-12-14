@@ -20,11 +20,11 @@ clean:
 
 tty: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29 gpio_cfg=25 gpio_cts=27
-	ldattach --debug --eightbits --noparity --onestopbit --speed 9600 29 /dev/ttyAMA0 &
+	ldattach --debug --eightbits --noparity --onestopbit --speed 115200 29 /dev/ttyAMA0 &
 
 usb: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29
-	ldattach --debug --eightbits --noparity --onestopbit --speed 9600 29 /dev/ttyUSB0 &
+	ldattach --debug --eightbits --noparity --onestopbit --speed 115200 29 /dev/ttyUSB0 &
 
 unload:
 	killall ldattach || true

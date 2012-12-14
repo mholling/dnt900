@@ -113,8 +113,10 @@
 #define DEVICE_MODE_ROUTER (0x03)
 
 #define ATTR_R  (S_IRUGO)
-#define ATTR_W  (S_IWUSR | S_IWGRP)
-#define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
+// #define ATTR_W  (S_IWUSR | S_IWGRP)
+// #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
+#define ATTR_W  (S_IWUGO)
+#define ATTR_RW (S_IRUGO | S_IWUGO)
 
 #define EQUAL_ADDRESSES(address1, address2) ( \
 	(address1)[0] == (address2)[0] && \
