@@ -18,11 +18,11 @@ $(DRIVER).ko: $(DRIVER).c
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 
-load: $(DRIVER).ko
+tty: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29 gpio_cfg=25 gpio_cts=27
 	ldattach --debug --eightbits --noparity --onestopbit --speed 9600 29 /dev/ttyAMA0 &
 
-load-usb: $(DRIVER).ko
+usb: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29
 	ldattach --debug --eightbits --noparity --onestopbit --speed 9600 29 /dev/ttyUSB0 &
 
