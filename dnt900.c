@@ -309,7 +309,8 @@ static int dnt900_dispatch_to_device_no_data(struct dnt900_ldisc *ldisc, void *f
 static int dnt900_apply_to_device(struct device *dev, void *data);
 static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(struct dnt900_device *));
 
-static int dnt900_send_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_reply, bool expect_ack, char *result);
+static int dnt900_async_message(struct dnt900_ldisc *ldisc, const char *message);
+static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_ack, char *result);
 
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command);
@@ -984,7 +985,7 @@ static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 		ldisc->tty->ops->write(ldisc->tty, zeroes, ARRAY_SIZE(zeroes));
 	} else {
 		MESSAGE(message, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
-		error = dnt900_send_message(ldisc, message, false, false, NULL);
+		error = dnt900_async_message(ldisc, message);
 	}
 	return error;
 }
@@ -996,7 +997,7 @@ static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc)
 		gpio_set_value(ldisc->gpio_cfg, 1);
 	else {
 		MESSAGE(message, COMMAND_EXIT_PROTOCOL_MODE);
-		error = dnt900_send_message(ldisc, message, false, false, NULL);
+		error = dnt900_async_message(ldisc, message);
 	}
 	return error;
 }
@@ -1004,18 +1005,18 @@ static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc)
 static int dnt900_get_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, char *value)
 {
 	MESSAGE(message, COMMAND_GET_REGISTER, reg->offset, reg->bank, reg->span);
-	return dnt900_send_message(ldisc, message, true, false, value);
+	return dnt900_sync_message(ldisc, message, false, value);
 }
 
 static int dnt900_get_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, char *value)
 {
 	MESSAGE(message, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
-	// return dnt900_send_message(ldisc, message, true, true, value);
+	// return dnt900_sync_message(ldisc, message, true, value);
 	
 	// TODO: need a better solution to this:
 	int error = -EAGAIN;
 	for (int tries = 5; (error == -EAGAIN) && tries; --tries)
-		error = dnt900_send_message(ldisc, message, true, true, value);
+		error = dnt900_sync_message(ldisc, message, true, value);
 	return error;
 }
 
@@ -1024,7 +1025,7 @@ static int dnt900_set_register(struct dnt900_ldisc *ldisc, const struct dnt900_r
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	char message[32 + 6] = { START_OF_PACKET, reg->span + 4, COMMAND_SET_REGISTER, reg->offset, reg->bank, reg->span };
 	memcpy(message + 6, value, reg->span);
-	return dnt900_send_message(ldisc, message, expect_reply, false, NULL);
+	return expect_reply ? dnt900_sync_message(ldisc, message, false, NULL) : dnt900_async_message(ldisc, message);
 }
 
 static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, const char *value)
@@ -1032,7 +1033,8 @@ static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sy
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	char message[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
 	memcpy(message + 9, value, reg->span);
-	return dnt900_send_message(ldisc, message, expect_reply, true, NULL); // TODO: expect_ack??
+	// TODO: expect_ack??:
+	return expect_reply ? dnt900_sync_message(ldisc, message, true, NULL) : dnt900_async_message(ldisc, message);
 }
 
 static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, char *sys_address)
@@ -1041,7 +1043,7 @@ static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, 
 	TRY(dnt900_read_use_tree_routing(ldisc, &use_tree_routing));
 	if (use_tree_routing) {
 		MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
-		int error = dnt900_send_message(ldisc, message, true, true, sys_address);
+		int error = dnt900_sync_message(ldisc, message, true, sys_address);
 		return error ? -ENODEV : 0; // TODO: do we need to translate this error code?
 	} else {
 		COPY3(sys_address, mac_address);
@@ -1138,7 +1140,7 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	MESSAGE(message, COMMAND_SOFTWARE_RESET, 0);
-	TRY(dnt900_send_message(device->ldisc, message, true, false, NULL));
+	TRY(dnt900_sync_message(device->ldisc, message, false, NULL));
 	return count;
 }
 
@@ -1219,7 +1221,6 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	size_t sent = 0;
 	int error = 0;
-	// TODO: must get expect_ack in dnt900_send_message somehow...
 	while (length > 0) { // TODO: switch to for loop?
 		size_t count = slot_size - 6 < length ? slot_size - 6 : length;
 		error = 0;
@@ -1232,7 +1233,7 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 			break;
 		
 		message[1] = count + 4;
-		error = dnt900_send_message(ldisc, message, true, expect_ack, NULL);
+		error = dnt900_sync_message(ldisc, message, expect_ack, NULL);
 		if (error == -EAGAIN &&!sent && blocking)
 			continue;
 		if (error)
@@ -1452,10 +1453,24 @@ static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(stru
 	return device_for_each_child(ldisc->tty->dev, action, dnt900_apply_to_device);
 }
 
-static int dnt900_send_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_reply, bool expect_ack, char *result)
+static int dnt900_async_message(struct dnt900_ldisc *ldisc, const char *message)
 {
 	if (ldisc->tty->flags & (1 << TTY_IO_ERROR))
 		return -EIO;
+	TRY(mutex_lock_interruptible(&ldisc->tty_lock));
+	unsigned int count = (unsigned char)message[1] + 2;
+	// TODO: use tty_lock()/tty_unlock instead?
+	for (unsigned int sent; count; count -= sent, message += sent) {
+		sent = ldisc->tty->ops->write(ldisc->tty, message, count);
+		if (sent < count)
+			tty_wakeup(ldisc->tty);
+	}
+	mutex_unlock(&ldisc->tty_lock);
+	return 0;
+}
+
+static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_ack, char *result)
+{
 	struct dnt900_packet packet = { .result = result, .error = 0, .message = message, .expect_ack = expect_ack };
 	INIT_LIST_HEAD(&packet.list);
 	init_completion(&packet.completed);
@@ -1465,23 +1480,10 @@ static int dnt900_send_message(struct dnt900_ldisc *ldisc, const char *message, 
 	mutex_unlock(&ldisc->packets_lock);
 	
 	int error;
-	UNWIND(error, mutex_lock_interruptible(&ldisc->tty_lock), exit);
-	unsigned int count = (unsigned char)message[1] + 2;
-	// TODO: use tty_lock()/tty_unlock instead?
-	for (unsigned int sent; count; count -= sent, message += sent) {
-		sent = ldisc->tty->ops->write(ldisc->tty, message, count);
-		if (sent < count)
-			tty_wakeup(ldisc->tty);
-	}
-	mutex_unlock(&ldisc->tty_lock);
-	
-	if (!expect_reply)
-		goto exit;
-	
+	UNWIND(error, dnt900_async_message(ldisc, message), exit);
 	long completed = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : 0;
-	if (!error)
-		return packet.error;
+	UNWIND(error, !completed ? -ETIMEDOUT : completed < 0 ? completed : 0, exit);
+	return packet.error;
 	
 exit: // TODO: check packet is enqueued before dequeueing it!
 	mutex_lock(&ldisc->packets_lock);
@@ -2063,9 +2065,6 @@ MODULE_VERSION("0.1");
 // (maybe set callbacks on the attribute writers?)
 
 // TODO: limit number of devices created using 'members' module parameter
-
-// TODO: do we need peer-to-peer ACKs? (EnableRtAcks and so on)
-// (maybe add bool expects_ack argument to dnt900_send_message?)
 
 // TODO: would be better to have correct MAC address for the base, rather than 0x000000
 
