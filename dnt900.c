@@ -112,6 +112,12 @@
 #define DEVICE_MODE_BASE   (0x01)
 #define DEVICE_MODE_ROUTER (0x03)
 
+#define PROTOCOL_OPTIONS_ENABLE_TX_REPLY (0x04)
+#define PROTOCOL_OPTIONS_ENABLE_ANNOUNCE (0x01)
+
+#define ANNOUNCE_OPTIONS_LINKS (0x02)
+#define ANNOUNCE_OPTIONS_INIT  (0x01)
+
 #define ATTR_R  (S_IRUGO)
 // #define ATTR_W  (S_IWUSR | S_IWGRP)
 // #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
@@ -122,6 +128,7 @@
 	(address1)[0] == (address2)[0] && \
 	(address1)[1] == (address2)[1] && \
 	(address1)[2] == (address2)[2])
+#define IS_BASE_ADDRESS(address) (!(address)[0] && !(address)[1] && !(address)[2])
 
 #define RANGE_TO_KMS(range) (4667 * (unsigned char)(range) / 10000)
 #define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
@@ -153,7 +160,13 @@ struct dnt900_packet {
 	char *result;
 	int error;
 	const char *message;
-	bool expect_ack;
+};
+
+struct dnt900_ldisc_params {
+	bool is_base;
+	bool use_tree_routing;
+	unsigned int slot_size;
+	bool tx_replies;
 };
 
 struct dnt900_ldisc {
@@ -171,9 +184,12 @@ struct dnt900_ldisc {
 	char message[MAX_PACKET_SIZE];
 	unsigned int end;
 	struct workqueue_struct *workqueue;
-	bool is_base;
-	bool use_tree_routing;
-	unsigned int slot_size;
+	struct dnt900_ldisc_params params;
+};
+
+struct dnt900_device_params {
+	char sys_address[3];
+	char enable_rt_acks;
 };
 
 struct dnt900_device {
@@ -186,8 +202,7 @@ struct dnt900_device {
 	wait_queue_head_t rx_queue;
 	DECLARE_KFIFO(rx_fifo, char, RX_BUF_SIZE);
 	char mac_address[3];
-	char sys_address[3];
-	bool tx_acks;
+	struct dnt900_device_params params;
 };
 
 struct dnt900_rxdata {
@@ -257,7 +272,6 @@ static int dnt900_add_attributes(struct device *dev);
 static void dnt900_remove_attributes(struct device *dev);
 
 static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc);
-static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc);
 static int dnt900_get_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, char *value);
 static int dnt900_get_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, char *value);
 static int dnt900_set_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, const char *value);
@@ -265,11 +279,8 @@ static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sy
 static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, char *sys_address);
 
 static int dnt900_set_sys_address(struct dnt900_device *device, void *data);
-static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_address);
-static int dnt900_read_tx_acks(struct dnt900_device *device, bool *tx_acks);
-static int dnt900_read_is_base(struct dnt900_ldisc *ldisc, bool *is_base);
-static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size);
-static int dnt900_read_use_tree_routing(struct dnt900_ldisc *ldisc, bool *use_tree_routing);
+static int dnt900_device_read_params(struct dnt900_device *device, struct dnt900_device_params *params);
+static int dnt900_ldisc_read_params(struct dnt900_ldisc *ldisc, struct dnt900_ldisc_params *params);
 
 static int dnt900_device_get_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
 static int dnt900_device_set_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value);
@@ -310,7 +321,7 @@ static int dnt900_apply_to_device(struct device *dev, void *data);
 static int dnt900_for_each_device(struct dnt900_ldisc *ldisc, int (*action)(struct dnt900_device *));
 
 static int dnt900_async_message(struct dnt900_ldisc *ldisc, const char *message);
-static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_ack, char *result);
+static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, char *result);
 
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command);
@@ -990,33 +1001,21 @@ static int dnt900_enter_protocol_mode(struct dnt900_ldisc *ldisc)
 	return error;
 }
 
-static int dnt900_exit_protocol_mode(struct dnt900_ldisc *ldisc)
-{
-	int error = 0;
-	if (ldisc->gpio_cfg >= 0)
-		gpio_set_value(ldisc->gpio_cfg, 1);
-	else {
-		MESSAGE(message, COMMAND_EXIT_PROTOCOL_MODE);
-		error = dnt900_async_message(ldisc, message);
-	}
-	return error;
-}
-
 static int dnt900_get_register(struct dnt900_ldisc *ldisc, const struct dnt900_register *reg, char *value)
 {
 	MESSAGE(message, COMMAND_GET_REGISTER, reg->offset, reg->bank, reg->span);
-	return dnt900_sync_message(ldisc, message, false, value);
+	return dnt900_sync_message(ldisc, message, value);
 }
 
 static int dnt900_get_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, char *value)
 {
 	MESSAGE(message, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
-	// return dnt900_sync_message(ldisc, message, true, value);
+	// return dnt900_sync_message(ldisc, message, value);
 	
 	// TODO: need a better solution to this:
 	int error = -EAGAIN;
 	for (int tries = 5; (error == -EAGAIN) && tries; --tries)
-		error = dnt900_sync_message(ldisc, message, true, value);
+		error = dnt900_sync_message(ldisc, message, value);
 	return error;
 }
 
@@ -1025,7 +1024,7 @@ static int dnt900_set_register(struct dnt900_ldisc *ldisc, const struct dnt900_r
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	char message[32 + 6] = { START_OF_PACKET, reg->span + 4, COMMAND_SET_REGISTER, reg->offset, reg->bank, reg->span };
 	memcpy(message + 6, value, reg->span);
-	return expect_reply ? dnt900_sync_message(ldisc, message, false, NULL) : dnt900_async_message(ldisc, message);
+	return expect_reply ? dnt900_sync_message(ldisc, message, NULL) : dnt900_async_message(ldisc, message);
 }
 
 static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sys_address, const struct dnt900_register *reg, const char *value)
@@ -1033,17 +1032,16 @@ static int dnt900_set_remote_register(struct dnt900_ldisc *ldisc, const char *sy
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	char message[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
 	memcpy(message + 9, value, reg->span);
-	// TODO: expect_ack??:
-	return expect_reply ? dnt900_sync_message(ldisc, message, true, NULL) : dnt900_async_message(ldisc, message);
+	return expect_reply ? dnt900_sync_message(ldisc, message, NULL) : dnt900_async_message(ldisc, message);
 }
 
 static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, char *sys_address)
 {
-	bool use_tree_routing;
-	TRY(dnt900_read_use_tree_routing(ldisc, &use_tree_routing));
-	if (use_tree_routing) {
+	struct dnt900_ldisc_params params;
+	TRY(dnt900_ldisc_read_params(ldisc, &params));
+	if (params.use_tree_routing) {
 		MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
-		int error = dnt900_sync_message(ldisc, message, true, sys_address);
+		int error = dnt900_sync_message(ldisc, message, sys_address);
 		return error ? -ENODEV : 0; // TODO: do we need to translate this error code?
 	} else {
 		COPY3(sys_address, mac_address);
@@ -1055,46 +1053,23 @@ static int dnt900_set_sys_address(struct dnt900_device *device, void *data)
 {
 	const char *sys_address = data;
 	TRY(mutex_lock_interruptible(&device->param_lock));
-	COPY3(device->sys_address, sys_address);
+	COPY3(device->params.sys_address, sys_address);
 	mutex_unlock(&device->param_lock);
 	return 0;
 }
 
-static int dnt900_read_sys_address(struct dnt900_device *device, char *sys_address)
+static int dnt900_device_read_params(struct dnt900_device *device, struct dnt900_device_params *params)
 {
 	TRY(mutex_lock_interruptible(&device->param_lock));
-	COPY3(sys_address, device->sys_address);
+	*params = device->params;
 	mutex_unlock(&device->param_lock);
 	return 0;
 }
 
-static int dnt900_read_tx_acks(struct dnt900_device *device, bool *tx_acks)
-{
-	TRY(mutex_lock_interruptible(&device->param_lock));
-	*tx_acks = device->tx_acks;
-	mutex_unlock(&device->param_lock);
-	return 0;
-}
-
-static int dnt900_read_is_base(struct dnt900_ldisc *ldisc, bool *is_base)
+static int dnt900_ldisc_read_params(struct dnt900_ldisc *ldisc, struct dnt900_ldisc_params *params)
 {
 	TRY(mutex_lock_interruptible(&ldisc->param_lock));
-	*is_base = ldisc->is_base;
-	mutex_unlock(&ldisc->param_lock);
-	return 0;
-}
-static int dnt900_read_slot_size(struct dnt900_ldisc *ldisc, unsigned int *slot_size)
-{
-	TRY(mutex_lock_interruptible(&ldisc->param_lock));
-	*slot_size = ldisc->slot_size;
-	mutex_unlock(&ldisc->param_lock);
-	return 0;
-}
-
-static int dnt900_read_use_tree_routing(struct dnt900_ldisc *ldisc, bool *use_tree_routing)
-{
-	TRY(mutex_lock_interruptible(&ldisc->param_lock));
-	*use_tree_routing = ldisc->use_tree_routing;
+	*params = ldisc->params;
 	mutex_unlock(&ldisc->param_lock);
 	return 0;
 }
@@ -1103,18 +1078,18 @@ static int dnt900_device_get_register(struct dnt900_device *device, const struct
 {
 	if (device->is_local)
 		return dnt900_get_register(device->ldisc, reg, value);
-	char sys_address[3];
-	TRY(dnt900_read_sys_address(device, sys_address));
-	return dnt900_get_remote_register(device->ldisc, sys_address, reg, value);
+	struct dnt900_device_params params;
+	TRY(dnt900_device_read_params(device, &params));
+	return dnt900_get_remote_register(device->ldisc, params.sys_address, reg, value);
 }
 
 static int dnt900_device_set_register(struct dnt900_device *device, const struct dnt900_register *reg, char *value)
 {
 	if (device->is_local)
 		return dnt900_set_register(device->ldisc, reg, value);
-	char sys_address[3];
-	TRY(dnt900_read_sys_address(device, sys_address));
-	return dnt900_set_remote_register(device->ldisc, sys_address, reg, value);
+	struct dnt900_device_params params;
+	TRY(dnt900_device_read_params(device, &params));
+	return dnt900_set_remote_register(device->ldisc, params.sys_address, reg, value);
 }
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf)
@@ -1133,6 +1108,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 	char value[32];
 	TRY(attribute->parse(buf, count, value));
 	TRY(dnt900_device_set_register(device, &attribute->reg, value));
+	// if (attribute->refresh && device->is_local) // TODO!!!
+	// 	dnt900_schedule_work(device->ldisc, NULL, dnt900_refresh_ldisc);
 	return count;
 }
 
@@ -1140,12 +1117,12 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	MESSAGE(message, COMMAND_SOFTWARE_RESET, 0);
-	TRY(dnt900_sync_message(device->ldisc, message, false, NULL));
+	TRY(dnt900_sync_message(device->ldisc, message, NULL));
 	return count;
 }
 
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
+{ // TODO: rename this function (and attribute)?
 	unsigned int mac_address_int;
 	char mac_address[3];
 	struct dnt900_device *device = dev_get_drvdata(dev);
@@ -1208,21 +1185,22 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 
 static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, const char *buf, size_t length, struct dnt900_device *device)
 {
-	unsigned int slot_size;
-	TRY(dnt900_read_slot_size(ldisc, &slot_size));
-	if (slot_size <= 6)
+	struct dnt900_ldisc_params ldisc_params;
+	TRY(dnt900_ldisc_read_params(ldisc, &ldisc_params));
+	if (ldisc_params.slot_size <= 6)
 		return -ECOMM;
-	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
+	struct dnt900_device_params device_params = { .enable_rt_acks = 0x00, .sys_address = { 0xFF, 0xFF, 0xFF } };
 	if (device)
-		TRY(dnt900_read_sys_address(device, message + 3));
-	bool expect_ack = false;
-	if (device)
-		TRY(dnt900_read_tx_acks(device, &expect_ack));
+		TRY(dnt900_device_read_params(device, &device_params));
+	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
+	COPY3(message + 3, device_params.sys_address);
+	bool device_is_base = IS_BASE_ADDRESS(device_params.sys_address);
+	bool sync = ldisc_params.tx_replies && device && (device_params.enable_rt_acks || ldisc_params.is_base || device_is_base);
 	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	size_t sent = 0;
 	int error = 0;
 	while (length > 0) { // TODO: switch to for loop?
-		size_t count = slot_size - 6 < length ? slot_size - 6 : length;
+		size_t count = ldisc_params.slot_size - 6 < length ? ldisc_params.slot_size - 6 : length;
 		error = 0;
 		
 		if (device)
@@ -1233,7 +1211,9 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 			break;
 		
 		message[1] = count + 4;
-		error = dnt900_sync_message(ldisc, message, expect_ack, NULL);
+		error = sync ?
+			dnt900_sync_message(ldisc, message, NULL) :
+			dnt900_async_message(ldisc, message);
 		if (error == -EAGAIN &&!sent && blocking)
 			continue;
 		if (error)
@@ -1258,36 +1238,35 @@ static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AuthMode].reg, &auth_mode));
-	if ((announce_options & 0x03) != 0x03)
-		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
-	if ((protocol_options & 0x05) != 0x05)
-		pr_err("set radio ProtocolOptions register to 0x05 for correct driver operation\n");
-	if (auth_mode == 0x02)
-		pr_warn("AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[DeviceMode].reg, &device_mode));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
+	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
+		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
+	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
+		pr_err("set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
+	if (auth_mode == 0x02)
+		pr_warn("AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	TRY(mutex_lock_interruptible(&ldisc->param_lock));
-	ldisc->is_base = device_mode == 0x01;
-	ldisc->slot_size = (unsigned char)slot_size;
-	ldisc->use_tree_routing = tree_routing_en == 0x01;
+	ldisc->params.is_base = device_mode == DEVICE_MODE_BASE;
+	ldisc->params.slot_size = (unsigned char)slot_size;
+	ldisc->params.use_tree_routing = tree_routing_en;
+	ldisc->params.tx_replies = protocol_options & PROTOCOL_OPTIONS_ENABLE_TX_REPLY;
 	mutex_unlock(&ldisc->param_lock);
 	return 0;
 }
 
 static int dnt900_device_get_params(struct dnt900_device *device)
 {
-	char sys_address[3];
-	char enable_rt_acks;
+	struct dnt900_device_params params;
 	
-	TRY(dnt900_discover(device->ldisc, device->mac_address, sys_address));
+	TRY(dnt900_discover(device->ldisc, device->mac_address, params.sys_address));
+	if (device->is_local)
+		TRY(dnt900_get_register(device->ldisc, &dnt900_attributes[EnableRtAcks].reg, &params.enable_rt_acks));
+	else
+		TRY(dnt900_get_remote_register(device->ldisc, params.sys_address, &dnt900_attributes[EnableRtAcks].reg, &params.enable_rt_acks));
 	TRY(mutex_lock_interruptible(&device->param_lock));
-	COPY3(device->sys_address, sys_address);
-	mutex_unlock(&device->param_lock);
-	// need to set sys_address before any registers are read
-	TRY(dnt900_device_get_register(device, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
-	TRY(mutex_lock_interruptible(&device->param_lock));
-	device->tx_acks = enable_rt_acks == 0x01; // || (!use_tree_routing && !peer_to_peer) (TODO?)
+	device->params = params;
 	mutex_unlock(&device->param_lock);
 	return 0;
 }
@@ -1391,9 +1370,9 @@ static int dnt900_device_matches_sys_address(struct device *dev, void *data)
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	const char *sys_address = data;
-	char device_sys_address[3];
-	int error = dnt900_read_sys_address(device, device_sys_address);
-	return !error && EQUAL_ADDRESSES(device_sys_address, sys_address);
+	struct dnt900_device_params params;
+	int error = dnt900_device_read_params(device, &params);
+	return !error && EQUAL_ADDRESSES(params.sys_address, sys_address);
 }
 
 static int dnt900_device_matches_mac_address(struct device *dev, void *data)
@@ -1469,9 +1448,9 @@ static int dnt900_async_message(struct dnt900_ldisc *ldisc, const char *message)
 	return 0;
 }
 
-static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, bool expect_ack, char *result)
+static int dnt900_sync_message(struct dnt900_ldisc *ldisc, const char *message, char *result)
 {
-	struct dnt900_packet packet = { .result = result, .error = 0, .message = message, .expect_ack = expect_ack };
+	struct dnt900_packet packet = { .result = result, .error = 0, .message = message };
 	INIT_LIST_HEAD(&packet.list);
 	init_completion(&packet.completed);
 	
@@ -1598,8 +1577,6 @@ static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 			packet->error = 0;
 			break;
 		case STATUS_NOT_ACKNOWLEDGED:
-			packet->error = packet->expect_ack ? -EAGAIN : 0;
-			break;
 		case STATUS_HOLDING_FOR_FLOW:
 			packet->error = -EAGAIN;
 			break;
@@ -1717,6 +1694,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  code: 0x%02X\n" \
 			"  network ID 0x%02X\n", \
 			annc[0], annc[1]);
+		// TODO: do something with this information
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1733,6 +1711,7 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  code: 0x%02X\n" \
 			"  MAC address: 0x%02X%02X%02X\n", \
 			annc[0], annc[3], annc[2], annc[1]);
+		// TODO: do something with this information
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1870,18 +1849,18 @@ static void dnt900_refresh_ldisc(struct work_struct *ws)
 static void dnt900_init_ldisc(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	struct dnt900_ldisc *ldisc = work->ldisc;
 	int error;
 	msleep_interruptible(1000); // wait for radio to possibly wake up from sleep
-	UNWIND(error, dnt900_enter_protocol_mode(work->ldisc), fail);
-	UNWIND(error, dnt900_ldisc_get_params(work->ldisc), fail);
+	UNWIND(error, dnt900_enter_protocol_mode(ldisc), fail);
+	UNWIND(error, dnt900_ldisc_get_params(ldisc), fail);
 	char mac_address[3];
-	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[MacAddress].reg, mac_address), fail);
-	UNWIND(error, dnt900_ldisc_add_local_device(work->ldisc, mac_address), fail);
-	char device_mode;
-	char base_mac_address[3] = { 0, 0, 0 };
-	UNWIND(error, dnt900_get_register(work->ldisc, &dnt900_attributes[DeviceMode].reg, &device_mode), fail);
-	if (device_mode != DEVICE_MODE_BASE)
-		dnt900_ldisc_add_remote_device(work->ldisc, base_mac_address);
+	UNWIND(error, dnt900_get_register(ldisc, &dnt900_attributes[MacAddress].reg, mac_address), fail);
+	UNWIND(error, dnt900_ldisc_add_local_device(ldisc, mac_address), fail);
+	if (ldisc->params.is_base)
+		goto success;
+	char base_mac_address[3] = { 0x00, 0x00, 0x00 };
+	dnt900_ldisc_add_remote_device(ldisc, base_mac_address);
 	goto success;
 	
 fail:
@@ -1950,6 +1929,9 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 		UNWIND(error, request_irq(gpio_to_irq(ldisc->gpio_cts), dnt900_cts_handler, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, DRIVER_NAME, ldisc), fail_irq_cts);
 	}
 	
+	if(!C_CRTSCTS(tty) && ldisc->gpio_cts < 0)
+		pr_warn("no hardware flow control enabled; data loss possible\n");
+	
 	dnt900_schedule_work(ldisc, NULL, dnt900_init_ldisc);
 	goto success;
 	
@@ -1983,7 +1965,6 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	down_write(&ldisc->shutdown_lock);
 	destroy_workqueue(ldisc->workqueue);
 	dnt900_free_devices(ldisc);
-	dnt900_exit_protocol_mode(ldisc);
 	if (ldisc->gpio_cts >= 0)
 		free_irq(gpio_to_irq(ldisc->gpio_cts), ldisc);
 	if (ldisc->gpio_cts >= 0)
@@ -2015,9 +1996,7 @@ fail_find:
 static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr)
 {
 	struct dnt900_ldisc *ldisc = tty->disc_data;
-	bool is_base;
-	TRY(dnt900_read_is_base(ldisc, &is_base));
-	return is_base ? dnt900_file_write(ldisc, filp, buf, nr, NULL) : -EPERM;
+	return dnt900_file_write(ldisc, filp, buf, nr, NULL);
 }
 
 int __init dnt900_init(void)
@@ -2055,13 +2034,14 @@ MODULE_VERSION("0.1");
 
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
+//       (Also, crash occurs if tty is already open when ldisc is opened?)
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
 
 // TODO: how to detect changes in slot_size when TDMA is used?
 
-// TODO: hook into sysfs writers when necessary to update device configs, etc.
+// TODO: hook into sysfs writers when necessary to update ldisc & device params when needed.
 // (maybe set callbacks on the attribute writers?)
 
 // TODO: limit number of devices created using 'members' module parameter

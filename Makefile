@@ -24,6 +24,7 @@ tty: $(DRIVER).ko
 
 usb: $(DRIVER).ko
 	sudo insmod $(DRIVER).ko n_dnt900=29
+	stty -F /dev/ttyUSB0 crtscts
 	ldattach --debug --eightbits --noparity --onestopbit --speed 115200 29 /dev/ttyUSB0 &
 
 unload:
