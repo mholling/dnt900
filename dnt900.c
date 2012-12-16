@@ -306,11 +306,11 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static ssize_t dnt900_device_read(struct dnt900_device *device, struct file *filp, char __user *buf, size_t length);
+static ssize_t dnt900_device_write(struct dnt900_device *device, struct file *filp, const char *buf, size_t length);
 
 static int dnt900_cdev_open(struct inode *inode, struct file *filp);
 static int dnt900_cdev_release(struct inode *inode, struct file *filp);
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
-static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, const char *buf, size_t length, struct dnt900_device *device);
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp);
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc);
@@ -1169,6 +1169,42 @@ static ssize_t dnt900_device_read(struct dnt900_device *device, struct file *fil
 	return copied;
 }
 
+static ssize_t dnt900_device_write(struct dnt900_device *device, struct file *filp, const char *buf, size_t length)
+{
+	struct dnt900_ldisc_params ldisc_params;
+	TRY(dnt900_ldisc_read_params(device->ldisc, &ldisc_params));
+	if (ldisc_params.slot_size <= 6)
+		return -ECOMM;
+	const bool broadcast = device->is_local;
+	struct dnt900_device_params device_params = { .sys_address = { 0xFF, 0xFF, 0xFF } };
+	if (!broadcast)
+		TRY(dnt900_device_read_params(device, &device_params));
+	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
+	COPY3(message + 3, device_params.sys_address);
+	bool sync = ldisc_params.tx_replies && !broadcast && (device_params.enable_rt_acks || ldisc_params.is_base || device_params.is_base);
+	bool blocking = !(filp->f_flags & O_NONBLOCK);
+	size_t sent = 0;
+	int error = 0;
+	for (size_t count; length > 0; error = 0, sent += count, buf += count, length -= count) {
+		count = ldisc_params.slot_size - 6 < length ? ldisc_params.slot_size - 6 : length;
+		if (broadcast)
+			memcpy(message + 6, buf, count);
+		else
+			error = copy_from_user(message + 6, buf, count) ? -EFAULT : 0;
+		if (error)
+			break;
+		message[1] = count + 4;
+		error = sync ?
+			dnt900_sync_message(device->ldisc, message, NULL) :
+			dnt900_async_message(device->ldisc, message);
+		if (error == -EAGAIN &&!sent && blocking)
+			continue;
+		if (error)
+			break;
+	}
+	return sent ? sent : error;
+}
+
 static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 {
 	struct dnt900_device *device = container_of(inode->i_cdev, struct dnt900_device, cdev);
@@ -1206,45 +1242,10 @@ static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t leng
 	return dnt900_device_read(device, filp, buf, length);
 }
 
-static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, const char *buf, size_t length, struct dnt900_device *device)
-{
-	struct dnt900_ldisc_params ldisc_params;
-	TRY(dnt900_ldisc_read_params(ldisc, &ldisc_params));
-	if (ldisc_params.slot_size <= 6)
-		return -ECOMM;
-	struct dnt900_device_params device_params = { .sys_address = { 0xFF, 0xFF, 0xFF } };
-	if (device)
-		TRY(dnt900_device_read_params(device, &device_params));
-	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
-	COPY3(message + 3, device_params.sys_address);
-	bool sync = ldisc_params.tx_replies && device && (device_params.enable_rt_acks || ldisc_params.is_base || device_params.is_base);
-	bool blocking = !(filp->f_flags & O_NONBLOCK);
-	size_t sent = 0;
-	int error = 0;
-	for (size_t count; length > 0; error = 0, sent += count, buf += count, length -= count) {
-		count = ldisc_params.slot_size - 6 < length ? ldisc_params.slot_size - 6 : length;
-		if (device)
-			error = copy_from_user(message + 6, buf, count) ? -EFAULT : 0;
-		else
-			memcpy(message + 6, buf, count);
-		if (error)
-			break;
-		message[1] = count + 4;
-		error = sync ?
-			dnt900_sync_message(ldisc, message, NULL) :
-			dnt900_async_message(ldisc, message);
-		if (error == -EAGAIN &&!sent && blocking)
-			continue;
-		if (error)
-			break;
-	}
-	return sent ? sent : error;
-}
-
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_device *device = filp->private_data;
-	return dnt900_file_write(device->ldisc, filp, buf, length, device);
+	return dnt900_device_write(device, filp, buf, length);
 }
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
@@ -2020,8 +2021,21 @@ fail_find:
 static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr)
 {
 	struct dnt900_ldisc *ldisc = tty->disc_data;
-	return dnt900_file_write(ldisc, filp, buf, nr, NULL);
+	ssize_t result;
+	struct device *dev = device_find_child(ldisc->tty->dev, NULL, dnt900_device_is_local);
+	UNWIND(result, dev ? 0 : -ENODEV, fail_find);
+	struct dnt900_device *device = dev_get_drvdata(dev);
+	result = dnt900_device_write(device, filp, buf, nr);
+	put_device(dev);
+fail_find:
+	return result;
 }
+
+// static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr)
+// {
+// 	struct dnt900_ldisc *ldisc = tty->disc_data;
+// 	return dnt900_device_write(ldisc, NULL, filp, buf, nr, NULL);
+// }
 
 int __init dnt900_init(void)
 {
@@ -2059,7 +2073,6 @@ MODULE_VERSION("0.1");
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 //       (Also, crash occurs if tty is already open when ldisc is opened?)
-// SOLUTION: use tty_ldisc_ref/tty_ldisc_ref_wait on cdev_open and tty_ldisc_deref on cdev_release
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
