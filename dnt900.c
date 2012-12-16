@@ -118,6 +118,17 @@
 #define ANNOUNCE_OPTIONS_LINKS (0x02)
 #define ANNOUNCE_OPTIONS_INIT  (0x01)
 
+#define AUTH_MODE_ANY     (0x00)
+#define AUTH_MODE_TABLE   (0x01)
+#define AUTH_MODE_HOST    (0x02)
+#define AUTH_MODE_CURRENT (0x03)
+
+#define ACCESS_MODE_POLLING      (0x00)
+#define ACCESS_MODE_CSMA         (0x01)
+#define ACCESS_MODE_TDMA_DYNAMIC (0x02)
+#define ACCESS_MODE_TDMA_FIXED   (0x03)
+#define ACCESS_MODE_TDMA_PTT     (0x04)
+
 #define ATTR_R  (S_IRUGO)
 // #define ATTR_W  (S_IWUSR | S_IWGRP)
 // #define ATTR_RW (S_IRUGO | S_IWUSR | S_IWGRP)
@@ -610,7 +621,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("RmtTransDestAddr",   ATTR_RW, 0x00, 0x2E, 0x03, print_3_bytes, parse_3_bytes, NULL, NULL),
 	DNT900_ATTR("TreeRoutingEn",      ATTR_RW, 0x00, 0x34, 0x01, print_1_bytes, parse_1_bytes, NULL, dnt900_refresh_all),
 	DNT900_ATTR("BaseModeNetID",      ATTR_RW, 0x00, 0x35, 0x01, print_1_bytes, parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("StaticNetAddr",      ATTR_RW, 0x00, 0x36, 0x01, print_1_bytes, parse_1_bytes, NULL, NULL),
+	DNT900_ATTR("StaticNetAddr",      ATTR_RW, 0x00, 0x36, 0x01, print_1_bytes, parse_1_bytes, dnt900_refresh_device, NULL),
 	DNT900_ATTR("HeartbeatIntrvl",    ATTR_RW, 0x00, 0x37, 0x02, print_2_bytes, parse_2_bytes, NULL, NULL),
 	DNT900_ATTR("TreeRoutingSysID",   ATTR_RW, 0x00, 0x39, 0x01, print_1_bytes, parse_1_bytes, NULL, NULL),
 	DNT900_ATTR("EnableRtAcks",       ATTR_RW, 0x00, 0x3A, 0x01, print_1_bytes, parse_1_bytes, dnt900_refresh_device, NULL),
@@ -1048,7 +1059,7 @@ static int dnt900_discover(struct dnt900_ldisc *ldisc, const char *mac_address, 
 	if (params.tree_routing) {
 		MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
 		int error = dnt900_sync_message(ldisc, message, sys_address);
-		return error ? -ENODEV : 0; // TODO: do we need to translate this error code?
+		return error == -ECOMM ? -ENODEV : error;
 	} else {
 		COPY3(sys_address, mac_address);
 		return 0;
@@ -1102,6 +1113,8 @@ static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *att
 {
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+	if (!attribute->print)
+		return -EPERM;
 	char value[32];
 	int error = dnt900_device_get_register(device, &attribute->reg, value);
 	return error ? error : attribute->print(value, buf);
@@ -1112,6 +1125,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 	struct dnt900_device *device = dev_get_drvdata(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	char value[32];
+	if (!attribute->parse)
+		return -EPERM;
 	TRY(attribute->parse(buf, count, value));
 	TRY(dnt900_device_set_register(device, &attribute->reg, value));
 	if (attribute->local_work && device->is_local)
@@ -1130,7 +1145,7 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 }
 
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{ // TODO: rename this function (and attribute)?
+{
 	unsigned int mac_address_int;
 	char mac_address[3];
 	struct dnt900_device *device = dev_get_drvdata(dev);
@@ -1197,7 +1212,7 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 	TRY(dnt900_ldisc_read_params(ldisc, &ldisc_params));
 	if (ldisc_params.slot_size <= 6)
 		return -ECOMM;
-	struct dnt900_device_params device_params = { .enable_rt_acks = 0x00, .sys_address = { 0xFF, 0xFF, 0xFF } };
+	struct dnt900_device_params device_params = { .sys_address = { 0xFF, 0xFF, 0xFF } };
 	if (device)
 		TRY(dnt900_device_read_params(device, &device_params));
 	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
@@ -1206,17 +1221,14 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 	bool blocking = !(filp->f_flags & O_NONBLOCK);
 	size_t sent = 0;
 	int error = 0;
-	while (length > 0) { // TODO: switch to for loop?
-		size_t count = ldisc_params.slot_size - 6 < length ? ldisc_params.slot_size - 6 : length;
-		error = 0;
-		
+	for (size_t count; length > 0; error = 0, sent += count, buf += count, length -= count) {
+		count = ldisc_params.slot_size - 6 < length ? ldisc_params.slot_size - 6 : length;
 		if (device)
 			error = copy_from_user(message + 6, buf, count) ? -EFAULT : 0;
 		else
 			memcpy(message + 6, buf, count);
 		if (error)
 			break;
-		
 		message[1] = count + 4;
 		error = sync ?
 			dnt900_sync_message(ldisc, message, NULL) :
@@ -1225,10 +1237,6 @@ static ssize_t dnt900_file_write(struct dnt900_ldisc *ldisc, struct file *filp, 
 			continue;
 		if (error)
 			break;
-		
-		sent += count;
-		buf += count;
-		length -= count;
 	}
 	return sent ? sent : error;
 }
@@ -1241,19 +1249,22 @@ static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size
 
 static int dnt900_ldisc_get_params(struct dnt900_ldisc *ldisc)
 {
-	char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en;
+	char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AuthMode].reg, &auth_mode));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[DeviceMode].reg, &device_mode));
 	TRY(dnt900_get_register(ldisc, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
+	TRY(dnt900_get_register(ldisc, &dnt900_attributes[AccessMode].reg, &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
 		pr_err("set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
-	if (auth_mode == 0x02)
+	if (auth_mode == AUTH_MODE_HOST)
 		pr_warn("AuthMode register is set to 0x02 but host-based authentication is not supported\n");
+	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
+		pr_warn("driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
 	TRY(mutex_lock_interruptible(&ldisc->param_lock));
 	ldisc->params.is_base = device_mode == DEVICE_MODE_BASE;
 	ldisc->params.slot_size = (unsigned char)slot_size;
@@ -1503,8 +1514,6 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 		if (ldisc->end == length) {
 			if (length > 2) {
 				const char type = ldisc->message[2];
-				// TODO: need to process possible errors returned by
-				// dnt900_process_... below:
 				if (type & TYPE_REPLY)
 					dnt900_process_reply(ldisc, type & MASK_COMMAND);
 				if (type & TYPE_EVENT)
@@ -1518,7 +1527,6 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 {
 	TRY(mutex_lock_interruptible(&ldisc->packets_lock));
-	// TODO: do we have to hold the mutex for this whole loop?
 	struct dnt900_packet *packet;
 	list_for_each_entry(packet, &ldisc->packets, list) {
 		char tx_status = STATUS_ACKNOWLEDGED;
@@ -1607,30 +1615,24 @@ static int dnt900_process_reply(struct dnt900_ldisc *ldisc, char command)
 
 static int dnt900_process_event(struct dnt900_ldisc *ldisc, char event)
 {
-	char sys_address[3];
 	struct dnt900_rxdata rxdata;
 	int error = 0;
 	
 	switch (event) {
 	case EVENT_RX_DATA:
-		for (int offset = 3; offset < 6; ++offset)
-			sys_address[offset-3] = ldisc->message[offset];
 		rxdata.buf = ldisc->message + 7;
 		rxdata.len = ldisc->end - 7;
-		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
-		// TODO: can we do anything with the RSSI value at message[6]?
+		error = dnt900_dispatch_to_device(ldisc, ldisc->message + 3, dnt900_device_matches_sys_address, &rxdata, dnt900_receive_data);
 		if (error == -ENODEV)
-			dnt900_schedule_work(ldisc, sys_address, dnt900_add_new_sys_address);
+			dnt900_schedule_work(ldisc, ldisc->message + 3, dnt900_add_new_sys_address);
 		break;
 	case EVENT_ANNOUNCE:
 		error = dnt900_dispatch_to_device(ldisc, NULL, dnt900_device_is_local, ldisc->message + 3, dnt900_process_announcement);
 		break;
 	case EVENT_RX_EVENT:
-		for (int offset = 3; offset < 6; ++offset)
-			sys_address[offset-3] = ldisc->message[offset];
-		error = dnt900_dispatch_to_device(ldisc, sys_address, dnt900_device_matches_sys_address, ldisc->message + 10, dnt900_process_rx_event);
+		error = dnt900_dispatch_to_device(ldisc, ldisc->message + 3, dnt900_device_matches_sys_address, ldisc->message + 10, dnt900_process_rx_event);
 		if (error == -ENODEV)
-			dnt900_schedule_work(ldisc, sys_address, dnt900_add_new_sys_address);
+			dnt900_schedule_work(ldisc, ldisc->message + 3, dnt900_add_new_sys_address);
 		break;
 	case EVENT_JOIN_REQUEST:
 		// unimplemented for now (used for host-based authentication)
@@ -1707,7 +1709,6 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  code: 0x%02X\n" \
 			"  network ID 0x%02X\n", \
 			annc[0], annc[1]);
-		// TODO: do something with this information
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1724,7 +1725,6 @@ static int dnt900_process_announcement(struct dnt900_device *device, void *data)
 			"  code: 0x%02X\n" \
 			"  MAC address: 0x%02X%02X%02X\n", \
 			annc[0], annc[3], annc[2], annc[1]);
-		// TODO: do something with this information
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1983,7 +1983,6 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 {
 	// TTY_IO_ERROR is set here so we can't do any more I/O via the serial
 	// port. This prevents us from e.g. sleeping or resetting the radio.
-	// (TODO)
 	
 	struct dnt900_ldisc *ldisc = tty->disc_data;
 	
@@ -2060,21 +2059,13 @@ MODULE_VERSION("0.1");
 // TODO: fix bug wherein crash occurse if line discipline is unloaded while a character device
 //       is still open (due to dnt900_cdev_ funtions being called after device is destroyed)
 //       (Also, crash occurs if tty is already open when ldisc is opened?)
+// SOLUTION: use tty_ldisc_ref/tty_ldisc_ref_wait on cdev_open and tty_ldisc_deref on cdev_release
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
 
-// TODO: how to detect changes in slot_size when TDMA is used?
-
-// TODO: hook into sysfs writers when necessary to update ldisc & device params when needed.
-// (maybe set callbacks on the attribute writers?)
-
 // TODO: limit number of devices created using 'members' module parameter
-
-// TODO: would be better to have correct MAC address for the base, rather than 0x000000
-
-// TODO: check for NULL parse/print pointers in attribute writers/readers
 
 // TODO: make use of ARQ_Mode and ARQ_AttemptLimit?
 
-// TODO: other attributes that affect sys_address?
+// TODO: report failure message strings by extending TRY() and UNWIND() macros
