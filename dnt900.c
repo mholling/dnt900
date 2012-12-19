@@ -310,9 +310,6 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
-static ssize_t dnt900_radio_read(struct dnt900_radio *radio, struct file *filp, char __user *buf, size_t length);
-static ssize_t dnt900_radio_write(struct dnt900_radio *radio, struct file *filp, const char *buf, size_t length);
-
 static int dnt900_cdev_open(struct inode *inode, struct file *filp);
 static int dnt900_cdev_close(struct inode *inode, struct file *filp);
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp);
@@ -365,8 +362,6 @@ static void dnt900_release_local(struct device *dev);
 
 static int dnt900_ldisc_open(struct tty_struct *tty);
 static void dnt900_ldisc_close(struct tty_struct *tty);
-static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr);
-static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr);
 
 int __init dnt900_init(void);
 void __exit dnt900_exit(void);
@@ -849,8 +844,6 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.name = DRIVER_NAME,
 	.open = dnt900_ldisc_open,
 	.close = dnt900_ldisc_close,
-	.read = dnt900_ldisc_read,
-	.write = dnt900_ldisc_write,
 	.receive_buf = dnt900_ldisc_receive_buf,
 	.owner = THIS_MODULE,
 };
@@ -1161,53 +1154,6 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 	return count;
 }
 
-static ssize_t dnt900_radio_read(struct dnt900_radio *radio, struct file *filp, char __user *buf, size_t length)
-{
-	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&radio->rx_fifo))
-		return -EAGAIN;
-	TRY(wait_event_interruptible(radio->rx_queue, !kfifo_is_empty(&radio->rx_fifo)));
-	unsigned int copied;
-	TRY(kfifo_to_user(&radio->rx_fifo, buf, length, &copied));
-	return copied;
-}
-
-static ssize_t dnt900_radio_write(struct dnt900_radio *radio, struct file *filp, const char *buf, size_t length)
-{
-	struct dnt900_local *local = DEV_TO_LOCAL(radio->dev.parent);
-	struct dnt900_local_params local_params;
-	TRY(dnt900_local_read_params(local, &local_params));
-	if (local_params.slot_size <= 6)
-		return -ECOMM;
-	const bool broadcast = radio->is_local;
-	struct dnt900_radio_params radio_params = { .sys_address = { 0xFF, 0xFF, 0xFF } };
-	if (!broadcast)
-		TRY(dnt900_radio_read_params(radio, &radio_params));
-	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
-	COPY3(message + 3, radio_params.sys_address);
-	bool sync = local_params.tx_replies && !broadcast && (radio_params.enable_rt_acks || local_params.is_base || radio_params.is_base);
-	bool blocking = !(filp->f_flags & O_NONBLOCK);
-	size_t sent = 0;
-	int error = 0;
-	for (size_t count; length > 0; error = 0, sent += count, buf += count, length -= count) {
-		count = local_params.slot_size - 6 < length ? local_params.slot_size - 6 : length;
-		if (broadcast)
-			memcpy(message + 6, buf, count);
-		else
-			error = copy_from_user(message + 6, buf, count) ? -EFAULT : 0;
-		if (error)
-			break;
-		message[1] = count + 4;
-		error = sync ?
-			dnt900_sync_message(local, message, NULL) :
-			dnt900_async_message(local, message);
-		if (error == -EAGAIN &&!sent && blocking)
-			continue;
-		if (error)
-			break;
-	}
-	return sent ? sent : error;
-}
-
 static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 {
 	struct dnt900_radio *radio = container_of(inode->i_cdev, struct dnt900_radio, cdev);
@@ -1248,13 +1194,50 @@ static int dnt900_cdev_close(struct inode *inode, struct file *filp)
 static ssize_t dnt900_cdev_read(struct file *filp, char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_radio *radio = filp->private_data;
-	return dnt900_radio_read(radio, filp, buf, length);
+	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&radio->rx_fifo))
+		return -EAGAIN;
+	TRY(wait_event_interruptible(radio->rx_queue, !kfifo_is_empty(&radio->rx_fifo)));
+	unsigned int copied;
+	TRY(kfifo_to_user(&radio->rx_fifo, buf, length, &copied));
+	return copied;
 }
 
 static ssize_t dnt900_cdev_write(struct file *filp, const char __user *buf, size_t length, loff_t *offp)
 {
 	struct dnt900_radio *radio = filp->private_data;
-	return dnt900_radio_write(radio, filp, buf, length);
+	struct dnt900_local *local = DEV_TO_LOCAL(radio->dev.parent);
+	struct dnt900_local_params local_params;
+	TRY(dnt900_local_read_params(local, &local_params));
+	if (local_params.slot_size <= 6)
+		return -ECOMM;
+	const bool broadcast = radio->is_local;
+	struct dnt900_radio_params radio_params = { .sys_address = { 0xFF, 0xFF, 0xFF } };
+	if (!broadcast)
+		TRY(dnt900_radio_read_params(radio, &radio_params));
+	char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA };
+	COPY3(message + 3, radio_params.sys_address);
+	bool sync = local_params.tx_replies && !broadcast && (radio_params.enable_rt_acks || local_params.is_base || radio_params.is_base);
+	bool blocking = !(filp->f_flags & O_NONBLOCK);
+	size_t sent = 0;
+	int error = 0;
+	for (size_t count; length > 0; error = 0, sent += count, buf += count, length -= count) {
+		count = local_params.slot_size - 6 < length ? local_params.slot_size - 6 : length;
+		if (broadcast)
+			memcpy(message + 6, buf, count);
+		else
+			error = copy_from_user(message + 6, buf, count) ? -EFAULT : 0;
+		if (error)
+			break;
+		message[1] = count + 4;
+		error = sync ?
+			dnt900_sync_message(local, message, NULL) :
+			dnt900_async_message(local, message);
+		if (error == -EAGAIN &&!sent && blocking)
+			continue;
+		if (error)
+			break;
+	}
+	return sent ? sent : error;
 }
 
 static int dnt900_local_get_params(struct dnt900_local *local)
@@ -1333,7 +1316,8 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	init_waitqueue_head(&radio->rx_queue);
 	INIT_KFIFO(radio->rx_fifo);
 	
-	radio->dev.devt = is_local ? MKDEV(0, 0) : MKDEV(local->major, local->minor++);
+	// radio->dev.devt = is_local ? MKDEV(0, 0) : MKDEV(local->major, local->minor++);
+	radio->dev.devt = MKDEV(local->major, local->minor++);
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
 	UNWIND(error, kobject_set_name(&radio->dev.kobj, name), fail_name);
@@ -1359,11 +1343,10 @@ static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address,
 	char name[80];
 	int error;
 	TRY(mutex_lock_interruptible(&local->radios_lock));
-	// TODO: this sets the cdev name too, but we want a different name for the cdev:
 	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
+	// snprintf(name, ARRAY_SIZE(name), "0x%02X%02X%02X", mac_address[2], mac_address[1], mac_address[0]);
 	UNWIND(error, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
 	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, name);
-	dev_set_name(&radio->dev, "blah.0x%02X%02X%02X", mac_address[2], mac_address[1], mac_address[0]);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
 	UNWIND(error, dnt900_radio_get_params(radio), fail_params);
 	UNWIND(error, dnt900_radio_add_attributes(radio), fail_attributes);
@@ -2023,35 +2006,6 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	dnt900_unregister_local(local);
 }
 
-static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t nr)
-{
-	struct dnt900_local *local = TTY_TO_LOCAL(tty);
-	ssize_t result;
-	struct device *dev = device_find_child(&local->dev, NULL, dnt900_radio_is_local);
-	UNWIND(result, dev ? 0 : -ENODEV, fail_find);
-	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	UNWIND(result, mutex_lock_interruptible(&radio->rx_lock), fail_lock);
-	result = dnt900_radio_read(radio, filp, buf, nr);
-	mutex_unlock(&radio->rx_lock);
-fail_lock:
-	put_device(dev);
-fail_find:
-	return result;
-}
-
-static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t nr)
-{
-	struct dnt900_local *local = TTY_TO_LOCAL(tty);
-	ssize_t result;
-	struct device *dev = device_find_child(&local->dev, NULL, dnt900_radio_is_local);
-	UNWIND(result, dev ? 0 : -ENODEV, fail_find);
-	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	result = dnt900_radio_write(radio, filp, buf, nr);
-	put_device(dev);
-fail_find:
-	return result;
-}
-
 int __init dnt900_init(void)
 {
 	int error;
@@ -2072,7 +2026,6 @@ void __exit dnt900_exit(void)
 {
 	pr_info("removing dnt900 module\n");
 	tty_unregister_ldisc(n_dnt900);
-	// TODO: class_for_each_device(dnt900_class, dnt900_unregister_local) or some such...
 	class_destroy(dnt900_class);
 }
 
@@ -2087,10 +2040,6 @@ MODULE_VERSION("0.1");
 // TODO: use dev_error() etc
 
 // TODO: use tty_lock to control access to tty after line discipline is closed
-
-// TODO: rename cdev to be different from the device
-
-// TODO: remove the tty character device stuff
 
 // TODO: reimplement /CFG interrupt
 
