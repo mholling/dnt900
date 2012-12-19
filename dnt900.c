@@ -1897,9 +1897,10 @@ static void dnt900_map_remotes(struct work_struct *ws)
 }
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
-{ // TODO:
-	// struct dnt900_local *local = dev_id;
-	// gpio_get_value(local->gpio_cts) ? stop_tty(local->tty) : start_tty(local->tty);
+{
+	struct dnt900_local *local = dev_id;
+	if (local->tty)
+		gpio_get_value(local->gpio_cts) ? stop_tty(local->tty) : start_tty(local->tty);
 	return IRQ_HANDLED;
 }
 
@@ -1993,6 +1994,8 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	down_write(&local->closed_lock);
 	destroy_workqueue(local->workqueue);
 	mutex_lock(&local->tty_lock);
+	if (local->gpio_cts >= 0)
+		free_irq(gpio_to_irq(local->gpio_cts), local);
 	tty_kref_put(local->tty);
 	local->tty = NULL;
 	tty->disc_data = NULL;
@@ -2032,8 +2035,6 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
-
-// TODO: reimplement /CFG interrupt
 
 // TODO: should we rx_lock and tx_lock on a per-read/per-write basis
 // instead of excluding multiple openers?
