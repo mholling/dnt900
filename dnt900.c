@@ -997,13 +997,10 @@ static int dnt900_local_add_attributes(struct dnt900_local *local)
 static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 {
 	if (local->gpio_cfg >= 0) {
-		char zeroes[100] = { 0 };
-		TRY(mutex_lock_interruptible(&local->tty_lock));
-		// TODO: check tty is not NULL here
+		gpio_set_value(local->gpio_cfg, 1);
+		msleep(100);
 		gpio_set_value(local->gpio_cfg, 0);
-		// flushing the DNT900 with zeroes seems to be needed for some reason...
-		local->tty->ops->write(local->tty, zeroes, ARRAY_SIZE(zeroes));
-		mutex_unlock(&local->tty_lock);
+		msleep(100);
 	} else {
 		MESSAGE(message, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
 		TRY(dnt900_async_message(local, message));
@@ -1334,7 +1331,6 @@ fail_alloc:
 static void dnt900_release_radio(struct device *dev)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-LINE();
 	kfree(radio);
 }
 
@@ -1456,7 +1452,7 @@ static int dnt900_async_message(struct dnt900_local *local, const char *message)
 {
 	int error;
 	TRY(mutex_lock_interruptible(&local->tty_lock));
-	UNWIND(error, local->tty ? 0 : -EPERM, exit);
+	UNWIND(error, local->tty ? 0 : -ENOENT, exit);
 	UNWIND(error, local->tty->flags & (1 << TTY_IO_ERROR) ? -EIO : 0, exit);
 	unsigned int count = (unsigned char)message[1] + 2;
 	for (unsigned int sent; count; count -= sent, message += sent) {
@@ -1970,7 +1966,6 @@ static void dnt900_release_local(struct device *dev)
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
 	
-LINE();
 	if (local->gpio_cts >= 0)
 		free_irq(gpio_to_irq(local->gpio_cts), local);
 	if (local->gpio_cts >= 0)
@@ -1978,8 +1973,7 @@ LINE();
 	if (local->gpio_cfg >= 0)
 		gpio_free(local->gpio_cfg);
 	unregister_chrdev_region(MKDEV(local->major, 0), members);
-	if (local->tty)
-		tty_kref_put(local->tty);
+	tty_kref_put(local->tty);
 	kfree(local);
 }
 
@@ -2038,8 +2032,6 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
-
-// TODO: use tty_lock to control access to tty after line discipline is closed
 
 // TODO: reimplement /CFG interrupt
 
