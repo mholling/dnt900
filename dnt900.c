@@ -186,8 +186,8 @@ struct dnt900_local_params {
 struct dnt900_local {
 	struct device dev;
 	struct tty_struct *tty;
-	int major;
-	int minor;
+	dev_t devt_start;
+	int radio_count;
 	int gpio_cfg;
 	int gpio_cts;
 	struct list_head packets;
@@ -319,6 +319,8 @@ static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
+static int dnt900_local_alloc_devt(struct dnt900_local *local, dev_t *devt);
+
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name);
 static void dnt900_release_radio(struct device *dev);
 static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address, bool is_local);
@@ -367,10 +369,12 @@ int __init dnt900_init(void);
 void __exit dnt900_exit(void);
 
 static int n_dnt900 = NR_LDISCS - 1;
-static int members = 126;
+static int radios = 255;
 static int gpio_cfg = -1;
 static int gpio_cts = -1;
 
+module_param(radios, int, S_IRUGO);
+MODULE_PARM_DESC(radios, "maximum number of radios");
 module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cfg, int, S_IRUGO);
@@ -1300,6 +1304,16 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	return 0;
 }
 
+static int dnt900_local_alloc_devt(struct dnt900_local *local, dev_t *devt)
+{
+	if (local->radio_count >= radios)
+		return -EMLINK;
+	int major = MAJOR(local->devt_start);
+	int minor = MINOR(local->devt_start);
+	*devt = MKDEV(major, minor + local->radio_count++);
+	return 0;
+}
+
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name)
 {
 	int error;
@@ -1313,8 +1327,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	init_waitqueue_head(&radio->rx_queue);
 	INIT_KFIFO(radio->rx_fifo);
 	
-	// radio->dev.devt = is_local ? MKDEV(0, 0) : MKDEV(local->major, local->minor++);
-	radio->dev.devt = MKDEV(local->major, local->minor++);
+	UNWIND(error, dnt900_local_alloc_devt(local, &radio->dev.devt), fail_devt);
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
 	UNWIND(error, kobject_set_name(&radio->dev.kobj, name), fail_name);
@@ -1323,6 +1336,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	
 fail_register:
 fail_name:
+fail_devt:
 	kfree(radio);
 fail_alloc:
 	return ERR_PTR(error == -ECOMM ? -ENODEV : error);
@@ -1919,10 +1933,8 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	INIT_LIST_HEAD(&local->packets);
 	local->workqueue = create_singlethread_workqueue(DRIVER_NAME);
 	UNWIND(error, local->workqueue ? 0 : -ENOMEM, fail_workqueue);
-	dev_t devt;
-	UNWIND(error, alloc_chrdev_region(&devt, 0, members, DRIVER_NAME), fail_alloc_chrdev_region);
-	local->major = MAJOR(devt);
-	local->minor = MINOR(devt);
+	UNWIND(error, alloc_chrdev_region(&local->devt_start, 0, radios, DRIVER_NAME), fail_alloc_chrdev_region);
+	local->radio_count = 0;
 	local->gpio_cfg = gpio_cfg; // how to make this per-instance?
 	if (local->gpio_cfg >= 0)
 		UNWIND(error, gpio_request_one(local->gpio_cfg, GPIOF_OUT_INIT_HIGH, "/cfg"), fail_gpio_cfg);
@@ -1952,7 +1964,7 @@ fail_gpio_cts:
 		gpio_free(local->gpio_cfg);
 fail_gpio_cfg:
 	tty->disc_data = NULL;
-	unregister_chrdev_region(MKDEV(local->major, 0), members);
+	unregister_chrdev_region(local->devt_start, radios);
 fail_alloc_chrdev_region:
 	destroy_workqueue(local->workqueue);
 fail_workqueue:
@@ -1973,7 +1985,7 @@ static void dnt900_release_local(struct device *dev)
 		gpio_free(local->gpio_cts);
 	if (local->gpio_cfg >= 0)
 		gpio_free(local->gpio_cfg);
-	unregister_chrdev_region(MKDEV(local->major, 0), members);
+	unregister_chrdev_region(local->devt_start, radios);
 	tty_kref_put(local->tty);
 	kfree(local);
 }
@@ -2035,11 +2047,6 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: use dev_error() etc
-
-// TODO: should we rx_lock and tx_lock on a per-read/per-write basis
-// instead of excluding multiple openers?
-
-// TODO: limit number of devices created using 'members' module parameter
 
 // TODO: make use of ARQ_Mode and ARQ_AttemptLimit?
 
