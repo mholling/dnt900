@@ -147,14 +147,14 @@
 #define DEV_TO_RADIO(_dev) container_of(_dev, struct dnt900_radio, dev)
 #define TTY_TO_LOCAL(tty) ((struct dnt900_local *)(tty)->disc_data)
 
-#define TRY(function_call) do { \
-	int error = (function_call); \
+#define TRY(expression) do { \
+	int error = (expression); \
 	if (error) \
 		return error; \
 } while (0)
 	
-#define UNWIND(error, function_call, exit) do { \
-	error = (function_call); \
+#define UNWIND(error, expression, exit) do { \
+	error = (expression); \
 	if (error) \
 		goto exit; \
 } while (0)
@@ -1373,6 +1373,7 @@ fail_params:
 	device_unregister(&radio->dev);
 fail_create:
 fail_exists:
+	pr_err(DRIVER_NAME ": could not add radio with MAC address 0x%02X%02X%02X (error %d)\n", mac_address[2], mac_address[1], mac_address[0], -error);
 success:
 	mutex_unlock(&local->radios_lock);
 	return error;
@@ -1898,7 +1899,7 @@ static void dnt900_init_local(struct work_struct *ws)
 	goto success;
 	
 fail:
-	pr_err("could not connect to dnt900 module on %s (error %d)\n", dev_name(&local->dev), -error);
+	pr_err(DRIVER_NAME ": could not connect to radio module on %s (error %d)\n", dev_name(&local->dev), -error);
 success:
 	kfree(work);
 }
@@ -2022,7 +2023,7 @@ int __init dnt900_init(void)
 	UNWIND(error, IS_ERR(dnt900_class) ? PTR_ERR(dnt900_class) : 0, fail_class_create);
 	dnt900_ldisc_ops.num = n_dnt900;
 	UNWIND(error, tty_register_ldisc(n_dnt900, &dnt900_ldisc_ops), fail_register);
-	pr_info("inserting dnt900 module\n");
+	pr_info(DRIVER_NAME ": module inserted\n");
 	return 0;
 	
 fail_register:
@@ -2033,7 +2034,7 @@ fail_class_create:
 
 void __exit dnt900_exit(void)
 {
-	pr_info("removing dnt900 module\n");
+	pr_info(DRIVER_NAME ": module removed\n");
 	tty_unregister_ldisc(n_dnt900);
 	class_destroy(dnt900_class);
 }
@@ -2046,8 +2047,6 @@ MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
-// TODO: use dev_error() etc
-
 // TODO: make use of ARQ_Mode and ARQ_AttemptLimit?
 
-// TODO: report failure message strings by extending TRY() and UNWIND() macros
+// TODO: fix retries in get_remote_register
