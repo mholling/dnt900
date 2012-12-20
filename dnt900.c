@@ -2047,5 +2047,3 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
 // TODO: make use of ARQ_Mode and ARQ_AttemptLimit?
-
-// TODO: fix retries in get_remote_register
