@@ -51,7 +51,7 @@
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
 
-#define LINE() pr_info("DEBUG: Passed %s %d \n",__FUNCTION__,__LINE__)
+#define MARK() pr_info("DEBUG: Passed %s %d \n",__FUNCTION__,__LINE__)
 
 #define MAX_PACKET_SIZE (2+255)
 
@@ -62,6 +62,7 @@
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
 #define TIMEOUT_MS (2500)
+#define REMOTE_REGISTER_RETRIES (2)
 
 #define START_OF_PACKET (0xFB)
 
@@ -1021,11 +1022,9 @@ static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_r
 static int dnt900_get_remote_register(struct dnt900_local *local, const char *sys_address, const struct dnt900_register *reg, char *value)
 {
 	MESSAGE(message, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
-	// return dnt900_sync_message(local, message, value);
 	
-	// TODO: need a better solution to this:
 	int error = -EAGAIN;
-	for (int tries = 5; (error == -EAGAIN) && tries; --tries)
+	for (int tries = REMOTE_REGISTER_RETRIES + 1; error == -EAGAIN && tries; --tries)
 		error = dnt900_sync_message(local, message, value);
 	return error;
 }
@@ -1252,13 +1251,13 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	TRY(dnt900_get_register(local, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
 	TRY(dnt900_get_register(local, &dnt900_attributes[AccessMode].reg, &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
-		pr_err("set radio AnnounceOptions register to 0x07 for correct driver operation\n");
+		pr_err(DRIVER_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
-		pr_err("set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
+		pr_err(DRIVER_NAME ": set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
 	if (auth_mode == AUTH_MODE_HOST)
-		pr_warn("AuthMode register is set to 0x02 but host-based authentication is not supported\n");
+		pr_warn(DRIVER_NAME ": AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
-		pr_warn("driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
+		pr_warn(DRIVER_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
 	TRY(mutex_lock_interruptible(&local->param_lock));
 	local->params.is_base = device_mode == DEVICE_MODE_BASE;
 	local->params.slot_size = (unsigned char)slot_size;
@@ -1354,7 +1353,6 @@ static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address,
 	int error;
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
-	// snprintf(name, ARRAY_SIZE(name), "0x%02X%02X%02X", mac_address[2], mac_address[1], mac_address[0]);
 	UNWIND(error, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
 	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, name);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
@@ -1364,6 +1362,7 @@ static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address,
 	radio->cdev.owner = THIS_MODULE;
 	UNWIND(error, cdev_add(&radio->cdev, radio->dev.devt, 1), fail_cdev);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
+	pr_info(DRIVER_NAME ": added new radio with MAC address 0x%02X%02X%02X\n", mac_address[2], mac_address[1], mac_address[0]);
 	goto success;
 	
 fail_cdev:
@@ -1372,8 +1371,8 @@ fail_attributes:
 fail_params:
 	device_unregister(&radio->dev);
 fail_create:
+	pr_warn(DRIVER_NAME ": unable to add radio with MAC address 0x%02X%02X%02X (error %d)\n", mac_address[2], mac_address[1], mac_address[0], -error);
 fail_exists:
-	pr_err(DRIVER_NAME ": could not add radio with MAC address 0x%02X%02X%02X (error %d)\n", mac_address[2], mac_address[1], mac_address[0], -error);
 success:
 	mutex_unlock(&local->radios_lock);
 	return error;
@@ -1899,7 +1898,7 @@ static void dnt900_init_local(struct work_struct *ws)
 	goto success;
 	
 fail:
-	pr_err(DRIVER_NAME ": could not connect to radio module on %s (error %d)\n", dev_name(&local->dev), -error);
+	pr_err(DRIVER_NAME ": unable to connect to radio module on %s (error %d)\n", dev_name(&local->dev), -error);
 success:
 	kfree(work);
 }
@@ -1944,7 +1943,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 		UNWIND(error, gpio_request_one(local->gpio_cts, GPIOF_IN, "/host_cts"), fail_gpio_cts);
 		UNWIND(error, request_irq(gpio_to_irq(local->gpio_cts), dnt900_cts_handler, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, DRIVER_NAME, local), fail_irq_cts);
 	} else if (!C_CRTSCTS(tty))
-		pr_warn("no hardware flow control enabled; data loss possible\n");
+		pr_warn(DRIVER_NAME ": no hardware flow control enabled for %s; risk of data loss\n", tty->name);
 	local->dev.devt = MKDEV(0, 0);
 	local->dev.class = dnt900_class;
 	local->dev.release = dnt900_release_local;
@@ -2034,9 +2033,9 @@ fail_class_create:
 
 void __exit dnt900_exit(void)
 {
-	pr_info(DRIVER_NAME ": module removed\n");
 	tty_unregister_ldisc(n_dnt900);
 	class_destroy(dnt900_class);
+	pr_info(DRIVER_NAME ": module removed\n");
 }
 
 module_init(dnt900_init);
