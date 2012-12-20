@@ -320,9 +320,10 @@ static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
-static int dnt900_local_alloc_devt(struct dnt900_local *local, dev_t *devt);
+static int dnt900_local_get_devt(struct dnt900_local *local, dev_t *devt);
+static void dnt900_local_claim_devt(struct dnt900_local *local);
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name);
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name, dev_t devt);
 static void dnt900_release_radio(struct device *dev);
 static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address, bool is_local);
 
@@ -1167,7 +1168,7 @@ static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 	if (filp->f_mode & FMODE_WRITE)
 		UNWIND(error, !mutex_trylock(&radio->tx_lock), fail_lock_tx);
 	get_device(&radio->dev);
-	get_device(&local->dev); // TODO: should not be needed
+	get_device(&local->dev);
 	filp->private_data = radio;
 	return 0;
 	
@@ -1187,7 +1188,7 @@ static int dnt900_cdev_close(struct inode *inode, struct file *filp)
 	if (filp->f_mode & FMODE_WRITE)
 		mutex_unlock(&radio->tx_lock);
 	put_device(&radio->dev);
-	put_device(&local->dev); // TODO: should not be needed
+	put_device(&local->dev);
 	return 0;
 }
 
@@ -1303,17 +1304,22 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	return 0;
 }
 
-static int dnt900_local_alloc_devt(struct dnt900_local *local, dev_t *devt)
+static int dnt900_local_get_devt(struct dnt900_local *local, dev_t *devt)
 {
 	if (local->radio_count >= radios)
 		return -EMLINK;
 	int major = MAJOR(local->devt_start);
 	int minor = MINOR(local->devt_start);
-	*devt = MKDEV(major, minor + local->radio_count++);
+	*devt = MKDEV(major, minor + local->radio_count);
 	return 0;
 }
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name)
+static void dnt900_local_claim_devt(struct dnt900_local *local)
+{
+	++local->radio_count;
+}
+
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name, dev_t devt)
 {
 	int error;
 	struct dnt900_radio *radio = kzalloc(sizeof(*radio), GFP_KERNEL);
@@ -1326,16 +1332,15 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	init_waitqueue_head(&radio->rx_queue);
 	INIT_KFIFO(radio->rx_fifo);
 	
-	UNWIND(error, dnt900_local_alloc_devt(local, &radio->dev.devt), fail_devt);
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
+	radio->dev.devt = devt;
 	UNWIND(error, kobject_set_name(&radio->dev.kobj, name), fail_name);
 	UNWIND(error, device_register(&radio->dev), fail_register);
 	return radio;
 	
 fail_register:
 fail_name:
-fail_devt:
 	kfree(radio);
 fail_alloc:
 	return ERR_PTR(error == -ECOMM ? -ENODEV : error);
@@ -1350,17 +1355,20 @@ static void dnt900_release_radio(struct device *dev)
 static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address, bool is_local)
 {
 	char name[80];
+	dev_t devt;
 	int error;
 	TRY(mutex_lock_interruptible(&local->radios_lock));
-	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
 	UNWIND(error, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
-	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, name);
+	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
+	UNWIND(error, dnt900_local_get_devt(local, &devt), fail_devt);
+	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, name, devt);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
 	UNWIND(error, dnt900_radio_get_params(radio), fail_params);
 	UNWIND(error, dnt900_radio_add_attributes(radio), fail_attributes);
 	cdev_init(&radio->cdev, &dnt900_cdev_fops);
 	radio->cdev.owner = THIS_MODULE;
 	UNWIND(error, cdev_add(&radio->cdev, radio->dev.devt, 1), fail_cdev);
+	dnt900_local_claim_devt(local);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
 	pr_info(DRIVER_NAME ": added new radio with MAC address 0x%02X%02X%02X\n", mac_address[2], mac_address[1], mac_address[0]);
 	goto success;
@@ -1371,6 +1379,7 @@ fail_attributes:
 fail_params:
 	device_unregister(&radio->dev);
 fail_create:
+fail_devt:
 	pr_warn(DRIVER_NAME ": unable to add radio with MAC address 0x%02X%02X%02X (error %d)\n", mac_address[2], mac_address[1], mac_address[0], -error);
 fail_exists:
 success:
@@ -2046,4 +2055,5 @@ MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
-// TODO: make use of ARQ_Mode and ARQ_AttemptLimit?
+// Future work:
+// - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
