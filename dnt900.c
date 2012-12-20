@@ -1161,8 +1161,6 @@ static int dnt900_cdev_open(struct inode *inode, struct file *filp)
 	struct dnt900_local *local = DEV_TO_LOCAL(radio->dev.parent);
 	int error = 0;
 	
-	if (radio->is_local && (filp->f_mode & FMODE_WRITE))
-		return -EPERM;
 	if (filp->f_mode & FMODE_READ)
 		UNWIND(error, !mutex_trylock(&radio->rx_lock), fail_lock_rx);
 	if (filp->f_mode & FMODE_WRITE)
@@ -1501,10 +1499,9 @@ static int dnt900_sync_message(struct dnt900_local *local, const char *message, 
 	int error;
 	UNWIND(error, dnt900_async_message(local, message), exit);
 	long completed = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	UNWIND(error, !completed ? -ETIMEDOUT : completed < 0 ? completed : 0, exit);
-	return packet.error;
+	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : packet.error;
 	
-exit: // TODO: check packet is enqueued before dequeueing it!
+exit:
 	mutex_lock(&local->packets_lock);
 	list_del(&packet.list);
 	mutex_unlock(&local->packets_lock);
@@ -1547,6 +1544,8 @@ static int dnt900_process_reply(struct dnt900_local *local, char command)
 	list_for_each_entry(packet, &local->packets, list) {
 		char tx_status = STATUS_ACKNOWLEDGED;
 		if (packet->message[2] != command)
+			continue;
+		if (completion_done(&packet->completed))
 			continue;
 		switch (command) {
 		case COMMAND_TX_DATA:
@@ -1621,7 +1620,6 @@ static int dnt900_process_reply(struct dnt900_local *local, char command)
 		default:
 			packet->error = -ECOMM;
 		}
-		list_del(&packet->list);
 		complete(&packet->completed);
 		break;
 	}
