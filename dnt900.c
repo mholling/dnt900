@@ -1048,16 +1048,9 @@ static int dnt900_set_remote_register(struct dnt900_local *local, const char *sy
 
 static int dnt900_discover(struct dnt900_local *local, const char *mac_address, char *sys_address)
 {
-	struct dnt900_local_params params;
-	TRY(dnt900_local_read_params(local, &params));
-	if (params.tree_routing) {
-		MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
-		int error = dnt900_sync_message(local, message, sys_address);
-		return error == -ECOMM ? -ENODEV : error;
-	} else {
-		COPY3(sys_address, mac_address);
-		return 0;
-	}
+	MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
+	int error = dnt900_sync_message(local, message, sys_address);
+	return error == -ECOMM ? -ENODEV : error;
 }
 
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
@@ -1271,8 +1264,15 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	struct dnt900_local *local = DEV_TO_LOCAL(radio->dev.parent);
 	char sys_address[3];
 	char device_mode, enable_rt_acks;
+	struct dnt900_local_params local_params;
 	
-	TRY(dnt900_discover(local, radio->mac_address, sys_address));
+	TRY(dnt900_local_read_params(local, &local_params));
+	if (!local_params.tree_routing)
+		COPY3(sys_address, radio->mac_address);
+	else if (radio->is_local && local_params.is_base)
+		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
+	else
+		TRY(dnt900_discover(local, radio->mac_address, sys_address));
 	if (radio->is_local) {
 		TRY(dnt900_get_register(local, &dnt900_attributes[DeviceMode].reg, &device_mode));
 		TRY(dnt900_get_register(local, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
