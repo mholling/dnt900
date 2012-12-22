@@ -220,6 +220,8 @@ struct dnt900_radio {
 	DECLARE_KFIFO(rx_fifo, char, RX_BUF_SIZE);
 	char mac_address[3];
 	struct dnt900_radio_params params;
+	char name[80];
+	char symlink[80];
 };
 
 struct dnt900_rxdata {
@@ -323,7 +325,7 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 static int dnt900_local_get_devt(struct dnt900_local *local, dev_t *devt);
 static void dnt900_local_claim_devt(struct dnt900_local *local);
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name, dev_t devt);
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, dev_t devt);
 static void dnt900_release_radio(struct device *dev);
 static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address, bool is_local);
 
@@ -1317,7 +1319,7 @@ static void dnt900_local_claim_devt(struct dnt900_local *local)
 	++local->radio_count;
 }
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, const char *name, dev_t devt)
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const char *mac_address, bool is_local, dev_t devt)
 {
 	int error;
 	struct dnt900_radio *radio = kzalloc(sizeof(*radio), GFP_KERNEL);
@@ -1329,11 +1331,12 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	mutex_init(&radio->tx_lock);
 	init_waitqueue_head(&radio->rx_queue);
 	INIT_KFIFO(radio->rx_fifo);
+	snprintf(radio->name, ARRAY_SIZE(radio->name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
 	
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
 	radio->dev.devt = devt;
-	UNWIND(error, kobject_set_name(&radio->dev.kobj, name), fail_name);
+	UNWIND(error, kobject_set_name(&radio->dev.kobj, radio->name), fail_name);
 	UNWIND(error, device_register(&radio->dev), fail_register);
 	return radio;
 	
@@ -1352,16 +1355,18 @@ static void dnt900_release_radio(struct device *dev)
 
 static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address, bool is_local)
 {
-	char name[80];
 	dev_t devt;
 	int error;
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	UNWIND(error, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
-	snprintf(name, ARRAY_SIZE(name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
 	UNWIND(error, dnt900_local_get_devt(local, &devt), fail_devt);
-	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, name, devt);
+	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, devt);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
 	UNWIND(error, dnt900_radio_get_params(radio), fail_params);
+	if (radio->is_local) {
+		snprintf(radio->symlink, ARRAY_SIZE(radio->symlink), "%s.local", dev_name(&local->dev));
+		UNWIND(error, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, radio->symlink), fail_symlink);
+	}
 	UNWIND(error, dnt900_radio_add_attributes(radio), fail_attributes);
 	cdev_init(&radio->cdev, &dnt900_cdev_fops);
 	radio->cdev.owner = THIS_MODULE;
@@ -1375,6 +1380,9 @@ fail_cdev:
 	kobject_put(&radio->cdev.kobj);
 fail_attributes:
 fail_params:
+	if (radio->is_local)
+		sysfs_remove_link(&radio->dev.kobj, radio->symlink);
+fail_symlink:
 	device_unregister(&radio->dev);
 fail_create:
 fail_devt:
@@ -1389,6 +1397,8 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	cdev_del(&radio->cdev);
+	if (radio->is_local)
+		sysfs_remove_link(&radio->dev.kobj, radio->symlink);
 	device_unregister(dev);
 	return 0;
 }
@@ -2052,6 +2062,9 @@ MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
+
+// TODO: symlinks, hotplug?
+// TODO: udev events for cdevs?
 
 // Future work:
 // - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
