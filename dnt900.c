@@ -1336,6 +1336,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
 	radio->dev.devt = devt;
+	radio->dev.class = dnt900_class;
 	UNWIND(error, kobject_set_name(&radio->dev.kobj, radio->name), fail_name);
 	UNWIND(error, device_register(&radio->dev), fail_register);
 	return radio;
@@ -2062,9 +2063,6 @@ MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
-
-// TODO: symlinks, hotplug?
-// TODO: udev events for cdevs?
 
 // Future work:
 // - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
