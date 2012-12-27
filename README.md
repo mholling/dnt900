@@ -408,4 +408,4 @@ Finally, if the local radio is configured as a remote in *TDMA Dynamic Slots* mo
 Release History
 ===============
 
-* 25/12/2012: version 0.1 (initial release): undoubtedly, not bug-free
+* 27/12/2012: version 0.1 (initial release): undoubtedly, not bug-free
