@@ -142,7 +142,7 @@
 	(address1)[2] == (address2)[2])
 
 #define RANGE_TO_KMS(range) (4667 * (unsigned char)(range) / 10000)
-#define PACKET_SUCCESS_RATE(attempts_x4) (400 / (unsigned char)(attempts_x4))
+#define PACKET_SUCCESS_RATE(attempts_x4) ((attempts_x4) ? 400 / (unsigned char)(attempts_x4) : 100)
 
 #define DEV_TO_LOCAL(_dev) container_of(_dev, struct dnt900_local, dev)
 #define DEV_TO_RADIO(_dev) container_of(_dev, struct dnt900_radio, dev)
@@ -1052,7 +1052,7 @@ static int dnt900_discover(struct dnt900_local *local, const char *mac_address, 
 {
 	MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
 	int error = dnt900_sync_message(local, message, sys_address);
-	return error == -ECOMM ? -ENODEV : error;
+	return error == -EAGAIN ? -ENODEV : error;
 }
 
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
@@ -1345,7 +1345,7 @@ fail_register:
 fail_name:
 	kfree(radio);
 fail_alloc:
-	return ERR_PTR(error == -ECOMM ? -ENODEV : error);
+	return ERR_PTR(error);
 }
 
 static void dnt900_release_radio(struct device *dev)
@@ -1997,8 +1997,6 @@ static void dnt900_release_local(struct device *dev)
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
 	
-	if (local->gpio_cts >= 0)
-		free_irq(gpio_to_irq(local->gpio_cts), local);
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
 	if (local->gpio_cfg >= 0)
