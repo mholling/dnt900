@@ -1,6 +1,6 @@
 /*
     Line discipline for RFM DNT900 radio transceiver modules.
-    Copyright (C) 2012 Matthew Hollingworth.
+    Copyright (C) 2012, 2013 Matthew Hollingworth.
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -62,6 +62,7 @@
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
 #define TIMEOUT_MS (2500)
+#define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
 
 #define START_OF_PACKET (0xFB)
@@ -189,7 +190,6 @@ struct dnt900_local {
 	struct tty_struct *tty;
 	dev_t devt_start;
 	int radio_count;
-	int gpio_cfg;
 	int gpio_cts;
 	struct list_head packets;
 	struct mutex packets_lock;
@@ -374,15 +374,12 @@ void __exit dnt900_exit(void);
 
 static int n_dnt900 = NR_LDISCS - 1;
 static int radios = 255;
-static int gpio_cfg = -1;
 static int gpio_cts = -1;
 
 module_param(radios, int, S_IRUGO);
 MODULE_PARM_DESC(radios, "maximum number of radios");
 module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
-module_param(gpio_cfg, int, S_IRUGO);
-MODULE_PARM_DESC(gpio_cfg, "GPIO number for /CFG signal");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
 
@@ -1004,15 +1001,9 @@ static int dnt900_local_add_attributes(struct dnt900_local *local)
 
 static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 {
-	if (local->gpio_cfg >= 0) {
-		gpio_set_value(local->gpio_cfg, 1);
-		msleep(100);
-		gpio_set_value(local->gpio_cfg, 0);
-		msleep(100);
-	} else {
-		MESSAGE(message, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
-		TRY(dnt900_async_message(local, message));
-	}
+	TRY(msleep_interruptible(STARTUP_DELAY_MS) ? -EINTR : 0);
+	MESSAGE(message, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
+	TRY(dnt900_sync_message(local, message, NULL));
 	return 0;
 }
 
@@ -1121,6 +1112,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 		return -EPERM;
 	TRY(attribute->parse(buf, count, value));
 	TRY(dnt900_radio_set_register(radio, &attribute->reg, value));
+	if (attr == &dnt900_attributes[UcReset].attr && radio->is_local)
+		TRY(dnt900_enter_protocol_mode(local));
 	if (attribute->local_work && radio->is_local)
 		dnt900_schedule_work(local, NULL, attribute->local_work);
 	if (attribute->work)
@@ -1133,6 +1126,7 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
 	MESSAGE(message, COMMAND_SOFTWARE_RESET, 0);
 	TRY(dnt900_sync_message(local, message, NULL));
+	TRY(dnt900_enter_protocol_mode(local));
 	return count;
 }
 
@@ -1757,6 +1751,7 @@ static int dnt900_process_announcement(struct dnt900_radio *radio, void *data)
 			"- event: base rebooted\n" \
 			"  code: 0x%02X\n", \
 			annc[0]);
+		// TODO?: dnt900_schedule_work(local, base_mac_address, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1903,7 +1898,6 @@ static void dnt900_init_local(struct work_struct *ws)
 	struct dnt900_local *local = work->local;
 	int error;
 	UNWIND(error, dnt900_local_add_attributes(local), fail);
-	msleep_interruptible(1000); // wait for radio to possibly wake up from sleep
 	UNWIND(error, dnt900_enter_protocol_mode(local), fail);
 	UNWIND(error, dnt900_local_get_params(local), fail);
 	char mac_address[3];
@@ -1953,9 +1947,6 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	UNWIND(error, local->workqueue ? 0 : -ENOMEM, fail_workqueue);
 	UNWIND(error, alloc_chrdev_region(&local->devt_start, 0, radios, DRIVER_NAME), fail_alloc_chrdev_region);
 	local->radio_count = 0;
-	local->gpio_cfg = gpio_cfg; // how to make this per-instance?
-	if (local->gpio_cfg >= 0)
-		UNWIND(error, gpio_request_one(local->gpio_cfg, GPIOF_OUT_INIT_HIGH, "/cfg"), fail_gpio_cfg);
 	local->gpio_cts = gpio_cts; // how to make this per-instance?
 	if (local->gpio_cts >= 0) {
 		UNWIND(error, gpio_request_one(local->gpio_cts, GPIOF_IN, "/host_cts"), fail_gpio_cts);
@@ -1978,10 +1969,6 @@ fail_irq_cts:
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
 fail_gpio_cts:
-	if (local->gpio_cfg >= 0)
-		gpio_free(local->gpio_cfg);
-fail_gpio_cfg:
-	tty->disc_data = NULL;
 	unregister_chrdev_region(local->devt_start, radios);
 fail_alloc_chrdev_region:
 	destroy_workqueue(local->workqueue);
@@ -1999,8 +1986,6 @@ static void dnt900_release_local(struct device *dev)
 	
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
-	if (local->gpio_cfg >= 0)
-		gpio_free(local->gpio_cfg);
 	unregister_chrdev_region(local->devt_start, radios);
 	tty_kref_put(local->tty);
 	kfree(local);

@@ -3,6 +3,8 @@ Summary
 
 This code implements a Linux driver (technically, a [tty line discipline](http://en.wikipedia.org/wiki/Line_discipline)) for use with the [DNT900](http://www.rfm.com/products/spec_sheet.php?record=DNT900P) series of 900 MHz radio transceiver modules, produced by [RFM](http://www.rfm.com/). The line discipline allows you to connect to the radio module via serial port. Each radio present on the DNT900 network is then presented to user-space as a character device to which data can be written and from which data can be read. The configuration registers for each radio are also presented as attribute files in sysfs, enabling the configuration of each radio to be read and changed.
 
+The DNT900 series includes the DNT900P and the DNT900C. This software is also likely to be compatible with the 2.4GHz [DNT2400](http://www.rfm.com/products/spec_sheet.php?record=DNT2400P) series (DNT2400P and DNT2400C), since they appear to use the same communication protocol and registers.
+
 Building the Module
 ===================
 
@@ -60,7 +62,7 @@ The configuration registers of each radio on the network may be accessed via the
     lrwxrwxrwx 1 root root    0 Dec 25 15:11 ttyAMA0.local -> ttyAMA0.0x00165F
     -rw-r--r-- 1 root root 4096 Dec 25 15:00 uevent
 
-This directory lists each radio on the network under its corresponding MAC address (e.g. `ttyAMA0.0x00165E` in this example). A symlink (`ttyAMA0.local`) for the locally connected radio is also listed for convenience.
+This directory lists each radio on the network under its corresponding MAC address (e.g. `ttyAMA0.0x00165E` in this example). If the network's base radio is not the locally connected radio, it appears with the MAC address `0x000000` rather than its actual MAC address. A symlink (`ttyAMA0.local`) for the locally connected radio is also listed for convenience.
 
 The configuration registers for a radio are listed within its named subdirectory. These registers are described in detail in the [DNT900 Series Integration Guide](http://www.rfm.com/products/data/dnt900dk_manual.pdf).
 
@@ -323,6 +325,8 @@ A software reset may be issued to the local radio by writing (anything) to the `
 
     $ echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/reset
 
+Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
+
 Transmitting and Receiving Data
 ===============================
 
@@ -374,32 +378,33 @@ Per the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf), i
 
 It is also possible to enable 'out-of-band' `/HOST_CTS` flow control using a GPIO, should your serial port not include flow control signals. You can specify the GPIO to be used with a module parameter(see below).
 
-Module Options
-==============
+Module Parameters
+=================
 
 Several module parameters are available:
 
     $ modinfo --parameters dnt900.ko 
     radios:maximum number of radios (int)
     n_dnt900:line discipline number (int)
-    gpio_cfg:GPIO number for /CFG signal (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
 
-You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/CFG` signal to a GPIO, you can specify the number of that GPIO using the `gpio_cfg` parameter. Similarly, if you have connected `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cfg`.
+You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cfg`.
 
-For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20, GPIO25 as `/CFG` and GPIO27 as `/HOST_CTS`:
+For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20 and GPIO27 as `/HOST_CTS`:
 
-    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cfg=25 gpio_cts=27
+    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27
     $ ldattach -8n1 -s 115200 20 /dev/ttyAMA0
 
 Caveats
 =======
 
+Communication with the radio is in protocol mode. Ideally you should select this mode permanently by grounding the radio's `/CFG` pin in your hardware. (If using the development kit, the J7 header on the interface boards exposes `/CFG`.) This is not normally compulsory as the *EnterProtocolMode* command is also issued. However, if an external reset source (e.g. a reset button) is used, `\CFG` must be grounded for correct operation after reset.
+
 As far as possible, this module takes a 'hands-off' approach to the attached radio. It does not independently alter any of the radio's configuration registers. However, a small number of the registers do affect the operation of the software.
 
 * `ProtocolOptions` must have bit 0 set in order to enable protocol message announcements (which are used by the software).
 * `AnnounceOptions` must be set to 0x07 to enable all announcement types.
-* Unless a `/CFG` GPIO signal is provided, `ProtocolSequenceEn` must be set to 0x02 (its default). This allows the *EnterProtocolMode* ASCII command string to be used to switch the radio to protocol mode.
+* Unless you have grounded the radio's `/CFG` pin, the `ProtocolSequenceEn` register must be set to 0x02. (It is by default). This allows the *EnterProtocolMode* ASCII command string to be used to switch the radio to protocol mode.
 * Bit 2 of `ProtocolOptions` affects data transmission from the local radio. If bit 2 is set, *TxReply* messages are generated by the radio and these checked for acknowledgment of transmitted packets. If the bit is clear, packet acknowledgements are not checked. This yields faster data transmission rates, but possibly at the expense of data integrity. (This is only likely to be a problem in a congested network or when the link with the remote is poor. The `ARQ_Mode` register may also be of interest in this situation.)
 
 Finally, if the local radio is configured as a remote in *TDMA Dynamic Slots* mode, data transmission may not succeed if new remotes join the network. (This is due to the dynamic nature of the remote slot size in this access mode.)
@@ -409,3 +414,4 @@ Release History
 ===============
 
 * 27/12/2012: version 0.1 (initial release): undoubtedly, not bug-free
+  * 4/1/2013: version 0.1.1: improved handling of radio resets; removed gpio_cfg parameter.
