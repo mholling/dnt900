@@ -1,5 +1,7 @@
 /*
-    Line discipline for RFM DNT900 radio transceiver modules.
+    Linux line discipline for RFM DNT900 & DNT2400 radio transceiver
+    modules.
+    
     Copyright (C) 2012, 2013 Matthew Hollingworth.
 
     This program is free software: you can redistribute it and/or modify
@@ -300,6 +302,7 @@ static int dnt900_get_remote_register(struct dnt900_local *local, const char *sy
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const char *value);
 static int dnt900_set_remote_register(struct dnt900_local *local, const char *sys_address, const struct dnt900_register *reg, const char *value);
 static int dnt900_discover(struct dnt900_local *local, const char *mac_address, char *sys_address);
+static int dnt900_get_base_mac_address(struct dnt900_local *local, char *mac_address);
 
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data);
 static int dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params);
@@ -353,7 +356,7 @@ static int dnt900_process_event(struct dnt900_local *local, char event);
 static int dnt900_process_announcement(struct dnt900_radio *radio, void *data);
 
 static void dnt900_schedule_work(struct dnt900_local *local, const char *address, void (*work_function)(struct work_struct *));
-static void dnt900_add_new_mac_address(struct work_struct *ws);
+static void dnt900_add_or_refresh_mac_address(struct work_struct *ws);
 static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_radio(struct work_struct *ws);
 static void dnt900_refresh_local(struct work_struct *ws);
@@ -1046,6 +1049,15 @@ static int dnt900_discover(struct dnt900_local *local, const char *mac_address, 
 	return error == -EAGAIN ? -ENODEV : error;
 }
 
+static int dnt900_get_base_mac_address(struct dnt900_local *local, char *mac_address)
+{
+	struct dnt900_local_params local_params;
+	TRY(dnt900_local_read_params(local, &local_params));
+	char sys_address[3] = { 0x00, 0x00, local_params.tree_routing ? 0xFF : 0x00 };
+	TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[MacAddress].reg, mac_address));
+	return 0;
+}
+
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
 {
 	const char *sys_address = data;
@@ -1236,7 +1248,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	TRY(dnt900_get_register(local, &dnt900_attributes[AuthMode].reg, &auth_mode));
 	TRY(dnt900_get_register(local, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en));
 	TRY(dnt900_get_register(local, &dnt900_attributes[DeviceMode].reg, &device_mode));
-	TRY(dnt900_get_register(local, &dnt900_attributes[device_mode == 0x01 ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
+	TRY(dnt900_get_register(local, &dnt900_attributes[device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
 	TRY(dnt900_get_register(local, &dnt900_attributes[AccessMode].reg, &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(DRIVER_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
@@ -1261,18 +1273,26 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	char sys_address[3];
 	char device_mode, enable_rt_acks;
 	struct dnt900_local_params local_params;
-	
 	TRY(dnt900_local_read_params(local, &local_params));
-	if (!local_params.tree_routing)
-		COPY3(sys_address, radio->mac_address);
-	else if (radio->is_local && local_params.is_base)
-		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
-	else
-		TRY(dnt900_discover(local, radio->mac_address, sys_address));
 	if (radio->is_local) {
+		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
 		TRY(dnt900_get_register(local, &dnt900_attributes[DeviceMode].reg, &device_mode));
 		TRY(dnt900_get_register(local, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
+	} else if (local_params.tree_routing) {
+		TRY(dnt900_discover(local, radio->mac_address, sys_address));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
+	} else if (local_params.is_base) {
+		COPY3(sys_address, radio->mac_address);
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
 	} else {
+		char base_mac_address[3];
+		TRY(dnt900_get_base_mac_address(local, base_mac_address));
+		if (EQUAL_ADDRESSES(base_mac_address, radio->mac_address))
+			sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
+		else
+			COPY3(sys_address, radio->mac_address);
 		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
 		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[EnableRtAcks].reg, &enable_rt_acks));
 	}
@@ -1326,17 +1346,18 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	init_waitqueue_head(&radio->rx_queue);
 	INIT_KFIFO(radio->rx_fifo);
 	snprintf(radio->name, ARRAY_SIZE(radio->name), "%s.0x%02X%02X%02X", dev_name(&local->dev), mac_address[2], mac_address[1], mac_address[0]);
-	
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
 	radio->dev.devt = devt;
 	radio->dev.class = dnt900_class;
+	UNWIND(error, dnt900_radio_get_params(radio), fail_params);
 	UNWIND(error, kobject_set_name(&radio->dev.kobj, radio->name), fail_name);
 	UNWIND(error, device_register(&radio->dev), fail_register);
 	return radio;
 	
 fail_register:
 fail_name:
+fail_params:
 	kfree(radio);
 fail_alloc:
 	return ERR_PTR(error);
@@ -1357,7 +1378,6 @@ static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address,
 	UNWIND(error, dnt900_local_get_devt(local, &devt), fail_devt);
 	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local, devt);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
-	UNWIND(error, dnt900_radio_get_params(radio), fail_params);
 	if (radio->is_local) {
 		snprintf(radio->symlink, ARRAY_SIZE(radio->symlink), "%s.local", dev_name(&local->dev));
 		UNWIND(error, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, radio->symlink), fail_symlink);
@@ -1368,13 +1388,12 @@ static int dnt900_add_radio(struct dnt900_local *local, const char *mac_address,
 	UNWIND(error, cdev_add(&radio->cdev, radio->dev.devt, 1), fail_cdev);
 	dnt900_local_claim_devt(local);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
-	pr_info(DRIVER_NAME ": added new radio with MAC address 0x%02X%02X%02X\n", mac_address[2], mac_address[1], mac_address[0]);
+	pr_info(DRIVER_NAME ": added new radio at %s\n", radio->name);
 	goto success;
 	
 fail_cdev:
 	kobject_put(&radio->cdev.kobj);
 fail_attributes:
-fail_params:
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, radio->symlink);
 fail_symlink:
@@ -1408,11 +1427,12 @@ static void dnt900_unregister_local(struct dnt900_local *local)
 static int dnt900_radio_matches_sys_address(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	if (radio->is_local)
+		return 0;
 	const char *sys_address = data;
 	struct dnt900_radio_params params;
 	int error = dnt900_radio_read_params(radio, &params);
 	return !error && EQUAL_ADDRESSES(params.sys_address, sys_address);
-	return false;
 }
 
 static int dnt900_radio_matches_mac_address(struct device *dev, void *data)
@@ -1426,7 +1446,6 @@ static int dnt900_radio_is_local(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	return radio->is_local;
-	return false;
 }
 
 static bool dnt900_radio_exists(struct dnt900_local *local, const char *mac_address)
@@ -1464,7 +1483,6 @@ static int dnt900_apply_to_radio(struct device *dev, void *data)
 {
 	int (*action)(struct dnt900_radio *) = data;
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	// return action(radio);
 	action(radio);
 	return 0;
 }
@@ -1703,7 +1721,6 @@ static int dnt900_process_announcement(struct dnt900_radio *radio, void *data)
 	char text[512];
 	struct dnt900_rxdata rxdata = { .buf = text };
 	struct dnt900_local *local = DEV_TO_LOCAL(radio->dev.parent);
-	char base_mac_address[3] = { 0, 0, 0 };
 	
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
@@ -1721,7 +1738,7 @@ static int dnt900_process_announcement(struct dnt900_radio *radio, void *data)
 			"  base MAC address: 0x%02X%02X%02X\n" \
 			"  range: %d km\n", \
 			annc[0], annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
-		dnt900_schedule_work(local, base_mac_address, dnt900_add_new_mac_address);
+		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1737,7 +1754,7 @@ static int dnt900_process_announcement(struct dnt900_radio *radio, void *data)
 			"  MAC address: 0x%02X%02X%02X\n" \
 			"  range: %d km\n", \
 			annc[0], annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
-		dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
+		dnt900_schedule_work(local, annc + 1, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1751,7 +1768,6 @@ static int dnt900_process_announcement(struct dnt900_radio *radio, void *data)
 			"- event: base rebooted\n" \
 			"  code: 0x%02X\n", \
 			annc[0]);
-		// TODO?: dnt900_schedule_work(local, base_mac_address, dnt900_add_new_mac_address);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		rxdata.len = scnprintf(text, ARRAY_SIZE(text), \
@@ -1851,7 +1867,7 @@ static void dnt900_schedule_work(struct dnt900_local *local, const char *address
 	up_read(&local->closed_lock);
 }
 
-static void dnt900_add_new_mac_address(struct work_struct *ws)
+static void dnt900_add_or_refresh_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	if (dnt900_radio_exists(work->local, work->address))
@@ -1905,8 +1921,8 @@ static void dnt900_init_local(struct work_struct *ws)
 	UNWIND(error, dnt900_add_radio(local, mac_address, true), fail);
 	if (local->params.is_base)
 		goto success;
-	char base_mac_address[3] = { 0x00, 0x00, 0x00 };
-	dnt900_add_radio(local, base_mac_address, false);
+	UNWIND(error, dnt900_get_base_mac_address(local, mac_address), success);
+	UNWIND(error, dnt900_add_radio(local, mac_address, false), success);
 	goto success;
 	
 fail:
@@ -1998,6 +2014,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	struct dnt900_local *local = dnt900_create_local(tty);
 	TRY(IS_ERR(local) ? PTR_ERR(local) : 0);
 	dnt900_schedule_work(local, NULL, dnt900_init_local);
+	pr_info(DRIVER_NAME ": attached to %s\n", tty->name);
 	return 0;
 }
 
@@ -2014,6 +2031,7 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	tty->disc_data = NULL;
 	mutex_unlock(&local->tty_lock);
 	dnt900_unregister_local(local);
+	pr_info(DRIVER_NAME ": detached from %s\n", tty->name);
 }
 
 int __init dnt900_init(void)
