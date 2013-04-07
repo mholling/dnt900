@@ -49,6 +49,7 @@
 #include <linux/wait.h>
 #include <linux/kfifo.h>
 #include <linux/delay.h>
+#include <linux/bitops.h>
 
 #define DRIVER_NAME "dnt900"
 #define CLASS_NAME "dnt900"
@@ -70,7 +71,7 @@
 #define START_OF_PACKET (0xFB)
 
 #define COMMAND_ENTER_PROTOCOL_MODE (0x00)
-#define COMMAND_EXIT_PROTOCOL_MODE  (0x00)
+#define COMMAND_EXIT_PROTOCOL_MODE  (0x01)
 #define COMMAND_SOFTWARE_RESET      (0x02)
 #define COMMAND_GET_REGISTER        (0x03)
 #define COMMAND_SET_REGISTER        (0x04)
@@ -1497,12 +1498,13 @@ static int dnt900_async_message(struct dnt900_local *local, const char *message)
 	int error;
 	TRY(mutex_lock_interruptible(&local->tty_lock));
 	UNWIND(error, local->tty ? 0 : -ENOENT, exit);
-	UNWIND(error, local->tty->flags & (1 << TTY_IO_ERROR) ? -EIO : 0, exit);
-	unsigned int count = (unsigned char)message[1] + 2;
-	for (unsigned int sent; count; count -= sent, message += sent) {
+	UNWIND(error, test_bit(TTY_IO_ERROR, &local->tty->flags) ? -EIO : 0, exit);
+	int count = (unsigned char)message[1] + 2;
+	UNWIND(error, wait_event_interruptible(local->tty->write_wait, tty_write_room(local->tty) >= count), exit);
+	for (int sent; count; count -= sent, message += sent) {
 		sent = local->tty->ops->write(local->tty, message, count);
-		if (sent < count)
-			tty_wakeup(local->tty);
+		if (sent) continue;
+		wait_event(local->tty->write_wait, tty_write_room(local->tty) >= count);
 	}
 exit:
 	mutex_unlock(&local->tty_lock);
@@ -2003,7 +2005,6 @@ static void dnt900_release_local(struct device *dev)
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
 	unregister_chrdev_region(local->devt_start, radios);
-	tty_kref_put(local->tty);
 	kfree(local);
 }
 

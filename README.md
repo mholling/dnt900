@@ -24,7 +24,7 @@ All going well, running the provided makefile should result in a sucessfully bui
 
 Loading the module is then a simple matter:
 
-    sudo insmod dnt900.ko
+    $ sudo insmod dnt900.ko
 
 Usage
 =====
@@ -33,7 +33,7 @@ To use the line discipline, you must first attach it to the serial port to which
 
 Apply power to the radio and use the `ldattach` utility to attach the line discipline (which defaults to number 29) to the serial port as follows:
 
-    ldattach -8n1 -s 9600 29 /dev/ttyUSB0
+    $ ldattach -8n1 -s 9600 29 /dev/ttyUSB0
 
 These options specify 8 bits, no parity, one stop bit, 9600 bps, which are the default serial settings for the DNT900; adjust as appropriate to your settings.
 
@@ -374,9 +374,9 @@ Flow Control
 
 Per the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf), it is highly recommended that hardware flow control be used if you intend to use your radio network for high-volume data transmission. (This means connecting the `/HOST_CTS` signal on the radio to a `/CTS` line on your serial port). If you are using hardware flow control, you should enable it before loading the line discipline, as follows:
 
-    stty -F /dev/ttyUSB0 crtscts
+    $ stty -F /dev/ttyUSB0 crtscts
 
-It is also possible to enable 'out-of-band' `/HOST_CTS` flow control using a GPIO, should your serial port not include flow control signals. You can specify the GPIO to be used with a module parameter(see below).
+It is also possible to enable 'out-of-band' `/HOST_CTS` flow control using a GPIO, should your serial port not include flow control signals. You can specify the GPIO to be used with a module parameter (see below).
 
 Module Parameters
 =================
@@ -388,7 +388,7 @@ Several module parameters are available:
     n_dnt900:line discipline number (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
 
-You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cfg`.
+You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
 
 For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20 and GPIO27 as `/HOST_CTS`:
 
@@ -419,3 +419,4 @@ Release History
 
 * 27/12/2012: version 0.1 (initial release): undoubtedly, not bug-free
   * 6/1/2013: version 0.1.1: improved handling of radio resets; removed gpio_cfg parameter; fixed bug preventing operation of remote radio in tree routing mode.
+  * 7/4/2013: HEAD: fixed bug whereby signals were ignored during device writes.
