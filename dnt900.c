@@ -1498,9 +1498,12 @@ static int dnt900_async_message(struct dnt900_local *local, const char *message)
 	UNWIND(error, local->tty ? 0 : -ENOENT, exit);
 	UNWIND(error, test_bit(TTY_IO_ERROR, &local->tty->flags) ? -EIO : 0, exit);
 	int count = (unsigned char)message[1] + 2;
+	// TODO: should we check for presence of tty->ops->write_room during startup?
 	UNWIND(error, wait_event_interruptible(local->tty->write_wait, tty_write_room(local->tty) >= count), exit);
 	for (int sent; count; count -= sent, message += sent) {
 		sent = local->tty->ops->write(local->tty, message, count);
+		error = sent < 0;
+		if (error) break;
 		if (sent) continue;
 		wait_event(local->tty->write_wait, tty_write_room(local->tty) >= count);
 	}

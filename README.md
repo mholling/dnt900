@@ -419,4 +419,4 @@ Release History
 
 * 27/12/2012: version 0.1 (initial release): undoubtedly, not bug-free
   * 6/1/2013: version 0.1.1: improved handling of radio resets; removed gpio_cfg parameter; fixed bug preventing operation of remote radio in tree routing mode.
-  * 7/4/2013: HEAD: fixed bug whereby signals were ignored during device writes.
+  * 8/4/2013: version 0.1.2: fixed bug whereby signals were ignored during device writes.
