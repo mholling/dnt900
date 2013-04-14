@@ -906,6 +906,16 @@ static struct tty_operations dnt900_tty_ops = {
 	.flush_buffer = dnt900_tty_flush_buffer,
 };
 
+static struct ktermios dnt900_init_termios = {
+	.c_iflag = 0,
+	.c_oflag = 0,
+	.c_cflag = B38400 | CS8 | CREAD | CLOCAL,
+	.c_lflag = 0,
+	.c_ispeed = 38400,
+	.c_ospeed = 38400,
+	.c_cc = INIT_C_CC,
+};
+
 static int dnt900_print_bytes(int bytes, const char *value, char *buf)
 {
 	unsigned int count = scnprintf(buf, PAGE_SIZE, "0x");
@@ -2174,10 +2184,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	local->tty_driver->minor_start = 0;
 	local->tty_driver->type = TTY_DRIVER_TYPE_SERIAL,
 	local->tty_driver->subtype = SERIAL_TYPE_NORMAL,
-	// TODO: set default termios to raw!
-	local->tty_driver->init_termios = tty_std_termios;
-	local->tty_driver->init_termios.c_lflag = 0; // ISIG | ICANON | IEXTEN
-	local->tty_driver->init_termios.c_cflag = B9600 | CS8 | CREAD | HUPCL | CLOCAL;
+	local->tty_driver->init_termios = dnt900_init_termios;
 	tty_set_operations(local->tty_driver, &dnt900_tty_ops);
 	UNWIND(error, tty_register_driver(local->tty_driver), fail_register_tty_driver);
 	dnt900_schedule_work(local, NULL, dnt900_init_local);
