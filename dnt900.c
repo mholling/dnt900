@@ -64,17 +64,15 @@
 #define MAX_PACKET_SIZE (2+255)
 
 // buffer sizes must be powers of 2
-#define  RX_BUFFER_SIZE (512)
-#define  TX_BUFFER_SIZE (4096)
+#define  RX_BUFFER_SIZE (512)  // no less
+#define  TX_BUFFER_SIZE (8192)
 #define OUT_BUFFER_SIZE (1024)
 #define TTY_BUFFER_SIZE (1024)
-
-// TODO: figure out size of buffers needed (smaller?)
 
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
-#define TIMEOUT_MS (25000) // TODO?
+#define REGISTER_TIMEOUT_MS (30000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
 
@@ -182,14 +180,14 @@
 } while (0)
 
 #define ARG_COUNT(...) (sizeof((char[]){__VA_ARGS__})/sizeof(char))
-#define MESSAGE(name, ...) unsigned char name[] = { START_OF_PACKET, ARG_COUNT(__VA_ARGS__), __VA_ARGS__ }
+#define PACKET(name, ...) unsigned char name[] = { START_OF_PACKET, ARG_COUNT(__VA_ARGS__), __VA_ARGS__ }
 
-struct dnt900_packet {
+struct dnt900_transaction {
 	struct list_head list;
 	struct completion completed;
 	unsigned char *result;
 	int error;
-	const unsigned char *message;
+	const unsigned char *packet;
 };
 
 struct dnt900_local_params {
@@ -205,8 +203,8 @@ struct dnt900_local {
 	char tty_driver_name[80];
 	char tty_dev_name[80];
 	int gpio_cts;
-	struct list_head packets;
-	struct mutex packets_lock;
+	struct list_head transactions;
+	struct mutex transactions_lock;
 	struct mutex radios_lock;
 	struct rw_semaphore closed_lock;
 	spinlock_t param_lock;
@@ -350,8 +348,8 @@ static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *fi
 static int dnt900_apply_to_radio(struct device *dev, void *data);
 static void dnt900_for_each_radio(struct dnt900_local *local, void (*action)(struct dnt900_radio *));
 
-static int dnt900_async_message(struct dnt900_local *local, const unsigned char *message);
-static int dnt900_sync_message(struct dnt900_local *local, const unsigned char *message, unsigned char *result);
+static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet);
+static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result);
 
 static void dnt900_radio_drain_fifo(struct dnt900_radio *radio);
 static void dnt900_radio_wake_tty(struct dnt900_radio *radio);
@@ -378,8 +376,8 @@ static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsi
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty);
 
-static int dnt900_process_reply(struct dnt900_local *local, unsigned char *message);
-static int dnt900_process_event(struct dnt900_local *local, unsigned char *message);
+static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response);
+static int dnt900_process_event(struct dnt900_local *local, unsigned char *response);
 
 static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data);
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc);
@@ -1062,47 +1060,47 @@ static int dnt900_local_add_attributes(struct dnt900_local *local)
 static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 {
 	TRY(msleep_interruptible(STARTUP_DELAY_MS) ? -EINTR : 0);
-	MESSAGE(message, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
-	TRY(dnt900_sync_message(local, message, NULL));
+	PACKET(packet, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
+	TRY(dnt900_send_packet_get_result(local, packet, NULL));
 	return 0;
 }
 
 static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_register *reg, unsigned char *value)
 {
-	MESSAGE(message, COMMAND_GET_REGISTER, reg->offset, reg->bank, reg->span);
-	return dnt900_sync_message(local, message, value);
+	PACKET(packet, COMMAND_GET_REGISTER, reg->offset, reg->bank, reg->span);
+	return dnt900_send_packet_get_result(local, packet, value);
 }
 
 static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
 {
-	MESSAGE(message, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
+	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
 	
 	int error = -EAGAIN;
 	for (int tries = REMOTE_REGISTER_RETRIES + 1; error == -EAGAIN && tries; --tries)
-		error = dnt900_sync_message(local, message, value);
+		error = dnt900_send_packet_get_result(local, packet, value);
 	return error;
 }
 
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value)
 {
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
-	unsigned char message[32 + 6] = { START_OF_PACKET, reg->span + 4, COMMAND_SET_REGISTER, reg->offset, reg->bank, reg->span };
-	memcpy(message + 6, value, reg->span);
-	return expect_reply ? dnt900_sync_message(local, message, NULL) : dnt900_async_message(local, message);
+	unsigned char packet[32 + 6] = { START_OF_PACKET, reg->span + 4, COMMAND_SET_REGISTER, reg->offset, reg->bank, reg->span };
+	memcpy(packet + 6, value, reg->span);
+	return expect_reply ? dnt900_send_packet_get_result(local, packet, NULL) : dnt900_send_packet(local, packet);
 }
 
 static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, const unsigned char *value)
 {
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
-	unsigned char message[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
-	memcpy(message + 9, value, reg->span);
-	return expect_reply ? dnt900_sync_message(local, message, NULL) : dnt900_async_message(local, message);
+	unsigned char packet[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
+	memcpy(packet + 9, value, reg->span);
+	return expect_reply ? dnt900_send_packet_get_result(local, packet, NULL) : dnt900_send_packet(local, packet);
 }
 
 static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_address, unsigned char *sys_address)
 {
-	MESSAGE(message, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
-	int error = dnt900_sync_message(local, message, sys_address);
+	PACKET(packet, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
+	int error = dnt900_send_packet_get_result(local, packet, sys_address);
 	return error == -EAGAIN ? -ENODEV : error;
 }
 
@@ -1194,8 +1192,8 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
-	MESSAGE(message, COMMAND_SOFTWARE_RESET, 0);
-	TRY(dnt900_sync_message(local, message, NULL));
+	PACKET(packet, COMMAND_SOFTWARE_RESET, 0);
+	TRY(dnt900_send_packet_get_result(local, packet, NULL));
 	TRY(dnt900_enter_protocol_mode(local));
 	return count;
 }
@@ -1465,41 +1463,41 @@ static void dnt900_for_each_radio(struct dnt900_local *local, void (*action)(str
 	device_for_each_child(&local->dev, action, dnt900_apply_to_radio);
 }
 
-static int dnt900_async_message(struct dnt900_local *local, const unsigned char *message)
+static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet)
 {
-	unsigned int length = 2 + message[1];
+	unsigned int length = 2 + packet[1];
 	unsigned long flags;
 	for (bool done = false; !done; ) {
 		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->tx_fifo) >= length));
 		spin_lock_irqsave(&local->tx_fifo_lock, flags);
 		done = kfifo_avail(&local->tx_fifo) >= length;
 		if (done)
-			length = kfifo_in(&local->tx_fifo, message, length);
+			length = kfifo_in(&local->tx_fifo, packet, length);
 		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 	}
 	dnt900_local_drain_fifo(local);
 	return 0;
 }
 
-static int dnt900_sync_message(struct dnt900_local *local, const unsigned char *message, unsigned char *result)
+static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result)
 {
-	struct dnt900_packet packet = { .result = result, .error = 0, .message = message };
-	INIT_LIST_HEAD(&packet.list);
-	init_completion(&packet.completed);
+	struct dnt900_transaction transaction = { .result = result, .error = 0, .packet = packet };
+	INIT_LIST_HEAD(&transaction.list);
+	init_completion(&transaction.completed);
 	
-	TRY(mutex_lock_interruptible(&local->packets_lock));
-	list_add_tail(&packet.list, &local->packets);
-	mutex_unlock(&local->packets_lock);
+	TRY(mutex_lock_interruptible(&local->transactions_lock));
+	list_add_tail(&transaction.list, &local->transactions);
+	mutex_unlock(&local->transactions_lock);
 	
 	int error;
-	UNWIND(error, dnt900_async_message(local, message), exit);
-	long completed = wait_for_completion_interruptible_timeout(&packet.completed, msecs_to_jiffies(TIMEOUT_MS));
-	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : packet.error;
+	UNWIND(error, dnt900_send_packet(local, packet), exit);
+	long completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
+	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.error;
 	
 exit:
-	mutex_lock(&local->packets_lock);
-	list_del(&packet.list);
-	mutex_unlock(&local->packets_lock);
+	mutex_lock(&local->transactions_lock);
+	list_del(&transaction.list);
+	mutex_unlock(&local->transactions_lock);
 	return error;
 }
 
@@ -1514,9 +1512,9 @@ static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 	if (local_params.slot_size <= 6)
 		return;
 	dnt900_radio_read_params(radio, &radio_params);
-	unsigned char message[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
+	unsigned char packet[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
 	if (!radio->is_local)
-		COPY3(message + 3, radio_params.sys_address);
+		COPY3(packet + 3, radio_params.sys_address);
 	unsigned long flags;
 	do {
 		int length = min(local_params.slot_size, kfifo_len(&radio->fifo) + 6);
@@ -1525,8 +1523,8 @@ static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 			spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 			break;
 		}
-		message[1] = 4 + kfifo_out(&radio->fifo, message + 6, length - 6);
-		length = kfifo_in(&local->tx_fifo, message, length);
+		packet[1] = 4 + kfifo_out(&radio->fifo, packet + 6, length - 6);
+		length = kfifo_in(&local->tx_fifo, packet, length);
 		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 	} while (!kfifo_is_empty(&radio->fifo));
 	// TODO: could we just send a single packet here to round-robin the tty fifos?
@@ -1689,93 +1687,93 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	while (count > 0) {
 		count -= kfifo_in(&local->rx_fifo, cp, count);
-		unsigned char message[MAX_PACKET_SIZE];
-		while (kfifo_out_peek(&local->rx_fifo, message, 2) == 2) {
-			if (message[0] != START_OF_PACKET) {
+		unsigned char response[MAX_PACKET_SIZE];
+		while (kfifo_out_peek(&local->rx_fifo, response, 2) == 2) {
+			if (response[0] != START_OF_PACKET) {
 				kfifo_skip(&local->rx_fifo);
 				continue;
 			}
-			if (message[1] == 0)
+			if (response[1] == 0)
 				continue;
-			unsigned int length = 2 + message[1];
+			unsigned int length = 2 + response[1];
 			if (kfifo_len(&local->rx_fifo) < length)
 				break;
-			length = kfifo_out(&local->rx_fifo, message, length);
-			if (message[2] & TYPE_REPLY)
-				dnt900_process_reply(local, message);
-			if (message[2] & TYPE_EVENT)
-				dnt900_process_event(local, message);
+			length = kfifo_out(&local->rx_fifo, response, length);
+			if (response[2] & TYPE_REPLY)
+				dnt900_process_reply(local, response);
+			if (response[2] & TYPE_EVENT)
+				dnt900_process_event(local, response);
 		}
 	}
 }
 
-static int dnt900_process_reply(struct dnt900_local *local, unsigned char *message)
+static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response)
 {
-	TRY(mutex_lock_interruptible(&local->packets_lock));
-	const unsigned char command = message[2] & MASK_COMMAND;
-	struct dnt900_packet *packet;
-	list_for_each_entry(packet, &local->packets, list) {
+	TRY(mutex_lock_interruptible(&local->transactions_lock));
+	const unsigned char command = response[2] & MASK_COMMAND;
+	struct dnt900_transaction *transaction;
+	list_for_each_entry(transaction, &local->transactions, list) {
 		unsigned char tx_status = STATUS_ACKNOWLEDGED;
-		if (packet->message[2] != command)
+		if (transaction->packet[2] != command)
 			continue;
-		if (completion_done(&packet->completed))
+		if (completion_done(&transaction->completed))
 			continue;
 		switch (command) {
 		case COMMAND_TX_DATA:
-			// (TODO: not currently used)
+			// (TODO: not currently used - maybe log bad status byte?)
 			// match Addr:
-			if (packet->message[3] != message[4] 
-			 || packet->message[4] != message[5] 
-			 || packet->message[5] != message[6])
+			if (transaction->packet[3] != response[4] 
+			 || transaction->packet[4] != response[5] 
+			 || transaction->packet[5] != response[6])
 				continue;
-			tx_status = message[3];
+			tx_status = response[3];
 			break;
 		case COMMAND_GET_REGISTER:
 			// match Reg, Bank, span:
-			if (packet->message[3] != message[3] 
-			 || packet->message[4] != message[4] 
-			 || packet->message[5] != message[5])
+			if (transaction->packet[3] != response[3] 
+			 || transaction->packet[4] != response[4] 
+			 || transaction->packet[5] != response[5])
 				continue;
-			for (int n = 0; n < packet->message[5]; ++n)
-				packet->result[n] = message[6 + n];
+			for (int n = 0; n < transaction->packet[5]; ++n)
+				transaction->result[n] = response[6 + n];
 			break;
 		case COMMAND_SET_REGISTER:
 			break;
 		case COMMAND_DISCOVER:
 			// match MacAddr:
-			if (packet->message[3] != message[4] 
-			 || packet->message[4] != message[5] 
-			 || packet->message[5] != message[6])
+			if (transaction->packet[3] != response[4] 
+			 || transaction->packet[4] != response[5] 
+			 || transaction->packet[5] != response[6])
 				continue;
-			tx_status = message[3];
+			tx_status = response[3];
 			if (tx_status == STATUS_ACKNOWLEDGED)
 				for (int n = 0; n < 3; ++n)
-					packet->result[n] = message[7 + n];
+					transaction->result[n] = response[7 + n];
 			break;
 		case COMMAND_GET_REMOTE_REGISTER:
 			// match Addr:
-			if (packet->message[3] != message[4] 
-			 || packet->message[4] != message[5] 
-			 || packet->message[5] != message[6])
+			if (transaction->packet[3] != response[4] 
+			 || transaction->packet[4] != response[5] 
+			 || transaction->packet[5] != response[6])
 				continue;
-			tx_status = message[3];
+			tx_status = response[3];
 			if (tx_status == STATUS_ACKNOWLEDGED) {
 				// match Reg, Bank, span:
-				if (packet->message[6] != message[8] 
-				 || packet->message[7] != message[9] 
-				 || packet->message[8] != message[10])
+				if (transaction->packet[6] != response[8] 
+				 || transaction->packet[7] != response[9] 
+				 || transaction->packet[8] != response[10])
 					continue;
-				for (int n = 0; n < packet->message[8]; ++n)
-					packet->result[n] = message[11 + n];
+				for (int n = 0; n < transaction->packet[8]; ++n)
+					transaction->result[n] = response[11 + n];
 			}
 			break;
 		case COMMAND_SET_REMOTE_REGISTER:
 			// match Addr:
-			if (packet->message[3] != message[4] 
-			 || packet->message[4] != message[5] 
-			 || packet->message[5] != message[6])
+			if (transaction->packet[3] != response[4] 
+			 || transaction->packet[4] != response[5] 
+			 || transaction->packet[5] != response[6])
 				continue;
-			tx_status = message[3];
+			tx_status = response[3];
 			break;
 		case COMMAND_SOFTWARE_RESET:
 			break;
@@ -1784,43 +1782,43 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *messa
 		}
 		switch (tx_status) {
 		case STATUS_ACKNOWLEDGED:
-			packet->error = 0;
+			transaction->error = 0;
 			break;
 		case STATUS_NOT_ACKNOWLEDGED:
 		case STATUS_HOLDING_FOR_FLOW:
-			packet->error = -EAGAIN;
+			transaction->error = -EAGAIN;
 			break;
 		case STATUS_NOT_LINKED:
 		default:
-			packet->error = -ECOMM;
+			transaction->error = -ECOMM;
 		}
-		complete(&packet->completed);
+		complete(&transaction->completed);
 		break;
 	}
-	mutex_unlock(&local->packets_lock);
+	mutex_unlock(&local->transactions_lock);
 	return 0;
 }
 
-static int dnt900_process_event(struct dnt900_local *local, unsigned char *message)
+static int dnt900_process_event(struct dnt900_local *local, unsigned char *response)
 {
 	struct dnt900_bufdata bufdata;
 	int error = 0;
-	const unsigned char event = message[2];
+	const unsigned char event = response[2];
 	switch (event) {
 	case EVENT_RX_DATA:
-		bufdata.buf = message + 7;
-		bufdata.len = message[1] - 5;
-		error = dnt900_dispatch_to_radio(local, message + 3, dnt900_radio_matches_sys_address, &bufdata, dnt900_radio_out);
+		bufdata.buf = response + 7;
+		bufdata.len = response[1] - 5;
+		error = dnt900_dispatch_to_radio(local, response + 3, dnt900_radio_matches_sys_address, &bufdata, dnt900_radio_out);
 		if (error == -ENODEV)
-			dnt900_schedule_work(local, message + 3, dnt900_add_new_sys_address);
+			dnt900_schedule_work(local, response + 3, dnt900_add_new_sys_address);
 		break;
 	case EVENT_ANNOUNCE:
-		error = dnt900_process_announcement(local, message + 3);
+		error = dnt900_process_announcement(local, response + 3);
 		break;
 	case EVENT_RX_EVENT:
-		error = dnt900_dispatch_to_radio(local, message + 3, dnt900_radio_matches_sys_address, message + 10, dnt900_process_rx_event);
+		error = dnt900_dispatch_to_radio(local, response + 3, dnt900_radio_matches_sys_address, response + 10, dnt900_process_rx_event);
 		if (error == -ENODEV)
-			dnt900_schedule_work(local, message + 3, dnt900_add_new_sys_address);
+			dnt900_schedule_work(local, response + 3, dnt900_add_new_sys_address);
 		break;
 	case EVENT_JOIN_REQUEST:
 		// unimplemented for now (used for host-based authentication)
@@ -2111,12 +2109,12 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	UNWIND(error, local ? 0 : -ENOMEM, fail_alloc);
 	local->tty = tty_kref_get(tty);
 	UNWIND(error, local->tty ? 0 : -EPERM, fail_tty_get);
-	mutex_init(&local->packets_lock);
+	mutex_init(&local->transactions_lock);
 	mutex_init(&local->radios_lock);
 	init_rwsem(&local->closed_lock);
 	spin_lock_init(&local->param_lock);
 	spin_lock_init(&local->tx_fifo_lock);
-	INIT_LIST_HEAD(&local->packets);
+	INIT_LIST_HEAD(&local->transactions);
 	snprintf(local->tty_driver_name, ARRAY_SIZE(local->tty_driver_name), TTY_DRIVER_NAME, tty->name);
 	snprintf(local->tty_dev_name, ARRAY_SIZE(local->tty_dev_name), TTY_DEV_NAME, tty->name);
 	local->workqueue = create_singlethread_workqueue(local->tty_driver_name);
@@ -2245,5 +2243,5 @@ MODULE_VERSION("0.1");
 // Future work:
 // - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
 // TODO: ParentACKQual not working!
-// TODO: have TIMEOUT_MS depend on whether data packets are being sent?
+// TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are being sent?
 // TODO: how to suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
