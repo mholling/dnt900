@@ -74,7 +74,7 @@
 #define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
 #define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
-#define TIMEOUT_MS (2500)
+#define TIMEOUT_MS (25000) // TODO?
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
 
@@ -483,7 +483,7 @@ enum {
 	ModelNumber,
 	CurrBaseModeNetID,
 	AveRXPwrOvHopSeq,
-	ParentACKQual,
+	// ParentACKQual,
 	SerialRate,
 	SerialParams,
 	SerialControls,
@@ -706,7 +706,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("ModelNumber",        ATTR_R,  0x02, 0x27, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("CurrBaseModeNetID",  ATTR_R,  0x02, 0x28, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("AveRXPwrOvHopSeq",   ATTR_R,  0x02, 0x29, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentACKQual",      ATTR_R,  0x02, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	// DNT900_ATTR("ParentACKQual",      ATTR_R,  0x02, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("SerialRate",         ATTR_RW, 0x03, 0x00, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_ATTR("SerialParams",       ATTR_RW, 0x03, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
 	DNT900_ATTR("SerialControls",     ATTR_RW, 0x03, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
@@ -1660,8 +1660,14 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	struct dnt900_bufdata bufdata = { .buf = buf, .len = len };
-	return dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
+	while (true) {
+		TRY(wait_event_interruptible(local->tx_queue, true));
+		int sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
+		if (sent || !len)
+			return sent;
+	};
 }
+
 
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len)
 {
@@ -2223,8 +2229,6 @@ fail_class_create:
 
 void __exit dnt900_exit(void)
 {
-	// tty_unregister_driver(dnt900_tty_driver);
-	// put_tty_driver(dnt900_tty_driver);
 	tty_unregister_ldisc(n_dnt900);
 	class_destroy(dnt900_class);
 	pr_info(LDISC_NAME ": module removed\n");
@@ -2240,3 +2244,6 @@ MODULE_VERSION("0.1");
 
 // Future work:
 // - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
+// TODO: ParentACKQual not working!
+// TODO: have TIMEOUT_MS depend on whether data packets are being sent?
+// TODO: how to suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
