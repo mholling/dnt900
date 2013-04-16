@@ -1518,7 +1518,6 @@ static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 		length = kfifo_in(&local->tx_fifo, packet, length);
 		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 	} while (!kfifo_is_empty(&radio->fifo));
-	// TODO: could we just send a single packet here to round-robin the tty fifos?
 }
 
 static void dnt900_radio_wake_tty(struct dnt900_radio *radio)
@@ -1532,14 +1531,12 @@ static void dnt900_radio_wake_tty(struct dnt900_radio *radio)
 
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
-	// TODO: copying out to temporary buffer and thence to local->tty
-	// is a bit inefficient, can we do better?
-	
+	// TODO: copying out to temporary buffer is a bit inefficient, can we do better?
 	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
 	unsigned long flags;
 	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
 		return;
-	unsigned char buf[512]; // TODO: put into dnt900_local?
+	unsigned char buf[512]; // TODO: put this temporate buffer into dnt900_local?
 	unsigned int room = tty_write_room(local->tty);
 	unsigned int copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
 	if (copied) {
@@ -1709,7 +1706,6 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 			continue;
 		switch (command) {
 		case COMMAND_TX_DATA:
-			// (TODO: not currently used - maybe log bad status byte?)
 			// match Addr:
 			if (transaction->packet[3] != response[4] 
 			 || transaction->packet[4] != response[5] 
@@ -2243,10 +2239,14 @@ module_exit(dnt900_exit);
 MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.2");
 
 // Future work:
-// - have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
+// TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
+//       better round-robin effect when transmitting data to multiple radios (or we could
+//       expose a 'priority' attribute to determine how many packets are sent at once)
+// TODO: report bad status bytes in TxDataReply responses received in dnt900_process_reply
 // TODO: ParentACKQual not working!
-// TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are being sent?
-// TODO: how to suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
+// TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are concurrently being sent?
+// TODO: can we suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
+// TODO: have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
