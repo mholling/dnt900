@@ -884,8 +884,6 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 static struct tty_port_operations dnt900_tty_port_ops = {
 	.activate = dnt900_tty_port_activate,
 	.shutdown = dnt900_tty_port_shutdown,
-	// .install = dnt900_tty_port_install,
-	// .shutdown = dnt900_tty_port_shutdown,
 };
 
 static struct tty_operations dnt900_tty_ops = {
@@ -1525,13 +1523,11 @@ static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 
 static void dnt900_radio_wake_tty(struct dnt900_radio *radio)
 {
-	if (radio->is_local)
+	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+	if (!tty)
 		return;
-	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
-	// TODO: using internal ttys[] is dodgy?
-	struct tty_struct *tty = local->tty_driver->ttys[radio->tty_index];
-	if (!IS_ERR_OR_NULL(tty))
-		tty_wakeup(tty);
+	tty_wakeup(tty);
+	tty_kref_put(tty);
 }
 
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
