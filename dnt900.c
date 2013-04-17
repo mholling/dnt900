@@ -1672,19 +1672,21 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	while (count > 0) {
-		count -= kfifo_in(&local->rx_fifo, cp, count);
+		for (; count > 0; --count, ++cp, ++fp)
+			if (*fp == TTY_NORMAL && !kfifo_put(&local->rx_fifo, cp))
+				break;
 		unsigned char response[MAX_PACKET_SIZE];
 		while (kfifo_out_peek(&local->rx_fifo, response, 2) == 2) {
 			if (response[0] != START_OF_PACKET) {
 				kfifo_skip(&local->rx_fifo);
 				continue;
 			}
-			if (response[1] == 0)
-				continue;
 			unsigned int length = 2 + response[1];
 			if (kfifo_len(&local->rx_fifo) < length)
 				break;
 			length = kfifo_out(&local->rx_fifo, response, length);
+			if (response[1] == 0)
+				continue;
 			if (response[2] & TYPE_REPLY)
 				dnt900_process_reply(local, response);
 			if (response[2] & TYPE_EVENT)
@@ -2239,7 +2241,7 @@ module_exit(dnt900_exit);
 MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.2.1");
 
 // Future work:
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a

@@ -437,3 +437,4 @@ Release History
   * 6/1/2013: version 0.1.1: improved handling of radio resets; removed gpio_cfg parameter; fixed bug preventing operation of remote radio in tree routing mode.
   * 8/4/2013: version 0.1.2: fixed bug whereby signals were ignored during device writes.
 * 16/4/2013: version 0.2: partial rewrite to represent remote radios as ttys instead of character devices.
+  * 17/4/2013: version 0.2.1: fixed bug which caused an infinite loop when tty sends non-normal flag byte.
