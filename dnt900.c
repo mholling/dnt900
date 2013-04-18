@@ -327,7 +327,6 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 
 static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
-static void dnt900_radio_try_get_params(struct dnt900_radio *radio);
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local);
@@ -344,13 +343,15 @@ static bool dnt900_radio_exists(struct dnt900_local *local, const unsigned char 
 static int dnt900_dispatch_to_radio(struct dnt900_local *local, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_radio *, void *));
 static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *finder_data, int (*finder)(struct device *, void *), int (*action)(struct dnt900_radio *));
 static int dnt900_apply_to_radio(struct device *dev, void *data);
-static void dnt900_for_each_radio(struct dnt900_local *local, void (*action)(struct dnt900_radio *));
+static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(struct dnt900_radio *));
 
 static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet);
 static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result);
 
-static void dnt900_radio_drain_fifo(struct dnt900_radio *radio);
-static void dnt900_radio_wake_tty(struct dnt900_radio *radio);
+static int dnt900_radio_wake_tty(struct dnt900_radio *radio);
+static int dnt900_radio_hangup_tty(struct dnt900_radio *radio);
+
+static int dnt900_radio_drain_fifo(struct dnt900_radio *radio);
 static void dnt900_local_drain_fifo(struct dnt900_local *local);
 
 static int dnt900_tty_port_activate(struct tty_port *port, struct tty_struct *tty);
@@ -1274,11 +1275,6 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	return 0;
 }
 
-static void dnt900_radio_try_get_params(struct dnt900_radio *radio)
-{
-	dnt900_radio_get_params(radio);
-}
-
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
@@ -1443,13 +1439,13 @@ static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *fi
 
 static int dnt900_apply_to_radio(struct device *dev, void *data)
 {
-	void (*action)(struct dnt900_radio *) = data;
+	int (*action)(struct dnt900_radio *) = data;
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	action(radio);
 	return 0;
 }
 
-static void dnt900_for_each_radio(struct dnt900_local *local, void (*action)(struct dnt900_radio *))
+static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(struct dnt900_radio *))
 {
 	device_for_each_child(&local->dev, action, dnt900_apply_to_radio);
 }
@@ -1492,16 +1488,36 @@ exit:
 	return error;
 }
 
-static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
+static int dnt900_radio_wake_tty(struct dnt900_radio *radio)
+{
+	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+	if (tty) {
+		tty_wakeup(tty);
+		tty_kref_put(tty);
+	}
+	return 0;
+}
+
+static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
+{
+	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+	if (tty) {
+		tty_hangup(tty);
+		tty_kref_put(tty);
+	}
+	return 0;
+}
+
+static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 {
 	if (kfifo_is_empty(&radio->fifo))
-		return;
+		return 0;
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	struct dnt900_local_params local_params;
 	struct dnt900_radio_params radio_params;
 	dnt900_local_read_params(local, &local_params);
 	if (local_params.slot_size <= 6)
-		return;
+		return 0;
 	dnt900_radio_read_params(radio, &radio_params);
 	unsigned char packet[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
 	if (!radio->is_local)
@@ -1518,15 +1534,7 @@ static void dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 		length = kfifo_in(&local->tx_fifo, packet, length);
 		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 	} while (!kfifo_is_empty(&radio->fifo));
-}
-
-static void dnt900_radio_wake_tty(struct dnt900_radio *radio)
-{
-	struct tty_struct *tty = tty_port_tty_get(&radio->port);
-	if (!tty)
-		return;
-	tty_wakeup(tty);
-	tty_kref_put(tty);
+	return 0;
 }
 
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
@@ -1868,6 +1876,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			"  code: 0x%02X\n" \
 			"  network ID 0x%02X\n", \
 			annc[0], annc[1]);
+		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		length = scnprintf(text, ARRAY_SIZE(text), \
@@ -1884,6 +1893,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			"  code: 0x%02X\n" \
 			"  MAC address: 0x%02X%02X%02X\n", \
 			annc[0], annc[3], annc[2], annc[1]);
+		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		length = scnprintf(text, ARRAY_SIZE(text), \
@@ -1907,7 +1917,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
 		unsigned char sys_address[] = { annc[4], annc[5], 0xFF };
-		TRY(dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, sys_address, dnt900_set_sys_address));
+		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, sys_address, dnt900_set_sys_address);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		length = scnprintf(text, ARRAY_SIZE(text), \
@@ -2047,7 +2057,7 @@ static void dnt900_refresh_all(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	dnt900_local_get_params(work->local);
-	dnt900_for_each_radio(work->local, dnt900_radio_try_get_params);
+	dnt900_for_each_radio(work->local, dnt900_radio_get_params);
 	kfree(work);
 }
 
