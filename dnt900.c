@@ -1229,8 +1229,6 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		pr_warn(LDISC_NAME ": AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
 		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
-	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
-		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
 	if (slot_size <= 10)
 		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", slot_size);
 	unsigned long flags;
@@ -1502,6 +1500,7 @@ static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
 {
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
 	if (tty) {
+		pr_info(LDISC_NAME ": hanging up %s (radio %s)\n", tty->name, radio->name);
 		tty_hangup(tty);
 		tty_kref_put(tty);
 	}
@@ -1858,7 +1857,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			"- event: startup complete\n" \
 			"  code: 0x%02X\n", \
 			annc[0]);
-		dnt900_schedule_work(local, NULL, dnt900_refresh_all);
+		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		length = scnprintf(text, ARRAY_SIZE(text), \
@@ -1868,6 +1867,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			"  base MAC address: 0x%02X%02X%02X\n" \
 			"  range: %d km\n", \
 			annc[0], annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
+		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
 		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
@@ -2262,3 +2262,4 @@ MODULE_VERSION("0.2.1");
 // TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are concurrently being sent?
 // TODO: can we suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
 // TODO: have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
+// TODO: can we clear the out_fifo when the tty is opened?
