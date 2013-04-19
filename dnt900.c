@@ -28,6 +28,7 @@
 #include <linux/tty_ldisc.h>
 #include <linux/tty_driver.h>
 #include <linux/tty_flip.h>
+#include <linux/poll.h>
 #include <linux/stat.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
@@ -374,6 +375,8 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len);
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty);
+static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty);
+static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait);
 
 static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response);
 static int dnt900_process_event(struct dnt900_local *local, unsigned char *response);
@@ -879,6 +882,8 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.read = dnt900_ldisc_read,
 	.receive_buf = dnt900_ldisc_receive_buf,
 	.write_wakeup = dnt900_ldisc_write_wakeup,
+	.chars_in_buffer = dnt900_ldisc_chars_in_buffer,
+	.poll = dnt900_ldisc_poll,
 	.owner = THIS_MODULE,
 };
 
@@ -1659,10 +1664,11 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 	};
 }
 
-
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&local->out_fifo))
+		return -EAGAIN;
 	TRY(wait_event_interruptible(local->out_queue, !kfifo_is_empty(&local->out_fifo)));
 	unsigned int copied;
 	TRY(kfifo_to_user(&local->out_fifo, buf, len, &copied));
@@ -1673,6 +1679,24 @@ static void dnt900_ldisc_write_wakeup(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	dnt900_local_drain_fifo(local);
+}
+
+static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty)
+{
+	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	return kfifo_len(&local->out_fifo);
+}
+
+static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait)
+{
+	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	unsigned int mask = 0;
+	poll_wait(filp, &local->out_queue, wait);
+	if (!kfifo_is_empty(&local->out_fifo))
+		mask |= POLLIN | POLLRDNORM;
+	if (tty_hung_up_p(filp))
+		mask |= POLLHUP;
+	return mask;
 }
 
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count)
