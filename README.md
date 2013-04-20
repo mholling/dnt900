@@ -438,4 +438,4 @@ Release History
   * 8/4/2013: version 0.1.2: fixed bug whereby signals were ignored during device writes.
 * 16/4/2013: version 0.2: partial rewrite to represent remote radios as ttys instead of character devices.
   * 17/4/2013: version 0.2.1: fixed bug which caused an infinite loop when tty sends non-normal flag byte.
-  * 19/7/2013: HEAD: added tty hangups when radios leave network.
+  * 20/4/2013: HEAD: added tty hangups on shutdown and when radios leave network.

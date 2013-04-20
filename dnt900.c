@@ -1355,7 +1355,7 @@ static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac
 	}
 	INIT_KFIFO(radio->fifo);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
-	pr_info(LDISC_NAME ": added new radio at %s\n", radio->name);
+	pr_info(LDISC_NAME ": added new radio %s\n", radio->name);
 	goto success;
 	
 fail_tty:
@@ -1505,7 +1505,7 @@ static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
 {
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
 	if (tty) {
-		pr_info(LDISC_NAME ": hanging up %s (radio %s)\n", tty->name, radio->name);
+		pr_info(LDISC_NAME ": hanging up radio %s at %s\n", radio->name, tty->name);
 		tty_hangup(tty);
 		tty_kref_put(tty);
 	}
@@ -2238,6 +2238,7 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	down_write(&local->closed_lock);
+	dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 	destroy_workqueue(local->workqueue);
 	if (local->gpio_cts >= 0)
 		free_irq(gpio_to_irq(local->gpio_cts), local);
