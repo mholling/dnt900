@@ -2284,7 +2284,7 @@ module_exit(dnt900_exit);
 MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.2.1");
+MODULE_VERSION("0.2.2");
 
 // Future work:
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
@@ -2295,4 +2295,3 @@ MODULE_VERSION("0.2.1");
 // TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are concurrently being sent?
 // TODO: can we suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
 // TODO: have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
-// TODO: can we clear the out_fifo when the tty is opened?
