@@ -405,6 +405,7 @@ static void dnt900_release_local(struct device *dev);
 
 static int dnt900_ldisc_open(struct tty_struct *tty);
 static void dnt900_ldisc_close(struct tty_struct *tty);
+static int dnt900_ldisc_hangup(struct tty_struct *tty);
 
 int __init dnt900_init(void);
 void __exit dnt900_exit(void);
@@ -878,6 +879,7 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.name = LDISC_NAME,
 	.open = dnt900_ldisc_open,
 	.close = dnt900_ldisc_close,
+	.hangup = dnt900_ldisc_hangup,
 	.write = dnt900_ldisc_write,
 	.read = dnt900_ldisc_read,
 	.receive_buf = dnt900_ldisc_receive_buf,
@@ -2245,6 +2247,12 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 	tty->disc_data = NULL;
 	dnt900_unregister_local(local);
 	pr_info(LDISC_NAME ": detached from %s\n", tty->name);
+}
+
+static int dnt900_ldisc_hangup(struct tty_struct *tty)
+{
+	dnt900_ldisc_close(tty);
+	return 0;
 }
 
 int __init dnt900_init(void)
