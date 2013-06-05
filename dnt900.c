@@ -407,10 +407,11 @@ static int dnt900_ldisc_open(struct tty_struct *tty);
 static void dnt900_ldisc_close(struct tty_struct *tty);
 static int dnt900_ldisc_hangup(struct tty_struct *tty);
 
-int __init dnt900_init(void);
-void __exit dnt900_exit(void);
+#ifndef N_DNT900
+#define N_DNT900 29
+#endif
 
-static int n_dnt900 = NR_LDISCS - 1;
+static int n_dnt900 = N_DNT900;
 static int radios = 255;
 static int gpio_cts = -1;
 
@@ -875,18 +876,18 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 static struct class *dnt900_class;
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
-	.magic = TTY_LDISC_MAGIC,
-	.name = LDISC_NAME,
-	.open = dnt900_ldisc_open,
-	.close = dnt900_ldisc_close,
-	.hangup = dnt900_ldisc_hangup,
-	.write = dnt900_ldisc_write,
-	.read = dnt900_ldisc_read,
-	.receive_buf = dnt900_ldisc_receive_buf,
-	.write_wakeup = dnt900_ldisc_write_wakeup,
+	.magic           = TTY_LDISC_MAGIC,
+	.name            = LDISC_NAME,
+	.open            = dnt900_ldisc_open,
+	.close           = dnt900_ldisc_close,
+	.hangup          = dnt900_ldisc_hangup,
+	.write           = dnt900_ldisc_write,
+	.read            = dnt900_ldisc_read,
+	.receive_buf     = dnt900_ldisc_receive_buf,
+	.write_wakeup    = dnt900_ldisc_write_wakeup,
 	.chars_in_buffer = dnt900_ldisc_chars_in_buffer,
-	.poll = dnt900_ldisc_poll,
-	.owner = THIS_MODULE,
+	.poll            = dnt900_ldisc_poll,
+	.owner           = THIS_MODULE,
 };
 
 static struct tty_port_operations dnt900_tty_port_ops = {
@@ -895,16 +896,16 @@ static struct tty_port_operations dnt900_tty_port_ops = {
 };
 
 static struct tty_operations dnt900_tty_ops = {
-	.open = dnt900_tty_open,
-	.close = dnt900_tty_close,
-	.hangup = dnt900_tty_hangup,
-	.write = dnt900_tty_write,
-	.put_char = dnt900_tty_put_char,
-	.write_room = dnt900_tty_write_room,
+	.open            = dnt900_tty_open,
+	.close           = dnt900_tty_close,
+	.hangup          = dnt900_tty_hangup,
+	.write           = dnt900_tty_write,
+	.put_char        = dnt900_tty_put_char,
+	.write_room      = dnt900_tty_write_room,
 	.chars_in_buffer = dnt900_tty_chars_in_buffer,
-	.flush_chars = dnt900_tty_flush_chars,
+	.flush_chars     = dnt900_tty_flush_chars,
 	.wait_until_sent = dnt900_tty_wait_until_sent,
-	.flush_buffer = dnt900_tty_flush_buffer,
+	.flush_buffer    = dnt900_tty_flush_buffer,
 };
 
 static struct ktermios dnt900_init_termios = {
@@ -920,6 +921,7 @@ static struct ktermios dnt900_init_termios = {
 static int dnt900_print_bytes(int bytes, const unsigned char *value, char *buf)
 {
 	unsigned int count = scnprintf(buf, PAGE_SIZE, "0x");
+
 	for (; bytes > 0; --bytes)
 		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", value[bytes-1]);
 	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
@@ -949,6 +951,7 @@ static int dnt900_print_4_bytes(const unsigned char *value, char *buf)
 static int dnt900_print_hex(int bytes, const unsigned char *value, char *buf)
 {
 	unsigned int count = scnprintf(buf, PAGE_SIZE, "0x");
+
 	for (; bytes > 0; ++value, --bytes)
 		count += scnprintf(buf + count, PAGE_SIZE - count, "%02X", *value);
 	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
@@ -984,6 +987,7 @@ static int dnt900_print_5_macs(const unsigned char *value, char *buf)
 static int dnt900_parse_bytes(int bytes, const char *buf, size_t count, unsigned char *value)
 {
 	unsigned long result;
+
 	TRY(kstrtoul(buf, 0, &result));
 	if (result >> (8 * bytes))
 		return -ERANGE;
@@ -1014,6 +1018,8 @@ static int dnt900_parse_4_bytes(const char *buf, size_t count, unsigned char *va
 
 static int dnt900_parse_hex(int bytes, const char *buf, size_t count, unsigned char *value)
 {
+	int n;
+
 	if (bytes * 2 + 2 != count)
 		return -EINVAL;
 	if (*buf++ != '0')
@@ -1022,7 +1028,7 @@ static int dnt900_parse_hex(int bytes, const char *buf, size_t count, unsigned c
 		return -EINVAL;
 	for (; bytes > 0; --bytes, ++value) {
 		*value = 0;
-		for (int n = 0; n < 2; ++n, ++buf) {
+		for (n = 0; n < 2; ++n, ++buf) {
 			if (!isxdigit(*buf))
 				return -EINVAL;
 			*value <<= 4;
@@ -1044,29 +1050,36 @@ static int dnt900_parse_32_hex(const char *buf, size_t count, unsigned char *val
 
 static int dnt900_parse_16_ascii(const char *buf, size_t count, unsigned char *value)
 {
-	for (int n = 0; n < 16; ++n)
+	int n;
+
+	for (n = 0; n < 16; ++n)
 		value[n] = n < count ? buf[n] : 0;
 	return 0;
 }
 
 static int dnt900_radio_add_attributes(struct dnt900_radio *radio)
 {
-	for (int n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
+	int n;
+
+	for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
 		TRY(device_create_file(&radio->dev, &dnt900_attributes[n].attr));
 	return 0;
 }
 
 static int dnt900_local_add_attributes(struct dnt900_local *local)
 {
-	for (int n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
+	int n;
+
+	for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
 		TRY(device_create_file(&local->dev, dnt900_local_attributes + n));
 	return 0;
 }
 
 static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 {
-	TRY(msleep_interruptible(STARTUP_DELAY_MS) ? -EINTR : 0);
 	PACKET(packet, COMMAND_ENTER_PROTOCOL_MODE, 'D', 'N', 'T', 'C', 'F', 'G');
+
+	TRY(msleep_interruptible(STARTUP_DELAY_MS) ? -EINTR : 0);
 	TRY(dnt900_send_packet_get_result(local, packet, NULL));
 	return 0;
 }
@@ -1074,15 +1087,16 @@ static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_register *reg, unsigned char *value)
 {
 	PACKET(packet, COMMAND_GET_REGISTER, reg->offset, reg->bank, reg->span);
+
 	return dnt900_send_packet_get_result(local, packet, value);
 }
 
 static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
 {
 	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
-	
-	int error = -EAGAIN;
-	for (int tries = REMOTE_REGISTER_RETRIES + 1; error == -EAGAIN && tries; --tries)
+	int tries, error = -EAGAIN;
+
+	for (tries = REMOTE_REGISTER_RETRIES + 1; error == -EAGAIN && tries; --tries)
 		error = dnt900_send_packet_get_result(local, packet, value);
 	return error;
 }
@@ -1091,6 +1105,7 @@ static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_r
 {
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	unsigned char packet[32 + 6] = { START_OF_PACKET, reg->span + 4, COMMAND_SET_REGISTER, reg->offset, reg->bank, reg->span };
+
 	memcpy(packet + 6, value, reg->span);
 	return expect_reply ? dnt900_send_packet_get_result(local, packet, NULL) : dnt900_send_packet(local, packet);
 }
@@ -1099,22 +1114,27 @@ static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned
 {
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	unsigned char packet[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
+
 	memcpy(packet + 9, value, reg->span);
 	return expect_reply ? dnt900_send_packet_get_result(local, packet, NULL) : dnt900_send_packet(local, packet);
 }
 
 static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_address, unsigned char *sys_address)
 {
+	int error;
 	PACKET(packet, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
-	int error = dnt900_send_packet_get_result(local, packet, sys_address);
+
+	error = dnt900_send_packet_get_result(local, packet, sys_address);
 	return error == -EAGAIN ? -ENODEV : error;
 }
 
 static int dnt900_get_base_mac_address(struct dnt900_local *local, unsigned char *mac_address)
 {
 	struct dnt900_local_params local_params;
+	unsigned char sys_address[3] = { 0x00, 0x00, 0x00 };
+
 	dnt900_local_read_params(local, &local_params);
-	unsigned char sys_address[3] = { 0x00, 0x00, local_params.tree_routing ? 0xFF : 0x00 };
+	sys_address[2] = local_params.tree_routing ? 0xFF : 0x00;
 	TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[MacAddress].reg, mac_address));
 	return 0;
 }
@@ -1123,6 +1143,7 @@ static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
 {
 	const unsigned char *sys_address = data;
 	unsigned long flags;
+
 	spin_lock_irqsave(&radio->param_lock, flags);
 	COPY3(radio->params.sys_address, sys_address);
 	spin_unlock_irqrestore(&radio->param_lock, flags);
@@ -1132,6 +1153,7 @@ static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
 static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params)
 {
 	unsigned long flags;
+
 	spin_lock_irqsave(&radio->param_lock, flags);
 	*params = radio->params;
 	spin_unlock_irqrestore(&radio->param_lock, flags);
@@ -1140,6 +1162,7 @@ static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_r
 static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_local_params *params)
 {
 	unsigned long flags;
+
 	spin_lock_irqsave(&local->param_lock, flags);
 	*params = local->params;
 	spin_unlock_irqrestore(&local->param_lock, flags);
@@ -1148,9 +1171,10 @@ static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_l
 static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_radio_params params;
+
 	if (radio->is_local)
 		return dnt900_get_register(local, reg, value);
-	struct dnt900_radio_params params;
 	dnt900_radio_read_params(radio, &params);
 	return dnt900_get_remote_register(local, params.sys_address, reg, value);
 }
@@ -1158,9 +1182,10 @@ static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dn
 static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dnt900_register *reg, const unsigned char *value)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_radio_params params;
+
 	if (radio->is_local)
 		return dnt900_set_register(local, reg, value);
-	struct dnt900_radio_params params;
 	dnt900_radio_read_params(radio, &params);
 	return dnt900_set_remote_register(local, params.sys_address, reg, value);
 }
@@ -1169,10 +1194,12 @@ static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *att
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+	unsigned char value[32];
+	int error;
+
 	if (!attribute->print)
 		return -EPERM;
-	unsigned char value[32];
-	int error = dnt900_radio_get_register(radio, &attribute->reg, value);
+	error = dnt900_radio_get_register(radio, &attribute->reg, value);
 	return error ? error : attribute->print(value, buf);
 }
 
@@ -1182,6 +1209,7 @@ static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *at
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
 	unsigned char value[32];
+
 	if (!attribute->parse)
 		return -EPERM;
 	TRY(attribute->parse(buf, count, value));
@@ -1199,6 +1227,7 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
 	PACKET(packet, COMMAND_SOFTWARE_RESET, 0);
+
 	TRY(dnt900_send_packet_get_result(local, packet, NULL));
 	TRY(dnt900_enter_protocol_mode(local));
 	return count;
@@ -1209,8 +1238,10 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 	unsigned int mac_address_int;
 	unsigned char mac_address[3];
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+	int n;
+
 	TRY(kstrtouint(buf, 16, &mac_address_int));
-	for (int n = 0; n < 3; ++n, mac_address_int >>= 8)
+	for (n = 0; n < 3; ++n, mac_address_int >>= 8)
 		mac_address[n] = mac_address_int & 0xFF;
 	if (mac_address_int)
 		return -EINVAL;
@@ -1221,6 +1252,8 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
 	unsigned char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
+	unsigned long flags;
+
 	TRY(dnt900_get_register(local, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
 	TRY(dnt900_get_register(local, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
 	TRY(dnt900_get_register(local, &dnt900_attributes[AuthMode].reg, &auth_mode));
@@ -1238,7 +1271,6 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
 	if (slot_size <= 10)
 		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", slot_size);
-	unsigned long flags;
 	spin_lock_irqsave(&local->param_lock, flags);
 	local->params.is_base = device_mode == DEVICE_MODE_BASE;
 	local->params.slot_size = slot_size;
@@ -1253,6 +1285,8 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	unsigned char sys_address[3];
 	unsigned char device_mode;
 	struct dnt900_local_params local_params;
+	unsigned long flags;
+
 	dnt900_local_read_params(local, &local_params);
 	if (radio->is_local) {
 		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
@@ -1272,7 +1306,6 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 			COPY3(sys_address, radio->mac_address);
 		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
 	}
-	unsigned long flags;
 	spin_lock_irqsave(&radio->param_lock, flags);
 	radio->params.is_base = device_mode == DEVICE_MODE_BASE;
 	COPY3(radio->params.sys_address, sys_address);
@@ -1284,9 +1317,11 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	unsigned char mac_addresses[15 * 26];
-	for (int n = 0; n < 26; ++n)
+	int n;
+
+	for (n = 0; n < 26; ++n)
 		TRY(dnt900_radio_get_register(radio, &dnt900_attributes[RegMACAddr00 + n].reg, mac_addresses + 15 * n));
-	for (int n = 0; n < 26 * 5; ++n) {
+	for (n = 0; n < 26 * 5; ++n) {
 		unsigned char *mac_address = mac_addresses + 3 * n;
 		if (mac_address[0] || mac_address[1] || mac_address[2])
 			dnt900_add_radio(local, mac_address, false);
@@ -1298,6 +1333,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 {
 	int error;
 	struct dnt900_radio *radio = kzalloc(sizeof(*radio), GFP_KERNEL);
+
 	UNWIND(error, radio ? 0 : -ENOMEM, fail_alloc);
 	radio->is_local = is_local;
 	COPY3(radio->mac_address, mac_address);
@@ -1323,6 +1359,7 @@ fail_alloc:
 static void dnt900_release_radio(struct device *dev)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+
 	kfree(radio);
 }
 
@@ -1330,6 +1367,7 @@ static int dnt900_count_radio(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	unsigned int *count = data;
+
 	if (!radio->is_local)
 		++(*count);
 	return 0;
@@ -1338,9 +1376,11 @@ static int dnt900_count_radio(struct device *dev, void *data)
 static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local)
 {
 	int error;
+	struct dnt900_radio *radio;
+
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	UNWIND(error, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
-	struct dnt900_radio *radio = dnt900_create_radio(local, mac_address, is_local);
+	radio = dnt900_create_radio(local, mac_address, is_local);
 	UNWIND(error, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
 	tty_port_init(&radio->port);
 	radio->port.ops = &dnt900_tty_port_ops;
@@ -1348,18 +1388,19 @@ static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac
 	if (radio->is_local)
 		UNWIND(error, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, LOCAL_SYMLINK_NAME), fail_symlink);
 	else {
+		struct device *tty_dev;
 		radio->tty_index = 0;
 		device_for_each_child(&local->dev, &radio->tty_index, dnt900_count_radio);
 		radio->tty_index--;
 		UNWIND(error, radio->tty_index < radios ? 0 : -EMLINK, fail_index);
-		struct device *tty_dev = tty_register_device(local->tty_driver, radio->tty_index, &radio->dev);
+		tty_dev = tty_register_device(local->tty_driver, radio->tty_index, &radio->dev);
 		UNWIND(error, IS_ERR(tty_dev) ? PTR_ERR(tty_dev) : 0, fail_tty);
 	}
 	INIT_KFIFO(radio->fifo);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
 	pr_info(LDISC_NAME ": added new radio %s\n", radio->name);
 	goto success;
-	
+
 fail_tty:
 fail_index:
 fail_symlink:
@@ -1377,6 +1418,7 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, LOCAL_SYMLINK_NAME);
@@ -1390,10 +1432,11 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 static int dnt900_radio_matches_sys_address(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	if (radio->is_local)
-		return 0;
 	const unsigned char *sys_address = data;
 	struct dnt900_radio_params params;
+
+	if (radio->is_local)
+		return 0;
 	dnt900_radio_read_params(radio, &params);
 	return EQUAL_ADDRESSES(params.sys_address, sys_address);
 }
@@ -1402,12 +1445,14 @@ static int dnt900_radio_matches_mac_address(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	const unsigned char *mac_address = data;
+
 	return EQUAL_ADDRESSES(radio->mac_address, mac_address);
 }
 
 static int dnt900_radio_is_local(struct device *dev, void *data)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+
 	return radio->is_local;
 }
 
@@ -1420,6 +1465,7 @@ static int dnt900_dispatch_to_radio(struct dnt900_local *local, void *finder_dat
 {
 	int error;
 	struct device *dev = device_find_child(&local->dev, finder_data, finder);
+
 	if (dev) {
 		struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 		error = action(radio, action_data);
@@ -1433,6 +1479,7 @@ static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *fi
 {
 	int error;
 	struct device *dev = device_find_child(&local->dev, finder_data, finder);
+
 	if (dev) {
 		struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 		error = action(radio);
@@ -1446,6 +1493,7 @@ static int dnt900_apply_to_radio(struct device *dev, void *data)
 {
 	int (*action)(struct dnt900_radio *) = data;
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+
 	action(radio);
 	return 0;
 }
@@ -1459,7 +1507,9 @@ static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *p
 {
 	unsigned int length = 2 + packet[1];
 	unsigned long flags;
-	for (bool done = false; !done; ) {
+	bool done;
+
+	for (done = false; !done; ) {
 		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->tx_fifo) >= length));
 		spin_lock_irqsave(&local->tx_fifo_lock, flags);
 		done = kfifo_avail(&local->tx_fifo) >= length;
@@ -1474,18 +1524,20 @@ static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *p
 static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result)
 {
 	struct dnt900_transaction transaction = { .result = result, .error = 0, .packet = packet };
+	int error;
+	long completed;
+
 	INIT_LIST_HEAD(&transaction.list);
 	init_completion(&transaction.completed);
-	
+
 	TRY(mutex_lock_interruptible(&local->transactions_lock));
 	list_add_tail(&transaction.list, &local->transactions);
 	mutex_unlock(&local->transactions_lock);
-	
-	int error;
+
 	UNWIND(error, dnt900_send_packet(local, packet), exit);
-	long completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
+	completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
 	error = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.error;
-	
+
 exit:
 	mutex_lock(&local->transactions_lock);
 	list_del(&transaction.list);
@@ -1496,6 +1548,7 @@ exit:
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio)
 {
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+
 	if (tty) {
 		tty_wakeup(tty);
 		tty_kref_put(tty);
@@ -1506,6 +1559,7 @@ static int dnt900_radio_wake_tty(struct dnt900_radio *radio)
 static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
 {
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+
 	if (tty) {
 		pr_info(LDISC_NAME ": hanging up radio %s at %s\n", radio->name, tty->name);
 		tty_hangup(tty);
@@ -1516,21 +1570,23 @@ static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
 
 static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 {
-	if (kfifo_is_empty(&radio->fifo))
-		return 0;
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	struct dnt900_local_params local_params;
 	struct dnt900_radio_params radio_params;
+	unsigned char packet[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
+
+	if (kfifo_is_empty(&radio->fifo))
+		return 0;
 	dnt900_local_read_params(local, &local_params);
 	if (local_params.slot_size <= 6)
 		return 0;
 	dnt900_radio_read_params(radio, &radio_params);
-	unsigned char packet[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
 	if (!radio->is_local)
 		COPY3(packet + 3, radio_params.sys_address);
-	unsigned long flags;
 	do {
+		unsigned long flags;
 		int length = min(local_params.slot_size, kfifo_len(&radio->fifo) + 6);
+
 		spin_lock_irqsave(&local->tx_fifo_lock, flags);
 		if (kfifo_avail(&local->tx_fifo) < length) {
 			spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
@@ -1546,19 +1602,22 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
 	// TODO: copying out to temporary buffer is a bit inefficient, can we do better?
-	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
 	unsigned long flags;
+	unsigned char buf[512]; // TODO: put this temporate buffer into dnt900_local?
+	unsigned int room;
+	unsigned int copied;
+
+	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
 	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
 		return;
-	unsigned char buf[512]; // TODO: put this temporate buffer into dnt900_local?
-	unsigned int room = tty_write_room(local->tty);
-	unsigned int copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
+	room = tty_write_room(local->tty);
+	copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
 	if (copied) {
 		set_bit(TTY_DO_WRITE_WAKEUP, &local->tty->flags);
 		copied = local->tty->ops->write(local->tty, buf, copied);
 	}
 	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
-	
+
 	wake_up_interruptible(&local->tx_queue);
 	dnt900_for_each_radio(local, dnt900_radio_wake_tty);
 }
@@ -1566,6 +1625,7 @@ static void dnt900_local_drain_fifo(struct dnt900_local *local)
 static int dnt900_tty_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = PORT_TO_RADIO(port);
+
 	get_device(&radio->dev);
 	return 0;
 }
@@ -1573,6 +1633,7 @@ static int dnt900_tty_port_activate(struct tty_port *port, struct tty_struct *tt
 static void dnt900_tty_port_shutdown(struct tty_port *port)
 {
 	struct dnt900_radio *radio = PORT_TO_RADIO(port);
+
 	put_device(&radio->dev);
 }
 
@@ -1581,6 +1642,7 @@ static int dnt900_radio_write(struct dnt900_radio *radio, void *data)
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	struct dnt900_bufdata *bufdata = data;
 	int count = kfifo_in(&radio->fifo, bufdata->buf, bufdata->len);
+
 	dnt900_local_drain_fifo(local);
 	return count;
 }
@@ -1588,18 +1650,21 @@ static int dnt900_radio_write(struct dnt900_radio *radio, void *data)
 static int dnt900_tty_open(struct tty_struct *tty, struct file *filp)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	return tty_port_open(&radio->port, tty, filp);
 }
 
 static void dnt900_tty_close(struct tty_struct *tty, struct file *filp)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	tty_port_close(&radio->port, tty, filp);
 }
 
 static void dnt900_tty_hangup(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	tty_port_hangup(&radio->port);
 }
 
@@ -1607,24 +1672,28 @@ static int dnt900_tty_write(struct tty_struct *tty, const unsigned char *buf, in
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
 	struct dnt900_bufdata bufdata = { .buf = buf, .len = len };
+
 	return dnt900_radio_write(radio, &bufdata);
 }
 
 static int dnt900_tty_put_char(struct tty_struct *tty, unsigned char ch)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	return kfifo_put(&radio->fifo, &ch) ? 1 : 0;
 }
 
 static int dnt900_tty_write_room(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	return kfifo_avail(&radio->fifo);
 }
 
 static int dnt900_tty_chars_in_buffer(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	return kfifo_len(&radio->fifo);
 }
 
@@ -1632,6 +1701,7 @@ static void dnt900_tty_flush_chars(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+
 	dnt900_local_drain_fifo(local);
 }
 
@@ -1639,6 +1709,7 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+
 	while (true) {
 		if (kfifo_is_empty(&radio->fifo))
 			break;
@@ -1651,6 +1722,7 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout)
 static void dnt900_tty_flush_buffer(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
 	kfifo_reset_out(&radio->fifo);
 }
 
@@ -1658,9 +1730,11 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	struct dnt900_bufdata bufdata = { .buf = buf, .len = len };
+
 	while (true) {
+		int sent;
 		TRY(wait_event_interruptible(local->tx_queue, true));
-		int sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
+		sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
 		if (sent || !len)
 			return sent;
 	};
@@ -1669,10 +1743,11 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	unsigned int copied;
+
 	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&local->out_fifo))
 		return -EAGAIN;
 	TRY(wait_event_interruptible(local->out_queue, !kfifo_is_empty(&local->out_fifo)));
-	unsigned int copied;
 	TRY(kfifo_to_user(&local->out_fifo, buf, len, &copied));
 	return copied;
 }
@@ -1680,12 +1755,14 @@ static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsi
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+
 	dnt900_local_drain_fifo(local);
 }
 
 static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+
 	return kfifo_len(&local->out_fifo);
 }
 
@@ -1693,6 +1770,7 @@ static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp,
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	unsigned int mask = 0;
+
 	poll_wait(filp, &local->out_queue, wait);
 	if (!kfifo_is_empty(&local->out_fifo))
 		mask |= POLLIN | POLLRDNORM;
@@ -1704,17 +1782,20 @@ static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp,
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+
 	while (count > 0) {
+		unsigned char response[MAX_PACKET_SIZE];
+		unsigned int length;
+
 		for (; count > 0; --count, ++cp, ++fp)
 			if (*fp == TTY_NORMAL && !kfifo_put(&local->rx_fifo, cp))
 				break;
-		unsigned char response[MAX_PACKET_SIZE];
 		while (kfifo_out_peek(&local->rx_fifo, response, 2) == 2) {
 			if (response[0] != START_OF_PACKET) {
 				kfifo_skip(&local->rx_fifo);
 				continue;
 			}
-			unsigned int length = 2 + response[1];
+			length = 2 + response[1];
 			if (kfifo_len(&local->rx_fifo) < length)
 				break;
 			length = kfifo_out(&local->rx_fifo, response, length);
@@ -1730,11 +1811,14 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 
 static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response)
 {
-	TRY(mutex_lock_interruptible(&local->transactions_lock));
 	const unsigned char command = response[2] & MASK_COMMAND;
 	struct dnt900_transaction *transaction;
+
+	TRY(mutex_lock_interruptible(&local->transactions_lock));
 	list_for_each_entry(transaction, &local->transactions, list) {
 		unsigned char tx_status = STATUS_ACKNOWLEDGED;
+		int n;
+
 		if (transaction->packet[2] != command)
 			continue;
 		if (completion_done(&transaction->completed))
@@ -1754,7 +1838,7 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 			 || transaction->packet[4] != response[4] 
 			 || transaction->packet[5] != response[5])
 				continue;
-			for (int n = 0; n < transaction->packet[5]; ++n)
+			for (n = 0; n < transaction->packet[5]; ++n)
 				transaction->result[n] = response[6 + n];
 			break;
 		case COMMAND_SET_REGISTER:
@@ -1767,7 +1851,7 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 				continue;
 			tx_status = response[3];
 			if (tx_status == STATUS_ACKNOWLEDGED)
-				for (int n = 0; n < 3; ++n)
+				for (n = 0; n < 3; ++n)
 					transaction->result[n] = response[7 + n];
 			break;
 		case COMMAND_GET_REMOTE_REGISTER:
@@ -1783,7 +1867,7 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 				 || transaction->packet[7] != response[9] 
 				 || transaction->packet[8] != response[10])
 					continue;
-				for (int n = 0; n < transaction->packet[8]; ++n)
+				for (n = 0; n < transaction->packet[8]; ++n)
 					transaction->result[n] = response[11 + n];
 			}
 			break;
@@ -1824,6 +1908,7 @@ static int dnt900_process_event(struct dnt900_local *local, unsigned char *respo
 	struct dnt900_bufdata bufdata;
 	int error = 0;
 	const unsigned char event = response[2];
+
 	switch (event) {
 	case EVENT_RX_DATA:
 		bufdata.buf = response + 7;
@@ -1876,7 +1961,8 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 {
 	unsigned char text[512];
 	unsigned int length;
-	
+	unsigned char sys_address[3];
+
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
 		length = scnprintf(text, ARRAY_SIZE(text), \
@@ -1942,7 +2028,9 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			annc[0], annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
 			(signed char)annc[7], (signed char)annc[9], \
 			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
-		unsigned char sys_address[] = { annc[4], annc[5], 0xFF };
+		sys_address[0] = annc[4];
+		sys_address[1] = annc[5];
+		sys_address[2] = 0xFF;
 		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, sys_address, dnt900_set_sys_address);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
@@ -2016,6 +2104,7 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 {
 	struct dnt900_bufdata *bufdata = data;
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
+
 	if (!tty)
 		return 0;
 	while (bufdata->len > 0) {
@@ -2029,15 +2118,18 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 static int dnt900_local_out(struct dnt900_local *local, const unsigned char *buf, unsigned int len)
 {
 	unsigned int copied = kfifo_in(&local->out_fifo, buf, len);
+
 	wake_up_interruptible(&local->out_queue);
 	return len == copied ? 0 : -EAGAIN;
 }
 
 static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char *address, void (*work_function)(struct work_struct *))
 {
+	struct dnt900_work *work;
+
 	if (!down_read_trylock(&local->closed_lock))
 		return;
-	struct dnt900_work *work = kzalloc(sizeof(*work), GFP_KERNEL);
+	work = kzalloc(sizeof(*work), GFP_KERNEL);
 	work->local = local;
 	if (address)
 		COPY3(work->address, address);
@@ -2049,6 +2141,7 @@ static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char
 static void dnt900_add_or_refresh_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+
 	if (dnt900_radio_exists(work->local, work->address))
 		dnt900_dispatch_to_radio_no_data(work->local, work->address, dnt900_radio_matches_mac_address, dnt900_radio_get_params);
 	else
@@ -2060,6 +2153,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	unsigned char mac_address[3];
+
 	if (!dnt900_get_remote_register(work->local, work->address, &dnt900_attributes[MacAddress].reg, mac_address))
 		dnt900_add_radio(work->local, mac_address, false);
 	kfree(work);
@@ -2068,6 +2162,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 static void dnt900_refresh_radio(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+
 	dnt900_dispatch_to_radio_no_data(work->local, work->address, dnt900_radio_matches_mac_address, dnt900_radio_get_params);
 	kfree(work);
 }
@@ -2075,6 +2170,7 @@ static void dnt900_refresh_radio(struct work_struct *ws)
 static void dnt900_refresh_local(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+
 	dnt900_local_get_params(work->local);
 	kfree(work);
 }
@@ -2082,6 +2178,7 @@ static void dnt900_refresh_local(struct work_struct *ws)
 static void dnt900_refresh_all(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+
 	dnt900_local_get_params(work->local);
 	dnt900_for_each_radio(work->local, dnt900_radio_get_params);
 	kfree(work);
@@ -2091,11 +2188,12 @@ static void dnt900_init_local(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	struct dnt900_local *local = work->local;
+	unsigned char mac_address[3];
 	int error;
+
 	UNWIND(error, dnt900_local_add_attributes(local), fail);
 	UNWIND(error, dnt900_enter_protocol_mode(local), fail);
 	UNWIND(error, dnt900_local_get_params(local), fail);
-	unsigned char mac_address[3];
 	UNWIND(error, dnt900_get_register(local, &dnt900_attributes[MacAddress].reg, mac_address), fail);
 	UNWIND(error, dnt900_add_radio(local, mac_address, true), fail);
 	if (local->params.is_base)
@@ -2103,7 +2201,7 @@ static void dnt900_init_local(struct work_struct *ws)
 	UNWIND(error, dnt900_get_base_mac_address(local, mac_address), success);
 	UNWIND(error, dnt900_add_radio(local, mac_address, false), success);
 	goto success;
-	
+
 fail:
 	pr_err(LDISC_NAME ": unable to connect to radio module on %s (error %d)\n", dev_name(&local->dev), -error);
 success:
@@ -2113,6 +2211,7 @@ success:
 static void dnt900_map_remotes(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+
 	dnt900_dispatch_to_radio_no_data(work->local, work->address, dnt900_radio_matches_mac_address, dnt900_radio_map_remotes);
 	kfree(work);
 }
@@ -2120,6 +2219,7 @@ static void dnt900_map_remotes(struct work_struct *ws)
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 {
 	struct dnt900_local *local = dev_id;
+
 	if (local->tty)
 		gpio_get_value(local->gpio_cts) ? stop_tty(local->tty) : start_tty(local->tty);
 	return IRQ_HANDLED;
@@ -2129,6 +2229,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 {
 	int error;
 	struct dnt900_local *local = kzalloc(sizeof(*local), GFP_KERNEL);
+
 	UNWIND(error, local ? 0 : -ENOMEM, fail_alloc);
 	local->tty = tty_kref_get(tty);
 	UNWIND(error, local->tty ? 0 : -EPERM, fail_tty_get);
@@ -2157,7 +2258,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	init_waitqueue_head(&local->tx_queue);
 	init_waitqueue_head(&local->out_queue);
 	return local;
-	
+
 fail_register:
 fail_name:
 	if (local->gpio_cts >= 0)
@@ -2178,6 +2279,7 @@ fail_alloc:
 static int dnt900_local_create_tty_driver(struct dnt900_local *local)
 {
 	int error;
+
 	snprintf(local->tty_driver_name, ARRAY_SIZE(local->tty_driver_name), TTY_DRIVER_NAME, local->tty->name);
 	snprintf(local->tty_dev_name, ARRAY_SIZE(local->tty_dev_name), TTY_DEV_NAME, local->tty->name);
 	local->tty_driver = alloc_tty_driver(radios);
@@ -2193,7 +2295,7 @@ static int dnt900_local_create_tty_driver(struct dnt900_local *local)
 	tty_set_operations(local->tty_driver, &dnt900_tty_ops);
 	UNWIND(error, tty_register_driver(local->tty_driver), fail_register_tty_driver);
 	return 0;
-	
+
 fail_register_tty_driver:
 	put_tty_driver(local->tty_driver);
 fail_alloc_tty_driver:
@@ -2209,6 +2311,7 @@ static void dnt900_unregister_local(struct dnt900_local *local)
 static void dnt900_release_local(struct device *dev)
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
 	tty_unregister_driver(local->tty_driver);
@@ -2220,15 +2323,17 @@ static void dnt900_release_local(struct device *dev)
 static int dnt900_ldisc_open(struct tty_struct *tty)
 {
 	int error;
+	struct dnt900_local *local;
+
 	UNWIND(error, tty->ops->write && tty->ops->write_room ? 0 : -EIO, fail_ops);
-	struct dnt900_local *local = dnt900_create_local(tty);
+	local = dnt900_create_local(tty);
 	UNWIND(error, IS_ERR(local) ? PTR_ERR(local) : 0, fail_create_local);
 	UNWIND(error, dnt900_local_create_tty_driver(local), fail_create_local_tty_driver);
 	tty->disc_data = local;
 	dnt900_schedule_work(local, NULL, dnt900_init_local);
 	pr_info(LDISC_NAME ": attached to %s\n", tty->name);
 	return 0;
-	
+
 fail_create_local_tty_driver:
 	device_unregister(&local->dev);
 fail_create_local:
@@ -2239,6 +2344,7 @@ fail_ops:
 static void dnt900_ldisc_close(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+
 	down_write(&local->closed_lock);
 	dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 	destroy_workqueue(local->workqueue);
@@ -2258,13 +2364,14 @@ static int dnt900_ldisc_hangup(struct tty_struct *tty)
 int __init dnt900_init(void)
 {
 	int error;
+
 	dnt900_class = class_create(THIS_MODULE, CLASS_NAME);
 	UNWIND(error, IS_ERR(dnt900_class) ? PTR_ERR(dnt900_class) : 0, fail_class_create);
 	dnt900_ldisc_ops.num = n_dnt900;
 	UNWIND(error, tty_register_ldisc(n_dnt900, &dnt900_ldisc_ops), fail_register);
 	pr_info(LDISC_NAME ": module inserted\n");
 	return 0;
-	
+
 fail_register:
 	class_destroy(dnt900_class);
 fail_class_create:
@@ -2285,6 +2392,7 @@ MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.2.2");
+//MODULE_ALIAS_LDISC(N_DNT900);
 
 // Future work:
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
