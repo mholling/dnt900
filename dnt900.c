@@ -210,6 +210,7 @@ struct dnt900_local {
 	struct rw_semaphore closed_lock;
 	spinlock_t param_lock;
 	spinlock_t tx_fifo_lock;
+	spinlock_t rx_fifo_lock;
 	struct workqueue_struct *workqueue;
 	struct dnt900_local_params params;
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
@@ -377,6 +378,7 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty);
 static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty);
 static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait);
+static void dnt900_ldisc_flush_buffer(struct tty_struct *tty);
 
 static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response);
 static int dnt900_process_event(struct dnt900_local *local, unsigned char *response);
@@ -887,6 +889,7 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.write_wakeup    = dnt900_ldisc_write_wakeup,
 	.chars_in_buffer = dnt900_ldisc_chars_in_buffer,
 	.poll            = dnt900_ldisc_poll,
+	.flush_buffer    = dnt900_ldisc_flush_buffer,
 	.owner           = THIS_MODULE,
 };
 
@@ -1779,17 +1782,28 @@ static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp,
 	return mask;
 }
 
+static void dnt900_ldisc_flush_buffer(struct tty_struct *tty)
+{
+	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	unsigned long flags;
+
+	spin_lock_irqsave(&local->rx_fifo_lock, flags);
+	kfifo_reset_out(&local->rx_fifo);
+	spin_unlock_irqrestore(&local->rx_fifo_lock, flags);
+}
+
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+	unsigned char response[MAX_PACKET_SIZE];
+	unsigned int length;
+	unsigned long flags;
 
 	while (count > 0) {
-		unsigned char response[MAX_PACKET_SIZE];
-		unsigned int length;
-
 		for (; count > 0; --count, ++cp, ++fp)
 			if (*fp == TTY_NORMAL && !kfifo_put(&local->rx_fifo, cp))
 				break;
+		spin_lock_irqsave(&local->rx_fifo_lock, flags);
 		while (kfifo_out_peek(&local->rx_fifo, response, 2) == 2) {
 			if (response[0] != START_OF_PACKET) {
 				kfifo_skip(&local->rx_fifo);
@@ -1801,11 +1815,14 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 			length = kfifo_out(&local->rx_fifo, response, length);
 			if (response[1] == 0)
 				continue;
+			spin_unlock_irqrestore(&local->rx_fifo_lock, flags);
 			if (response[2] & TYPE_REPLY)
 				dnt900_process_reply(local, response);
 			if (response[2] & TYPE_EVENT)
 				dnt900_process_event(local, response);
+			spin_lock_irqsave(&local->rx_fifo_lock, flags);
 		}
+		spin_unlock_irqrestore(&local->rx_fifo_lock, flags);
 	}
 }
 
@@ -2238,6 +2255,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	init_rwsem(&local->closed_lock);
 	spin_lock_init(&local->param_lock);
 	spin_lock_init(&local->tx_fifo_lock);
+	spin_lock_init(&local->rx_fifo_lock);
 	INIT_LIST_HEAD(&local->transactions);
 	local->workqueue = create_singlethread_workqueue(local->tty_driver_name);
 	UNWIND(error, local->workqueue ? 0 : -ENOMEM, fail_workqueue);
