@@ -1574,6 +1574,8 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 	struct dnt900_local_params local_params;
 	struct dnt900_radio_params radio_params;
 	unsigned char packet[MAX_PACKET_SIZE] = { START_OF_PACKET, 0, COMMAND_TX_DATA, 0xFF, 0xFF, 0xFF };
+	unsigned long flags;
+	bool tx_available;
 
 	if (kfifo_is_empty(&radio->fifo))
 		return 0;
@@ -1584,39 +1586,32 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 	if (!radio->is_local)
 		COPY3(packet + 3, radio_params.sys_address);
 	do {
-		unsigned long flags;
 		int length = min(local_params.slot_size, kfifo_len(&radio->fifo) + 6);
-
 		spin_lock_irqsave(&local->tx_fifo_lock, flags);
-		if (kfifo_avail(&local->tx_fifo) < length) {
-			spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
-			break;
+		tx_available = kfifo_avail(&local->tx_fifo) >= length;
+		if (tx_available) {
+			packet[1] = 4 + kfifo_out(&radio->fifo, packet + 6, length - 6);
+			length = kfifo_in(&local->tx_fifo, packet, length);
 		}
-		packet[1] = 4 + kfifo_out(&radio->fifo, packet + 6, length - 6);
-		length = kfifo_in(&local->tx_fifo, packet, length);
 		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
-	} while (!kfifo_is_empty(&radio->fifo));
+	} while (tx_available && !kfifo_is_empty(&radio->fifo));
 	return 0;
 }
 
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
 	// TODO: copying out to temporary buffer is a bit inefficient, can we do better?
-	unsigned long flags;
-	unsigned char buf[512]; // TODO: put this temporate buffer into dnt900_local?
+	unsigned char buf[512]; // TODO: put this temporary buffer into dnt900_local?
 	unsigned int room;
 	unsigned int copied;
 
 	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
-	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
-		return;
 	room = tty_write_room(local->tty);
 	copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
 	if (copied) {
 		set_bit(TTY_DO_WRITE_WAKEUP, &local->tty->flags);
 		copied = local->tty->ops->write(local->tty, buf, copied);
 	}
-	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 
 	wake_up_interruptible(&local->tx_queue);
 	dnt900_for_each_radio(local, dnt900_radio_wake_tty);
@@ -1713,6 +1708,7 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout)
 	while (true) {
 		if (kfifo_is_empty(&radio->fifo))
 			break;
+		// TODO: possible bug - should the next line wait for a different condition?
 		if (wait_event_interruptible_timeout(local->tx_queue, kfifo_is_empty(&local->tx_fifo), timeout) <= 0)
 			break;
 		dnt900_local_drain_fifo(local);
@@ -1722,8 +1718,12 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout)
 static void dnt900_tty_flush_buffer(struct tty_struct *tty)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	unsigned long flags;
 
+	spin_lock_irqsave(&local->tx_fifo_lock, flags);
 	kfifo_reset_out(&radio->fifo);
+	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 }
 
 static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t len)
