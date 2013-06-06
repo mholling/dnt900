@@ -1607,14 +1607,18 @@ static void dnt900_local_drain_fifo(struct dnt900_local *local)
 	unsigned char buf[512]; // TODO: put this temporary buffer into dnt900_local?
 	unsigned int room;
 	unsigned int copied;
+	unsigned long flags;
 
 	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
+	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
+		return;
 	room = tty_write_room(local->tty);
 	copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
 	if (copied) {
 		set_bit(TTY_DO_WRITE_WAKEUP, &local->tty->flags);
 		copied = local->tty->ops->write(local->tty, buf, copied);
 	}
+	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 
 	wake_up_interruptible(&local->tx_queue);
 	dnt900_for_each_radio(local, dnt900_radio_wake_tty);
