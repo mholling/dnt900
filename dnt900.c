@@ -378,6 +378,7 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty);
 static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty);
 static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait);
+static int dnt900_ldisc_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg);
 static void dnt900_ldisc_flush_buffer(struct tty_struct *tty);
 
 static int dnt900_process_reply(struct dnt900_local *local, unsigned char *response);
@@ -889,6 +890,7 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.write_wakeup    = dnt900_ldisc_write_wakeup,
 	.chars_in_buffer = dnt900_ldisc_chars_in_buffer,
 	.poll            = dnt900_ldisc_poll,
+	.ioctl           = dnt900_ldisc_ioctl,
 	.flush_buffer    = dnt900_ldisc_flush_buffer,
 	.owner           = THIS_MODULE,
 };
@@ -1731,6 +1733,7 @@ static void dnt900_tty_flush_buffer(struct tty_struct *tty)
 	spin_lock_irqsave(&local->tx_fifo_lock, flags);
 	kfifo_reset_out(&radio->fifo);
 	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
+	dnt900_local_drain_fifo(local);
 }
 
 static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t len)
@@ -1784,6 +1787,29 @@ static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp,
 	if (tty_hung_up_p(filp))
 		mask |= POLLHUP;
 	return mask;
+}
+
+static int dnt900_ldisc_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct dnt900_local *local = TTY_TO_LOCAL(tty);
+
+	switch (cmd) {
+	case TIOCOUTQ:
+		return put_user(kfifo_len(&local->tx_fifo), (int __user *)arg);
+	case TIOCINQ:
+		return put_user(kfifo_len(&local->rx_fifo), (int __user *)arg);
+	case TCFLSH:
+		switch (arg) {
+		case TCIOFLUSH:
+		case TCIFLUSH:
+			dnt900_ldisc_flush_buffer(tty);
+		case TCOFLUSH:
+			return 0;
+		}
+		return -EINVAL;
+	default:
+		return tty_mode_ioctl(tty, file, cmd, arg);
+	}
 }
 
 static void dnt900_ldisc_flush_buffer(struct tty_struct *tty)
