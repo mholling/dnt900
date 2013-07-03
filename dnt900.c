@@ -143,6 +143,8 @@
 #define ACCESS_MODE_TDMA_FIXED   (0x03)
 #define ACCESS_MODE_TDMA_PTT     (0x04)
 
+#define LINK_STATUS_READY (0x04)
+
 #define ATTR_R  (S_IRUGO)
 #define ATTR_W  (S_IWUSR)
 #define ATTR_RW (S_IRUGO | S_IWUSR)
@@ -1256,9 +1258,10 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
-	unsigned char announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
+	unsigned char link_status, announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
 	unsigned long flags;
 
+	TRY(dnt900_get_register(local, &dnt900_attributes[LinkStatus].reg, &link_status));
 	TRY(dnt900_get_register(local, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
 	TRY(dnt900_get_register(local, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
 	TRY(dnt900_get_register(local, &dnt900_attributes[AuthMode].reg, &auth_mode));
@@ -1274,7 +1277,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		pr_warn(LDISC_NAME ": AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
 		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
-	if (slot_size <= 10)
+	if (link_status == LINK_STATUS_READY && slot_size <= 10)
 		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", slot_size);
 	spin_lock_irqsave(&local->param_lock, flags);
 	local->params.is_base = device_mode == DEVICE_MODE_BASE;
