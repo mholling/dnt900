@@ -438,4 +438,4 @@ Release History
 * 16/4/2013: version 0.2: partial rewrite to represent remote radios as ttys instead of character devices.
   * 17/4/2013: version 0.2.1: fixed bug which caused an infinite loop when tty sends non-normal flag byte.
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
-  * 4/7/2013: HEAD: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
+  * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
