@@ -330,17 +330,16 @@ Transmitting and Receiving Data
 
 Data transmissions to and from remote radios are implemented using a virtual tty device for each non-local radio on the network. Loading the line discipline causes the network to be interrogated for information on all radios in the network. In our example, we get the following:
 
-    $ ls -l /dev/ttyAMA0*
-    crw-rw-rw- 1 root uucp 204, 64 Jan  1  1970 /dev/ttyAMA0
-    crw-rw-rw- 1 root uucp 248,  0 Apr 16 15:25 /dev/ttyAMA0.0
+    $ ls -l /dev/ttyDNT*
+    crw-rw-rw- 1 root uucp 248,  0 Apr 16 15:25 /dev/ttyDNT0
 
-Here, `/dev/ttyAMA0.0` is a new tty representing the remote radio with MAC address `0x00165E`. We can send data to the remote radio by writing to the new tty. For example:
+Here, `/dev/ttyDNT0` is a new tty representing the remote radio with MAC address `0x00165E`. We can send data to the remote radio by writing to the new tty. For example:
 
-    $ echo "hello, world" > /dev/ttyAMA0.0
+    $ echo "hello, world" > /dev/ttyDNT0
 
 We may also use the same file to read any data sent by the remote radio:
 
-    $ cat /dev/ttyAMA0.0
+    $ cat /dev/ttyDNT0
 
 Since there is no data transmission to and from the local radio, the original tty is used for transmitting broadcast messages (which are sent to all radios on the network, at a considerably slower rate). For example, we can broadcast data to all remotes as follows:
 
@@ -371,15 +370,15 @@ udev Rules
 
 It is suggested to add [udev rules](http://www.reactivated.net/writing_udev_rules.html) to create more meaningful names for the remote ttys. Any of the radio register attributes (in particular, the MAC address) can be used in the rules. `udevadm` is helpful in writing a suitable rule:
 
-    $ udevadm info --attribute-walk /sys/class/tty/ttyAMA0.0
+    $ udevadm info --attribute-walk /sys/class/tty/ttyDNT0
 
 For example, a rule which creates a symlink for each remote radio, named for its MAC address, is as follows:
 
     $ cat /etc/udev/rules.d/99-dnt900.rules
-    SUBSYSTEM=="tty" SUBSYSTEMS=="dnt900" ATTRS{MacAddress}=="0x*" MODE="0666" SYMLINK+="$attr{MacAddress}"
+    SUBSYSTEMS=="dnt900" ATTRS{MacAddress}=="0x*" MODE="0666" SYMLINK+="$attr{MacAddress}"
     
     $ ls -l /dev/0x*
-    lrwxrwxrwx 1 root root 9 Apr 16 15:25 /dev/0x00165E -> ttyAMA0.0
+    lrwxrwxrwx 1 root root 9 Apr 16 15:25 /dev/0x00165E -> ttyDNT0
 
 (Individual MAC addresses could also be used to give custom names to individual radios.)
 
@@ -439,4 +438,4 @@ Release History
 * 16/4/2013: version 0.2: partial rewrite to represent remote radios as ttys instead of character devices.
   * 17/4/2013: version 0.2.1: fixed bug which caused an infinite loop when tty sends non-normal flag byte.
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
-  * 7/6/2013: HEAD: new Makefile; added flush_buffer and ioctl for line discipline.
+  * 4/7/2013: HEAD: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.

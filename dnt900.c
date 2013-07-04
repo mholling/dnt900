@@ -56,8 +56,8 @@
 
 #define LDISC_NAME "dnt900"
 #define CLASS_NAME "dnt900"
-#define TTY_DRIVER_NAME "%s.dnt900"
-#define TTY_DEV_NAME "%s."
+#define TTY_DRIVER_NAME "ttyDNT"
+#define TTY_DEV_NAME "ttyDNT"
 #define LOCAL_SYMLINK_NAME "local"
 
 #define MARK() pr_info("DEBUG: Passed %s %d \n",__FUNCTION__,__LINE__)
@@ -69,9 +69,6 @@
 #define  TX_BUFFER_SIZE (8192)
 #define OUT_BUFFER_SIZE (1024)
 #define TTY_BUFFER_SIZE (1024)
-
-#define CIRC_INDEX(index, offset, size) (((index) + (offset)) & ((size) - 1))
-#define CIRC_OFFSET(index, offset, size) (index) = (((index) + (offset)) & ((size) - 1))
 
 #define REGISTER_TIMEOUT_MS (30000)
 #define STARTUP_DELAY_MS (500)
@@ -202,9 +199,6 @@ struct dnt900_local_params {
 struct dnt900_local {
 	struct device dev;
 	struct tty_struct *tty;
-	struct tty_driver *tty_driver;
-	char tty_driver_name[80];
-	char tty_dev_name[80];
 	int gpio_cts;
 	struct list_head transactions;
 	struct mutex transactions_lock;
@@ -335,7 +329,6 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local);
 static void dnt900_release_radio(struct device *dev);
-static int dnt900_count_radio(struct device *dev, void *data);
 static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local);
 static int dnt900_unregister_radio(struct device *dev, void *unused);
 
@@ -404,7 +397,6 @@ static void dnt900_map_remotes(struct work_struct *ws);
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
 static struct dnt900_local *dnt900_create_local(struct tty_struct *tty);
-static int dnt900_local_create_tty_driver(struct dnt900_local *local);
 static void dnt900_unregister_local(struct dnt900_local *local);
 static void dnt900_release_local(struct device *dev);
 
@@ -879,6 +871,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 };
 
 static struct class *dnt900_class;
+static struct tty_driver *dnt900_tty_driver;
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.magic           = TTY_LDISC_MAGIC,
@@ -1371,16 +1364,6 @@ static void dnt900_release_radio(struct device *dev)
 	kfree(radio);
 }
 
-static int dnt900_count_radio(struct device *dev, void *data)
-{
-	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	unsigned int *count = data;
-
-	if (!radio->is_local)
-		++(*count);
-	return 0;
-}
-
 static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local)
 {
 	int error;
@@ -1397,11 +1380,14 @@ static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac
 		UNWIND(error, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, LOCAL_SYMLINK_NAME), fail_symlink);
 	else {
 		struct device *tty_dev;
-		radio->tty_index = 0;
-		device_for_each_child(&local->dev, &radio->tty_index, dnt900_count_radio);
-		radio->tty_index--;
+		mutex_lock(&tty_mutex);
+		for (radio->tty_index = 0; radio->tty_index < radios; ++radio->tty_index)
+			if (dnt900_tty_driver->ttys[radio->tty_index] == NULL)
+				break;
+		// ideally we would use tty_driver_lookup_tty here, but it is not exported...
+		mutex_unlock(&tty_mutex);
 		UNWIND(error, radio->tty_index < radios ? 0 : -EMLINK, fail_index);
-		tty_dev = tty_register_device(local->tty_driver, radio->tty_index, &radio->dev);
+		tty_dev = tty_register_device(dnt900_tty_driver, radio->tty_index, &radio->dev);
 		UNWIND(error, IS_ERR(tty_dev) ? PTR_ERR(tty_dev) : 0, fail_tty);
 	}
 	INIT_KFIFO(radio->fifo);
@@ -1431,7 +1417,7 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, LOCAL_SYMLINK_NAME);
 	else
-		tty_unregister_device(local->tty_driver, radio->tty_index);
+		tty_unregister_device(dnt900_tty_driver, radio->tty_index);
 	device_unregister(dev);
 	mutex_unlock(&local->radios_lock);
 	return 0;
@@ -2290,7 +2276,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	spin_lock_init(&local->tx_fifo_lock);
 	spin_lock_init(&local->rx_fifo_lock);
 	INIT_LIST_HEAD(&local->transactions);
-	local->workqueue = create_singlethread_workqueue(local->tty_driver_name);
+	local->workqueue = create_singlethread_workqueue(tty->name);
 	UNWIND(error, local->workqueue ? 0 : -ENOMEM, fail_workqueue);
 	local->gpio_cts = gpio_cts; // how to make this per-instance?
 	if (local->gpio_cts >= 0) {
@@ -2327,32 +2313,6 @@ fail_alloc:
 	return ERR_PTR(error);
 }
 
-static int dnt900_local_create_tty_driver(struct dnt900_local *local)
-{
-	int error;
-
-	snprintf(local->tty_driver_name, ARRAY_SIZE(local->tty_driver_name), TTY_DRIVER_NAME, local->tty->name);
-	snprintf(local->tty_dev_name, ARRAY_SIZE(local->tty_dev_name), TTY_DEV_NAME, local->tty->name);
-	local->tty_driver = alloc_tty_driver(radios);
-	UNWIND(error, local->tty_driver ? 0 : -ENOMEM, fail_alloc_tty_driver);
-	local->tty_driver->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
-	local->tty_driver->driver_name = local->tty_driver_name;
-	local->tty_driver->name = local->tty_dev_name;
-	local->tty_driver->major = 0; // allocate automatically
-	local->tty_driver->minor_start = 0;
-	local->tty_driver->type = TTY_DRIVER_TYPE_SERIAL,
-	local->tty_driver->subtype = SERIAL_TYPE_NORMAL,
-	local->tty_driver->init_termios = dnt900_init_termios;
-	tty_set_operations(local->tty_driver, &dnt900_tty_ops);
-	UNWIND(error, tty_register_driver(local->tty_driver), fail_register_tty_driver);
-	return 0;
-
-fail_register_tty_driver:
-	put_tty_driver(local->tty_driver);
-fail_alloc_tty_driver:
-	return error;
-}
-
 static void dnt900_unregister_local(struct dnt900_local *local)
 {
 	device_for_each_child(&local->dev, NULL, dnt900_unregister_radio);
@@ -2365,8 +2325,6 @@ static void dnt900_release_local(struct device *dev)
 
 	if (local->gpio_cts >= 0)
 		gpio_free(local->gpio_cts);
-	tty_unregister_driver(local->tty_driver);
-	put_tty_driver(local->tty_driver);
 	tty_kref_put(local->tty);
 	kfree(local);
 }
@@ -2379,14 +2337,11 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	UNWIND(error, tty->ops->write && tty->ops->write_room ? 0 : -EIO, fail_ops);
 	local = dnt900_create_local(tty);
 	UNWIND(error, IS_ERR(local) ? PTR_ERR(local) : 0, fail_create_local);
-	UNWIND(error, dnt900_local_create_tty_driver(local), fail_create_local_tty_driver);
 	tty->disc_data = local;
 	dnt900_schedule_work(local, NULL, dnt900_init_local);
 	pr_info(LDISC_NAME ": attached to %s\n", tty->name);
 	return 0;
 
-fail_create_local_tty_driver:
-	device_unregister(&local->dev);
 fail_create_local:
 fail_ops:
 	return error;
@@ -2418,12 +2373,27 @@ int __init dnt900_init(void)
 
 	dnt900_class = class_create(THIS_MODULE, CLASS_NAME);
 	UNWIND(error, IS_ERR(dnt900_class) ? PTR_ERR(dnt900_class) : 0, fail_class_create);
+	dnt900_tty_driver = alloc_tty_driver(radios);
+	UNWIND(error, dnt900_tty_driver ? 0 : -ENOMEM, fail_alloc_tty_driver);
+	dnt900_tty_driver->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
+	dnt900_tty_driver->driver_name = TTY_DRIVER_NAME;
+	dnt900_tty_driver->name = TTY_DEV_NAME;
+	dnt900_tty_driver->major = 0; // allocate automatically
+	dnt900_tty_driver->minor_start = 0;
+	dnt900_tty_driver->type = TTY_DRIVER_TYPE_SERIAL,
+	dnt900_tty_driver->subtype = SERIAL_TYPE_NORMAL,
+	dnt900_tty_driver->init_termios = dnt900_init_termios;
+	tty_set_operations(dnt900_tty_driver, &dnt900_tty_ops);
+	UNWIND(error, tty_register_driver(dnt900_tty_driver), fail_register_tty_driver);
 	dnt900_ldisc_ops.num = n_dnt900;
-	UNWIND(error, tty_register_ldisc(n_dnt900, &dnt900_ldisc_ops), fail_register);
+	UNWIND(error, tty_register_ldisc(n_dnt900, &dnt900_ldisc_ops), fail_register_ldisc);
 	pr_info(LDISC_NAME ": module inserted\n");
 	return 0;
 
-fail_register:
+fail_register_ldisc:
+fail_register_tty_driver:
+	put_tty_driver(dnt900_tty_driver);
+fail_alloc_tty_driver:
 	class_destroy(dnt900_class);
 fail_class_create:
 	return error;
@@ -2432,6 +2402,8 @@ fail_class_create:
 void __exit dnt900_exit(void)
 {
 	tty_unregister_ldisc(n_dnt900);
+	tty_unregister_driver(dnt900_tty_driver);
+	put_tty_driver(dnt900_tty_driver);
 	class_destroy(dnt900_class);
 	pr_info(LDISC_NAME ": module removed\n");
 }
@@ -2454,3 +2426,6 @@ MODULE_VERSION("0.2.2");
 // TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are concurrently being sent?
 // TODO: can we suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
 // TODO: have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
+// TODO: Would like to issue ExitProtocolMode command when the line discipline is detached.
+//       However we can't do this as the tty is not available for use in dnt900_ldisc_close.
+//       One possibility: add 'detach' attribute which hangs up the host tty when written to.
