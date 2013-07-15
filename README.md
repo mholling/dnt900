@@ -325,6 +325,8 @@ A software reset may be issued to the local radio by writing (anything) to the `
 
 Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
 
+Also note that reading and writing attribute files may be slow (many seconds) when data is being concurrently transmitted.
+
 Transmitting and Receiving Data
 ===============================
 
@@ -439,3 +441,4 @@ Release History
   * 17/4/2013: version 0.2.1: fixed bug which caused an infinite loop when tty sends non-normal flag byte.
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
+  * 15/7/2013: HEAD: reduced internal buffer sizes; fixed attribute timeout issues.

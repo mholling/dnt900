@@ -66,11 +66,11 @@
 
 // buffer sizes must be powers of 2
 #define  RX_BUFFER_SIZE (512)  // no less
-#define  TX_BUFFER_SIZE (8192)
+#define  TX_BUFFER_SIZE (2048)
 #define OUT_BUFFER_SIZE (1024)
-#define TTY_BUFFER_SIZE (1024)
+#define TTY_BUFFER_SIZE (512)
 
-#define REGISTER_TIMEOUT_MS (30000)
+#define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
 
@@ -344,6 +344,7 @@ static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(stru
 
 static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet);
 static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result);
+static int dnt900_clear_packets(struct dnt900_local *local);
 
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio);
 static int dnt900_radio_hangup_tty(struct dnt900_radio *radio);
@@ -1081,6 +1082,7 @@ static int dnt900_enter_protocol_mode(struct dnt900_local *local)
 
 	TRY(msleep_interruptible(STARTUP_DELAY_MS) ? -EINTR : 0);
 	TRY(dnt900_send_packet_get_result(local, packet, NULL));
+	TRY(dnt900_clear_packets(local));
 	return 0;
 }
 
@@ -1539,6 +1541,21 @@ exit:
 	return error;
 }
 
+static int dnt900_clear_packets(struct dnt900_local *local)
+{
+	struct dnt900_transaction *transaction;
+
+	TRY(mutex_lock_interruptible(&local->transactions_lock));
+	list_for_each_entry(transaction, &local->transactions, list) {
+		if (completion_done(&transaction->completed))
+			continue;
+		transaction->error = -EAGAIN;
+		complete(&transaction->completed);
+	}
+	mutex_unlock(&local->transactions_lock);
+	return 0;
+}
+
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio)
 {
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
@@ -1860,14 +1877,6 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 		if (completion_done(&transaction->completed))
 			continue;
 		switch (command) {
-		case COMMAND_TX_DATA:
-			// match Addr:
-			if (transaction->packet[3] != response[4] 
-			 || transaction->packet[4] != response[5] 
-			 || transaction->packet[5] != response[6])
-				continue;
-			tx_status = response[3];
-			break;
 		case COMMAND_GET_REGISTER:
 			// match Reg, Bank, span:
 			if (transaction->packet[3] != response[3] 
@@ -2005,6 +2014,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			"- event: startup complete\n" \
 			"  code: 0x%02X\n", \
 			annc[0]);
+		dnt900_clear_packets(local);
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_JOINED:
@@ -2423,9 +2433,6 @@ MODULE_VERSION("0.2.3");
 //       expose a 'priority' attribute to determine how many packets are sent at once)
 // TODO: report bad status bytes in TxDataReply responses received in dnt900_process_reply
 // TODO: ParentACKQual not working!
-// TODO: have REGISTER_TIMEOUT_MS depend on whether data packets are concurrently being sent?
-// TODO: can we suspend TxData packets when GetRegister/GetRegisterRemote packets are waiting?
-// TODO: have packet timeout scale with ARQ_AttemptLimit x HopDuration x tree depth?
 // TODO: Would like to issue ExitProtocolMode command when the line discipline is detached.
 //       However we can't do this as the tty is not available for use in dnt900_ldisc_close.
-//       One possibility: add 'detach' attribute which hangs up the host tty when written to.
+// TODO: hangup ttys on ANNOUNCEMENT_BASE_REBOOTED event?
