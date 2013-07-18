@@ -306,10 +306,10 @@ When you wish your configuration registers changes to be permanent, you will nee
 
     $ echo 0x01 > /sys/class/dnt900/ttyAMA0/0x00165E/MemorySave
 
-Note that changing some configuration registers relating to the serial port or radio network may cause a temporary loss of connection to the radio. For example, changing the serial rate on the local radio to 115200 would result in the serial connection being lost, requiring that the line discipline be dropped and reattached at the new rate:
+Note that changing some configuration registers relating to the serial port or radio network may cause a temporary loss of connection to the radio. For example, changing the serial rate on the local radio to 115200 would result in the serial connection being lost. After writing the value, interrupt with `ctrl-c` then drop and reattach the line discipline at the new rate:
 
     $ echo 0x0004 > /sys/class/dnt900/ttyAMA0/0x00165F/SerialRate 
-    -bash: echo: write error: Connection timed out
+    ^Cbash: echo: write error: Interrupted system call
     $ killall ldattach
     $ ldattach -8n1 -s 115200 29 /dev/ttyAMA0
 
