@@ -873,6 +873,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 
 static struct class *dnt900_class;
 static struct tty_driver *dnt900_tty_driver;
+static bool *dnt900_tty_indices;
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
 	.magic           = TTY_LDISC_MAGIC,
@@ -1382,13 +1383,10 @@ static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac
 		UNWIND(error, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, LOCAL_SYMLINK_NAME), fail_symlink);
 	else {
 		struct device *tty_dev;
-		mutex_lock(&tty_mutex);
-		for (radio->tty_index = 0; radio->tty_index < radios; ++radio->tty_index)
-			if (dnt900_tty_driver->ttys[radio->tty_index] == NULL)
-				break;
-		// ideally we would use tty_driver_lookup_tty here, but it is not exported...
-		mutex_unlock(&tty_mutex);
+		for (radio->tty_index = 0; radio->tty_index < radios && dnt900_tty_indices[radio->tty_index]; ++radio->tty_index)
+			;
 		UNWIND(error, radio->tty_index < radios ? 0 : -EMLINK, fail_index);
+		dnt900_tty_indices[radio->tty_index] = true;
 		tty_dev = tty_register_device(dnt900_tty_driver, radio->tty_index, &radio->dev);
 		UNWIND(error, IS_ERR(tty_dev) ? PTR_ERR(tty_dev) : 0, fail_tty);
 	}
@@ -1418,8 +1416,10 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, LOCAL_SYMLINK_NAME);
-	else
+	else {
 		tty_unregister_device(dnt900_tty_driver, radio->tty_index);
+		dnt900_tty_indices[radio->tty_index] = false;
+	}
 	device_unregister(dev);
 	mutex_unlock(&local->radios_lock);
 	return 0;
@@ -2383,6 +2383,8 @@ int __init dnt900_init(void)
 
 	dnt900_class = class_create(THIS_MODULE, CLASS_NAME);
 	UNWIND(error, IS_ERR(dnt900_class) ? PTR_ERR(dnt900_class) : 0, fail_class_create);
+	dnt900_tty_indices = kcalloc(radios, sizeof(*dnt900_tty_indices), GFP_KERNEL);
+	UNWIND(error, dnt900_tty_indices ? 0 : -ENOMEM, fail_alloc_tty_indices);
 	dnt900_tty_driver = alloc_tty_driver(radios);
 	UNWIND(error, dnt900_tty_driver ? 0 : -ENOMEM, fail_alloc_tty_driver);
 	dnt900_tty_driver->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
@@ -2401,9 +2403,12 @@ int __init dnt900_init(void)
 	return 0;
 
 fail_register_ldisc:
+	tty_unregister_driver(dnt900_tty_driver);
 fail_register_tty_driver:
 	put_tty_driver(dnt900_tty_driver);
 fail_alloc_tty_driver:
+	kfree(dnt900_tty_indices);
+fail_alloc_tty_indices:
 	class_destroy(dnt900_class);
 fail_class_create:
 	return error;
@@ -2414,6 +2419,7 @@ void __exit dnt900_exit(void)
 	tty_unregister_ldisc(n_dnt900);
 	tty_unregister_driver(dnt900_tty_driver);
 	put_tty_driver(dnt900_tty_driver);
+	kfree(dnt900_tty_indices);
 	class_destroy(dnt900_class);
 	pr_info(LDISC_NAME ": module removed\n");
 }
