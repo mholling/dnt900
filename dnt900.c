@@ -2430,7 +2430,7 @@ module_exit(dnt900_exit);
 MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.2.3");
+MODULE_VERSION("0.2.4");
 //MODULE_ALIAS_LDISC(N_DNT900);
 
 // Future work:
