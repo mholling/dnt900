@@ -442,3 +442,5 @@ Release History
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
+  * 30/7/2013: HEAD: improve DNT900 event logging
+  

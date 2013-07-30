@@ -2163,10 +2163,11 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 
 static int dnt900_local_out(struct dnt900_local *local, const unsigned char *buf, unsigned int len)
 {
-	unsigned int copied = kfifo_in(&local->out_fifo, buf, len);
-
+	if (kfifo_avail(&local->out_fifo) < len)
+		return -EAGAIN;
+	len = kfifo_in(&local->out_fifo, buf, len);
 	wake_up_interruptible(&local->out_queue);
-	return len == copied ? 0 : -EAGAIN;
+	return 0;
 }
 
 static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char *address, void (*work_function)(struct work_struct *))
