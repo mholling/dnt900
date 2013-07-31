@@ -207,6 +207,7 @@ struct dnt900_local {
 	spinlock_t param_lock;
 	spinlock_t tx_fifo_lock;
 	spinlock_t rx_fifo_lock;
+	spinlock_t announce_lock;
 	struct workqueue_struct *workqueue;
 	struct dnt900_local_params params;
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
@@ -214,6 +215,7 @@ struct dnt900_local {
 	DECLARE_KFIFO(out_fifo, unsigned char, OUT_BUFFER_SIZE);
 	wait_queue_head_t tx_queue;
 	wait_queue_head_t out_queue;
+	unsigned char announce[32];
 };
 
 struct dnt900_radio_params {
@@ -322,6 +324,7 @@ static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *att
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_show_announce(struct device *dev, struct device_attribute *attr, char *buf);
 
 static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
@@ -421,8 +424,9 @@ module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
 
 static const struct device_attribute dnt900_local_attributes[] = {
-	__ATTR(reset,	ATTR_W, NULL, dnt900_store_reset),
-	__ATTR(discover, ATTR_W, NULL, dnt900_store_discover)
+	__ATTR(reset,	 ATTR_W, NULL, dnt900_store_reset),
+	__ATTR(discover, ATTR_W, NULL, dnt900_store_discover),
+	__ATTR(announce, ATTR_R, dnt900_show_announce, NULL)
 };
 
 enum {
@@ -1252,6 +1256,17 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 	return count;
 }
 
+static ssize_t dnt900_show_announce(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&local->announce_lock, flags);
+	strcpy(buf, local->announce);
+	spin_unlock_irqrestore(&local->announce_lock, flags);
+	return strlen(buf);
+}
+
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
 	unsigned char link_status, announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
@@ -2006,7 +2021,9 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 {
 	unsigned char text[512];
 	unsigned int length;
+	unsigned int bytes = 1;
 	unsigned char sys_address[3];
+	unsigned long flags;
 
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
@@ -2018,6 +2035,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_JOINED:
+		bytes = 6;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: joined network\n" \
 			"  code: 0x%02X\n" \
@@ -2029,6 +2047,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
+		bytes = 2;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: departed network\n" \
 			"  code: 0x%02X\n" \
@@ -2037,6 +2056,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
+		bytes = 6;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: remote joined\n" \
 			"  code: 0x%02X\n" \
@@ -2046,6 +2066,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_schedule_work(local, annc + 1, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
+		bytes = 4;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: remote departed\n" \
 			"  code: 0x%02X\n" \
@@ -2060,6 +2081,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			annc[0]);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
+		bytes = 11;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: received heartbeat\n" \
 			"  code: 0x%02X\n" \
@@ -2080,6 +2102,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, sys_address, dnt900_set_sys_address);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
+		bytes = 2;
 		length = scnprintf(text, ARRAY_SIZE(text), \
 			"- event: router heartbeat timed out\n" \
 			"  code: 0x%02X\n" \
@@ -2143,6 +2166,10 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	default:
 		return 0;
 	}
+	spin_lock_irqsave(&local->announce_lock, flags);
+	dnt900_print_hex(bytes, annc, local->announce);
+	spin_unlock_irqrestore(&local->announce_lock, flags);
+	sysfs_notify(&local->dev.kobj, NULL, "announce");
 	return dnt900_local_out(local, text, length);
 }
 
@@ -2286,6 +2313,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	spin_lock_init(&local->param_lock);
 	spin_lock_init(&local->tx_fifo_lock);
 	spin_lock_init(&local->rx_fifo_lock);
+	spin_lock_init(&local->announce_lock);
 	INIT_LIST_HEAD(&local->transactions);
 	local->workqueue = create_singlethread_workqueue(tty->name);
 	UNWIND(error, local->workqueue ? 0 : -ENOMEM, fail_workqueue);

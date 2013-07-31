@@ -55,6 +55,7 @@ The configuration registers of each radio on the network may be accessed via the
     total 0
     drwxr-xr-x 3 root root    0 Apr 16 15:25 0x00165E
     drwxr-xr-x 4 root root    0 Apr 16 15:25 0x00165F
+    -r--r--r-- 1 root root 4096 Apr 16 15:25 announce
     --w------- 1 root root 4096 Apr 16 15:25 discover
     lrwxrwxrwx 1 root root    0 Apr 16 15:25 local -> 0x00165F
     drwxr-xr-x 2 root root    0 Apr 16 15:25 power
@@ -315,7 +316,7 @@ Note that changing some configuration registers relating to the serial port or r
 
 (Note that a `MemorySave` would then be required to make this change permanent.)
 
-Finally, two system attributes, `discover` and `reset`, are also available. Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
+Finally, three system attributes, `discover`, `reset` and `announce`, are also available. Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
 
     $ echo 0x00165A > /sys/class/dnt900/ttyAMA0/discover
 
@@ -324,6 +325,13 @@ A software reset may be issued to the local radio by writing (anything) to the `
     $ echo 1 > /sys/class/dnt900/ttyAMA0/reset
 
 Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
+
+The `announce` attribute file contains the most recent announcement from the DNT900 radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). For example, when running on a remote radio, the following announcement would be received when the radio joins a radio network with base MAC address `0x00165F`:
+
+    $ cat /sys/class/dnt900/ttyAMA0/announce
+    0xA3005F160001
+
+The `announce` attribute is pollable, allowing it to be monitored for announcements as they occur. As an alternative to this attribute file, announcement messages are also output in YAML format on the original tty device (see below).
 
 Also note that reading and writing attribute files may be slow (many seconds) when data is being concurrently transmitted.
 
@@ -347,7 +355,7 @@ Since there is no data transmission to and from the local radio, the original tt
 
     $ echo "some broadcast message" > /dev/ttyAMA0
 
-This original tty is also used to receive event messages posted by the local radio. In our example, the following messages are emitted when a remote radio joins the network (in tree routing mode) and begins transmitting heartbeats:
+This original tty is also used to receive announcements posted by the local radio. In our example, the following messages are emitted when a remote radio joins the network (in tree routing mode) and begins transmitting heartbeats:
 
     $ cat /dev/ttyAMA0 
     - event: remote joined
@@ -442,5 +450,5 @@ Release History
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
-  * 30/7/2013: HEAD: improve DNT900 event logging
+  * 30/7/2013: HEAD: added sysfs announce attribute as alternate way of monitoring radio announcements;
   
