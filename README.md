@@ -340,26 +340,6 @@ Since there is no data transmission to and from the local radio, the original tt
 
     $ echo "some broadcast message" > /dev/ttyAMA0
 
-This original tty is also used to receive announcements posted by the local radio. In our example, the following messages are emitted when a remote radio joins the network (in tree routing mode) and begins transmitting heartbeats:
-
-    $ cat /dev/ttyAMA0 
-    - event: remote joined
-      code: 0xA2
-      MAC address: 0x00165E
-      range: 0 km
-    - event: received heartbeat
-      code: 0xA8
-      MAC address: 0x00165E
-      network address: 0x00
-      network ID: 0x01
-      parent network ID: 0x00
-      received RSSI: -39 dBm
-      reported RSSI: -57 dBm
-      packet success rate: 100%
-      range: 0 km
-
-Whilst human-readable, these messages are in [YAML](http://en.wikipedia.org/wiki/YAML) format and should be easy to parse in a user-space application.
-
 Local Radio Attributes
 ======================
 
@@ -380,7 +360,7 @@ The `announce` attribute file contains the most recent announcement from the DNT
     $ cat /sys/devices/virtual/dnt900/ttyAMA0/announce
     0xA3005F160001
 
-The `announce` attribute is pollable, allowing it to be monitored by your application for new announcements as they occur. (This is in addition to the YAML-formatted output on the original tty device, described previously.)
+The `announce` attribute is pollable, allowing it to be monitored by your application for new announcements as they occur.
 
 Receiving I/O Reports
 =====================
