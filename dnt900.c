@@ -72,7 +72,6 @@
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
-#define REPORT_REGISTERS (10)
 
 #define START_OF_PACKET (0xFB)
 
@@ -196,54 +195,18 @@ struct dnt900_local_params {
 	unsigned int slot_size;
 };
 
-struct dnt900_local {
-	struct device dev;
-	struct tty_struct *tty;
-	int gpio_cts;
-	struct list_head transactions;
-	struct mutex transactions_lock;
-	struct mutex radios_lock;
-	struct rw_semaphore closed_lock;
-	spinlock_t param_lock;
-	spinlock_t tx_fifo_lock;
-	spinlock_t rx_fifo_lock;
-	spinlock_t announce_lock;
-	struct workqueue_struct *workqueue;
-	struct dnt900_local_params params;
-	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
-	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
-	wait_queue_head_t tx_queue;
-	unsigned char announce[32];
-};
+struct dnt900_local;
 
 struct dnt900_radio_params {
 	unsigned char sys_address[3];
 	bool is_base;
 };
 
-struct dnt900_radio {
-	struct device dev;
-	bool is_local;
-	spinlock_t param_lock;
-	spinlock_t report_lock;
-	unsigned char mac_address[3];
-	struct dnt900_radio_params params;
-	char name[80];
-	unsigned int tty_index;
-	struct tty_port port;
-	DECLARE_KFIFO(fifo, unsigned char, TTY_BUFFER_SIZE);
-	char report[REPORT_REGISTERS][8];
-};
+struct dnt900_radio;
 
 struct dnt900_bufdata {
 	const unsigned char *buf;
 	unsigned int len;
-};
-
-struct dnt900_register {
-	unsigned char bank;
-	unsigned char offset;
-	unsigned char span;
 };
 
 struct dnt900_work {
@@ -252,7 +215,13 @@ struct dnt900_work {
 	struct dnt900_local *local;
 };
 
-struct dnt900_attribute {
+struct dnt900_register {
+	unsigned char bank;
+	unsigned char offset;
+	unsigned char span;
+};
+
+struct dnt900_reg_attribute {
 	struct device_attribute attr;
 	struct dnt900_register reg;
 	int (*print)(const unsigned char *value, char *buf);
@@ -268,39 +237,10 @@ struct dnt900_report_attribute {
 	unsigned int bytes;
 };
 
-#define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse, _work, _local_work) { \
-	.attr = { \
-		.attr = { \
-			.name = _name, \
-			.mode = _mode \
-		}, \
-		.show = dnt900_show_attr, \
-		.store = dnt900_store_attr \
-	}, \
-	.reg = { \
-		.bank = _bank, \
-		.offset = _offset, \
-		.span = _span \
-	}, \
-	.print = _print, \
-	.parse = _parse, \
-	.work = _work, \
-	.local_work = _local_work \
-}
-
-#define DNT900_REPORT_ATTR(_name, _index, _offset, _bytes) { \
-	.attr = { \
-		.attr = { \
-			.name = _name, \
-			.mode = ATTR_R \
-		}, \
-		.show = dnt900_show_report, \
-		.store = NULL \
-	}, \
-	.index = _index, \
-	.offset = _offset, \
-	.bytes = _bytes \
-}
+struct dnt900_announce_attribute {
+	struct device_attribute attr;
+	unsigned int index;
+};
 
 static int dnt900_print_bytes(int bytes, const unsigned char *value, char *buf);
 static int dnt900_print_1_bytes(const unsigned char *value, char *buf);
@@ -341,8 +281,8 @@ static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_l
 static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dnt900_register *reg, const unsigned char *value);
 
-static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_show_reg(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t dnt900_store_reg(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_show_report(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
@@ -670,240 +610,321 @@ enum {
 	MemorySave
 };
 
-static const struct dnt900_attribute dnt900_attributes[] = {
-	DNT900_ATTR("DeviceMode",         ATTR_RW, 0x00, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, dnt900_refresh_local),
-	DNT900_ATTR("RF_DataRate",        ATTR_RW, 0x00, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("HopDuration",        ATTR_RW, 0x00, 0x02, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("InitialParentNwkID", ATTR_RW, 0x00, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SecurityKey",        ATTR_W,  0x00, 0x05, 0x10, NULL, dnt900_parse_16_hex, NULL, NULL),
-	DNT900_ATTR("SleepMode",          ATTR_RW, 0x00, 0x15, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("WakeResponseTime",   ATTR_RW, 0x00, 0x16, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("WakeLinkTimeout",    ATTR_RW, 0x00, 0x17, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("TxPower",            ATTR_RW, 0x00, 0x18, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ExtSyncEnable",      ATTR_RW, 0x00, 0x19, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("DiversityMode",      ATTR_RW, 0x00, 0x1A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("UserTag",            ATTR_RW, 0x00, 0x1C, 0x10, dnt900_print_16_ascii, dnt900_parse_16_ascii, NULL, NULL),
-	DNT900_ATTR("RegDenialDelay",     ATTR_RW, 0x00, 0x2C, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("RmtTransDestAddr",   ATTR_RW, 0x00, 0x2E, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("TreeRoutingEn",      ATTR_RW, 0x00, 0x34, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_all),
-	DNT900_ATTR("BaseModeNetID",      ATTR_RW, 0x00, 0x35, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("StaticNetAddr",      ATTR_RW, 0x00, 0x36, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, NULL),
-	DNT900_ATTR("HeartbeatIntrvl",    ATTR_RW, 0x00, 0x37, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("TreeRoutingSysID",   ATTR_RW, 0x00, 0x39, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("EnableRtAcks",       ATTR_RW, 0x00, 0x3A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, NULL),
-	DNT900_ATTR("FrequencyBand",      ATTR_RW, 0x01, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("AccessMode",         ATTR_RW, 0x01, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("BaseSlotSize",       ATTR_RW, 0x01, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_local),
-	DNT900_ATTR("LeasePeriod",        ATTR_RW, 0x01, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ARQ_Mode",           ATTR_RW, 0x01, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ARQ_AttemptLimit",   ATTR_RW, 0x01, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("MaxSlots",           ATTR_RW, 0x01, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("CSMA_Predelay",      ATTR_RW, 0x01, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("CSMA_Backoff",       ATTR_RW, 0x01, 0x08, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("MaxPropDelay",       ATTR_RW, 0x01, 0x09, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("LinkDropThreshold",  ATTR_RW, 0x01, 0x0A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("CSMA_RemtSlotSize",  ATTR_RW, 0x01, 0x0B, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("CSMA_BusyThreshold", ATTR_RW, 0x01, 0x0C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("RangingInterval",    ATTR_RW, 0x01, 0x0D, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("AuthMode",           ATTR_RW, 0x01, 0x0E, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("P2PReplyTimeout",    ATTR_RW, 0x01, 0x0F, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("MacAddress",         ATTR_R,  0x02, 0x00, 0x03, dnt900_print_3_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrNwkAddr",        ATTR_R,  0x02, 0x03, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrNwkID",          ATTR_R,  0x02, 0x04, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrRF_DataRate",    ATTR_R,  0x02, 0x05, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrFreqBand",       ATTR_R,  0x02, 0x06, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("LinkStatus",         ATTR_R,  0x02, 0x07, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("RemoteSlotSize",     ATTR_R,  0x02, 0x08, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("TDMA_NumSlots",      ATTR_R,  0x02, 0x09, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("TDMA_CurrSlot",      ATTR_R,  0x02, 0x0B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("HardwareVersion",    ATTR_R,  0x02, 0x0C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("FirmwareVersion",    ATTR_R,  0x02, 0x0D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("FirmwareBuildNum",   ATTR_R,  0x02, 0x0E, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("SuperframeCount",    ATTR_R,  0x02, 0x11, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("RSSI_Idle",          ATTR_R,  0x02, 0x12, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("RSSI_Last",          ATTR_R,  0x02, 0x13, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrTxPower",        ATTR_R,  0x02, 0x14, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrAttemptLimit",   ATTR_R,  0x02, 0x15, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrRangeDelay",     ATTR_R,  0x02, 0x16, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("FirmwareBuildDate",  ATTR_R,  0x02, 0x17, 0x08, dnt900_print_8_ascii, NULL, NULL, NULL),
-	DNT900_ATTR("FirmwareBuildTime",  ATTR_R,  0x02, 0x1F, 0x08, dnt900_print_8_ascii, NULL, NULL, NULL),
-	DNT900_ATTR("ModelNumber",        ATTR_R,  0x02, 0x27, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("CurrBaseModeNetID",  ATTR_R,  0x02, 0x28, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("AveRXPwrOvHopSeq",   ATTR_R,  0x02, 0x29, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	// DNT900_ATTR("ParentACKQual",      ATTR_R,  0x02, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("SerialRate",         ATTR_RW, 0x03, 0x00, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("SerialParams",       ATTR_RW, 0x03, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SerialControls",     ATTR_RW, 0x03, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SPI_Mode",           ATTR_RW, 0x03, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SPI_Divisor",        ATTR_RW, 0x03, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SPI_Options",        ATTR_RW, 0x03, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SPI_MasterCmdLen",   ATTR_RW, 0x03, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SPI_MasterCmdStr",   ATTR_RW, 0x03, 0x08, 0x20, dnt900_print_32_hex, dnt900_parse_32_hex, NULL, NULL),
-	DNT900_ATTR("ProtocolMode",       ATTR_RW, 0x04, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ProtocolOptions",    ATTR_RW, 0x04, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_local),
-	DNT900_ATTR("TxTimeout",          ATTR_RW, 0x04, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("MinPacketLength",    ATTR_RW, 0x04, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("AnnounceOptions",    ATTR_RW, 0x04, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("TransLinkAnnEn",     ATTR_RW, 0x04, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ProtocolSequenceEn", ATTR_RW, 0x04, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("TransPtToPtMode",    ATTR_RW, 0x04, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("MaxPktsPerHop",      ATTR_RW, 0x04, 0x08, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO0",              ATTR_RW, 0x05, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO1",              ATTR_RW, 0x05, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO2",              ATTR_RW, 0x05, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO3",              ATTR_RW, 0x05, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO4",              ATTR_RW, 0x05, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO5",              ATTR_RW, 0x05, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ADC0",               ATTR_R,  0x05, 0x06, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ADC1",               ATTR_R,  0x05, 0x08, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ADC2",               ATTR_R,  0x05, 0x0A, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("EventFlags",         ATTR_R,  0x05, 0x0C, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("PWM0",               ATTR_RW, 0x05, 0x0E, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("PWM1",               ATTR_RW, 0x05, 0x10, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_Dir",           ATTR_RW, 0x06, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_Init",          ATTR_RW, 0x06, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_Alt",           ATTR_RW, 0x06, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_Edge_Trigger",  ATTR_RW, 0x06, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_SleepMode",     ATTR_RW, 0x06, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_SleepDir",      ATTR_RW, 0x06, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("GPIO_SleepState",    ATTR_RW, 0x06, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("PWM0_Init",          ATTR_RW, 0x06, 0x07, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("PWM1_Init",          ATTR_RW, 0x06, 0x09, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC_SampleIntvl",    ATTR_RW, 0x06, 0x0B, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC0_ThresholdLo",   ATTR_RW, 0x06, 0x0D, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC0_ThresholdHi",   ATTR_RW, 0x06, 0x0F, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC1_ThresholdLo",   ATTR_RW, 0x06, 0x11, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC1_ThresholdHi",   ATTR_RW, 0x06, 0x13, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC2_ThresholdLo",   ATTR_RW, 0x06, 0x15, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("ADC2_ThresholdHi",   ATTR_RW, 0x06, 0x17, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("IO_ReportTrigger",   ATTR_RW, 0x06, 0x19, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("IO_ReportInterval",  ATTR_RW, 0x06, 0x1A, 0x04, dnt900_print_4_bytes, dnt900_parse_4_bytes, NULL, NULL),
-	DNT900_ATTR("IO_ReportPreDel",    ATTR_RW, 0x06, 0x1E, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("IO_ReportRepeat",    ATTR_RW, 0x06, 0x1F, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr00",     ATTR_RW, 0x07, 0x00, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr01",     ATTR_RW, 0x07, 0x03, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr02",     ATTR_RW, 0x07, 0x06, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr03",     ATTR_RW, 0x07, 0x09, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr04",     ATTR_RW, 0x07, 0x0C, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr05",     ATTR_RW, 0x07, 0x0F, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr06",     ATTR_RW, 0x07, 0x12, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr07",     ATTR_RW, 0x07, 0x15, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr08",     ATTR_RW, 0x07, 0x18, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr09",     ATTR_RW, 0x07, 0x1B, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr10",     ATTR_RW, 0x07, 0x1E, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr11",     ATTR_RW, 0x07, 0x21, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr12",     ATTR_RW, 0x07, 0x24, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr13",     ATTR_RW, 0x07, 0x27, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr14",     ATTR_RW, 0x07, 0x2A, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("ApprovedAddr15",     ATTR_RW, 0x07, 0x2D, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
-	DNT900_ATTR("BaseNetworkID",      ATTR_R,  0x08, 0x00, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID01",  ATTR_R,  0x08, 0x01, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID02",  ATTR_R,  0x08, 0x02, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID03",  ATTR_R,  0x08, 0x03, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID04",  ATTR_R,  0x08, 0x04, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID05",  ATTR_R,  0x08, 0x05, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID06",  ATTR_R,  0x08, 0x06, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID07",  ATTR_R,  0x08, 0x07, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID08",  ATTR_R,  0x08, 0x08, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID09",  ATTR_R,  0x08, 0x09, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID10",  ATTR_R,  0x08, 0x0A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID11",  ATTR_R,  0x08, 0x0B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID12",  ATTR_R,  0x08, 0x0C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID13",  ATTR_R,  0x08, 0x0D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID14",  ATTR_R,  0x08, 0x0E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID15",  ATTR_R,  0x08, 0x0F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID16",  ATTR_R,  0x08, 0x10, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID17",  ATTR_R,  0x08, 0x11, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID18",  ATTR_R,  0x08, 0x12, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID19",  ATTR_R,  0x08, 0x13, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID20",  ATTR_R,  0x08, 0x14, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID21",  ATTR_R,  0x08, 0x15, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID22",  ATTR_R,  0x08, 0x16, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID23",  ATTR_R,  0x08, 0x17, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID24",  ATTR_R,  0x08, 0x18, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID25",  ATTR_R,  0x08, 0x19, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID26",  ATTR_R,  0x08, 0x1A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID27",  ATTR_R,  0x08, 0x1B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID28",  ATTR_R,  0x08, 0x1C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID29",  ATTR_R,  0x08, 0x1D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID30",  ATTR_R,  0x08, 0x1E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID31",  ATTR_R,  0x08, 0x1F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID32",  ATTR_R,  0x08, 0x20, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID33",  ATTR_R,  0x08, 0x21, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID34",  ATTR_R,  0x08, 0x22, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID35",  ATTR_R,  0x08, 0x23, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID36",  ATTR_R,  0x08, 0x24, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID37",  ATTR_R,  0x08, 0x25, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID38",  ATTR_R,  0x08, 0x26, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID39",  ATTR_R,  0x08, 0x27, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID40",  ATTR_R,  0x08, 0x28, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID41",  ATTR_R,  0x08, 0x29, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID42",  ATTR_R,  0x08, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID43",  ATTR_R,  0x08, 0x2B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID44",  ATTR_R,  0x08, 0x2C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID45",  ATTR_R,  0x08, 0x2D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID46",  ATTR_R,  0x08, 0x2E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID47",  ATTR_R,  0x08, 0x2F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID48",  ATTR_R,  0x08, 0x30, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID49",  ATTR_R,  0x08, 0x31, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID50",  ATTR_R,  0x08, 0x32, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID51",  ATTR_R,  0x08, 0x33, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID52",  ATTR_R,  0x08, 0x34, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID53",  ATTR_R,  0x08, 0x35, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID54",  ATTR_R,  0x08, 0x36, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID55",  ATTR_R,  0x08, 0x37, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID56",  ATTR_R,  0x08, 0x38, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID57",  ATTR_R,  0x08, 0x39, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID58",  ATTR_R,  0x08, 0x3A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID59",  ATTR_R,  0x08, 0x3B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID60",  ATTR_R,  0x08, 0x3C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID61",  ATTR_R,  0x08, 0x3D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID62",  ATTR_R,  0x08, 0x3E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("ParentNetworkID63",  ATTR_R,  0x08, 0x3F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr00",       ATTR_R,  0x09, 0x00, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr01",       ATTR_R,  0x09, 0x01, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr02",       ATTR_R,  0x09, 0x02, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr03",       ATTR_R,  0x09, 0x03, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr04",       ATTR_R,  0x09, 0x04, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr05",       ATTR_R,  0x09, 0x05, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr06",       ATTR_R,  0x09, 0x06, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr07",       ATTR_R,  0x09, 0x07, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr08",       ATTR_R,  0x09, 0x08, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr09",       ATTR_R,  0x09, 0x09, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr10",       ATTR_R,  0x09, 0x0A, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr11",       ATTR_R,  0x09, 0x0B, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr12",       ATTR_R,  0x09, 0x0C, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr13",       ATTR_R,  0x09, 0x0D, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr14",       ATTR_R,  0x09, 0x0E, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr15",       ATTR_R,  0x09, 0x0F, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr16",       ATTR_R,  0x09, 0x10, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr17",       ATTR_R,  0x09, 0x11, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr18",       ATTR_R,  0x09, 0x12, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr19",       ATTR_R,  0x09, 0x13, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr20",       ATTR_R,  0x09, 0x14, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr21",       ATTR_R,  0x09, 0x15, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr22",       ATTR_R,  0x09, 0x16, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr23",       ATTR_R,  0x09, 0x17, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr24",       ATTR_R,  0x09, 0x18, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("RegMACAddr25",       ATTR_R,  0x09, 0x19, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
-	DNT900_ATTR("UcReset",            ATTR_W,  0xFF, 0x00, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("SleepModeOverride",  ATTR_RW, 0xFF, 0x0C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("RoutingTableUpd",    ATTR_RW, 0xFF, 0x1C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_ATTR("DiagSerialRate",     ATTR_RW, 0xFF, 0x20, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
-	DNT900_ATTR("MemorySave",         ATTR_W,  0xFF, 0xFF, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL)
+#define DNT900_REG_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse, _work, _local_work) { \
+	.attr = { \
+		.attr = { \
+			.name = #_name, \
+			.mode = _mode \
+		}, \
+		.show = dnt900_show_reg, \
+		.store = dnt900_store_reg \
+	}, \
+	.reg = { \
+		.bank = _bank, \
+		.offset = _offset, \
+		.span = _span \
+	}, \
+	.print = _print, \
+	.parse = _parse, \
+	.work = _work, \
+	.local_work = _local_work \
+}
+
+static const struct dnt900_reg_attribute dnt900_reg_attributes[] = {
+	DNT900_REG_ATTR(DeviceMode,         ATTR_RW, 0x00, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, dnt900_refresh_local),
+	DNT900_REG_ATTR(RF_DataRate,        ATTR_RW, 0x00, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(HopDuration,        ATTR_RW, 0x00, 0x02, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(InitialParentNwkID, ATTR_RW, 0x00, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SecurityKey,        ATTR_W,  0x00, 0x05, 0x10, NULL, dnt900_parse_16_hex, NULL, NULL),
+	DNT900_REG_ATTR(SleepMode,          ATTR_RW, 0x00, 0x15, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(WakeResponseTime,   ATTR_RW, 0x00, 0x16, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(WakeLinkTimeout,    ATTR_RW, 0x00, 0x17, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(TxPower,            ATTR_RW, 0x00, 0x18, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ExtSyncEnable,      ATTR_RW, 0x00, 0x19, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(DiversityMode,      ATTR_RW, 0x00, 0x1A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(UserTag,            ATTR_RW, 0x00, 0x1C, 0x10, dnt900_print_16_ascii, dnt900_parse_16_ascii, NULL, NULL),
+	DNT900_REG_ATTR(RegDenialDelay,     ATTR_RW, 0x00, 0x2C, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(RmtTransDestAddr,   ATTR_RW, 0x00, 0x2E, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(TreeRoutingEn,      ATTR_RW, 0x00, 0x34, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_all),
+	DNT900_REG_ATTR(BaseModeNetID,      ATTR_RW, 0x00, 0x35, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(StaticNetAddr,      ATTR_RW, 0x00, 0x36, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, NULL),
+	DNT900_REG_ATTR(HeartbeatIntrvl,    ATTR_RW, 0x00, 0x37, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(TreeRoutingSysID,   ATTR_RW, 0x00, 0x39, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(EnableRtAcks,       ATTR_RW, 0x00, 0x3A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, NULL),
+	DNT900_REG_ATTR(FrequencyBand,      ATTR_RW, 0x01, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(AccessMode,         ATTR_RW, 0x01, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(BaseSlotSize,       ATTR_RW, 0x01, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_local),
+	DNT900_REG_ATTR(LeasePeriod,        ATTR_RW, 0x01, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ARQ_Mode,           ATTR_RW, 0x01, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ARQ_AttemptLimit,   ATTR_RW, 0x01, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MaxSlots,           ATTR_RW, 0x01, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(CSMA_Predelay,      ATTR_RW, 0x01, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(CSMA_Backoff,       ATTR_RW, 0x01, 0x08, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MaxPropDelay,       ATTR_RW, 0x01, 0x09, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(LinkDropThreshold,  ATTR_RW, 0x01, 0x0A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(CSMA_RemtSlotSize,  ATTR_RW, 0x01, 0x0B, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(CSMA_BusyThreshold, ATTR_RW, 0x01, 0x0C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(RangingInterval,    ATTR_RW, 0x01, 0x0D, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(AuthMode,           ATTR_RW, 0x01, 0x0E, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(P2PReplyTimeout,    ATTR_RW, 0x01, 0x0F, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MacAddress,         ATTR_R,  0x02, 0x00, 0x03, dnt900_print_3_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrNwkAddr,        ATTR_R,  0x02, 0x03, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrNwkID,          ATTR_R,  0x02, 0x04, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrRF_DataRate,    ATTR_R,  0x02, 0x05, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrFreqBand,       ATTR_R,  0x02, 0x06, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(LinkStatus,         ATTR_R,  0x02, 0x07, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RemoteSlotSize,     ATTR_R,  0x02, 0x08, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(TDMA_NumSlots,      ATTR_R,  0x02, 0x09, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(TDMA_CurrSlot,      ATTR_R,  0x02, 0x0B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(HardwareVersion,    ATTR_R,  0x02, 0x0C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(FirmwareVersion,    ATTR_R,  0x02, 0x0D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(FirmwareBuildNum,   ATTR_R,  0x02, 0x0E, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(SuperframeCount,    ATTR_R,  0x02, 0x11, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RSSI_Idle,          ATTR_R,  0x02, 0x12, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RSSI_Last,          ATTR_R,  0x02, 0x13, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrTxPower,        ATTR_R,  0x02, 0x14, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrAttemptLimit,   ATTR_R,  0x02, 0x15, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrRangeDelay,     ATTR_R,  0x02, 0x16, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(FirmwareBuildDate,  ATTR_R,  0x02, 0x17, 0x08, dnt900_print_8_ascii, NULL, NULL, NULL),
+	DNT900_REG_ATTR(FirmwareBuildTime,  ATTR_R,  0x02, 0x1F, 0x08, dnt900_print_8_ascii, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ModelNumber,        ATTR_R,  0x02, 0x27, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(CurrBaseModeNetID,  ATTR_R,  0x02, 0x28, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(AveRXPwrOvHopSeq,   ATTR_R,  0x02, 0x29, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	// DNT900_REG_ATTR(ParentACKQual,      ATTR_R,  0x02, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(SerialRate,         ATTR_RW, 0x03, 0x00, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SerialParams,       ATTR_RW, 0x03, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SerialControls,     ATTR_RW, 0x03, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SPI_Mode,           ATTR_RW, 0x03, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SPI_Divisor,        ATTR_RW, 0x03, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SPI_Options,        ATTR_RW, 0x03, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SPI_MasterCmdLen,   ATTR_RW, 0x03, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SPI_MasterCmdStr,   ATTR_RW, 0x03, 0x08, 0x20, dnt900_print_32_hex, dnt900_parse_32_hex, NULL, NULL),
+	DNT900_REG_ATTR(ProtocolMode,       ATTR_RW, 0x04, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ProtocolOptions,    ATTR_RW, 0x04, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_local),
+	DNT900_REG_ATTR(TxTimeout,          ATTR_RW, 0x04, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MinPacketLength,    ATTR_RW, 0x04, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(AnnounceOptions,    ATTR_RW, 0x04, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(TransLinkAnnEn,     ATTR_RW, 0x04, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ProtocolSequenceEn, ATTR_RW, 0x04, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(TransPtToPtMode,    ATTR_RW, 0x04, 0x07, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MaxPktsPerHop,      ATTR_RW, 0x04, 0x08, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO0,              ATTR_RW, 0x05, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO1,              ATTR_RW, 0x05, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO2,              ATTR_RW, 0x05, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO3,              ATTR_RW, 0x05, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO4,              ATTR_RW, 0x05, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO5,              ATTR_RW, 0x05, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC0,               ATTR_R,  0x05, 0x06, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ADC1,               ATTR_R,  0x05, 0x08, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ADC2,               ATTR_R,  0x05, 0x0A, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(EventFlags,         ATTR_R,  0x05, 0x0C, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(PWM0,               ATTR_RW, 0x05, 0x0E, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(PWM1,               ATTR_RW, 0x05, 0x10, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_Dir,           ATTR_RW, 0x06, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_Init,          ATTR_RW, 0x06, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_Alt,           ATTR_RW, 0x06, 0x02, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_Edge_Trigger,  ATTR_RW, 0x06, 0x03, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_SleepMode,     ATTR_RW, 0x06, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_SleepDir,      ATTR_RW, 0x06, 0x05, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(GPIO_SleepState,    ATTR_RW, 0x06, 0x06, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(PWM0_Init,          ATTR_RW, 0x06, 0x07, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(PWM1_Init,          ATTR_RW, 0x06, 0x09, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC_SampleIntvl,    ATTR_RW, 0x06, 0x0B, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC0_ThresholdLo,   ATTR_RW, 0x06, 0x0D, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC0_ThresholdHi,   ATTR_RW, 0x06, 0x0F, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC1_ThresholdLo,   ATTR_RW, 0x06, 0x11, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC1_ThresholdHi,   ATTR_RW, 0x06, 0x13, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC2_ThresholdLo,   ATTR_RW, 0x06, 0x15, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ADC2_ThresholdHi,   ATTR_RW, 0x06, 0x17, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(IO_ReportTrigger,   ATTR_RW, 0x06, 0x19, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(IO_ReportInterval,  ATTR_RW, 0x06, 0x1A, 0x04, dnt900_print_4_bytes, dnt900_parse_4_bytes, NULL, NULL),
+	DNT900_REG_ATTR(IO_ReportPreDel,    ATTR_RW, 0x06, 0x1E, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(IO_ReportRepeat,    ATTR_RW, 0x06, 0x1F, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr00,     ATTR_RW, 0x07, 0x00, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr01,     ATTR_RW, 0x07, 0x03, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr02,     ATTR_RW, 0x07, 0x06, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr03,     ATTR_RW, 0x07, 0x09, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr04,     ATTR_RW, 0x07, 0x0C, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr05,     ATTR_RW, 0x07, 0x0F, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr06,     ATTR_RW, 0x07, 0x12, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr07,     ATTR_RW, 0x07, 0x15, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr08,     ATTR_RW, 0x07, 0x18, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr09,     ATTR_RW, 0x07, 0x1B, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr10,     ATTR_RW, 0x07, 0x1E, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr11,     ATTR_RW, 0x07, 0x21, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr12,     ATTR_RW, 0x07, 0x24, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr13,     ATTR_RW, 0x07, 0x27, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr14,     ATTR_RW, 0x07, 0x2A, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(ApprovedAddr15,     ATTR_RW, 0x07, 0x2D, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
+	DNT900_REG_ATTR(BaseNetworkID,      ATTR_R,  0x08, 0x00, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID01,  ATTR_R,  0x08, 0x01, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID02,  ATTR_R,  0x08, 0x02, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID03,  ATTR_R,  0x08, 0x03, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID04,  ATTR_R,  0x08, 0x04, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID05,  ATTR_R,  0x08, 0x05, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID06,  ATTR_R,  0x08, 0x06, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID07,  ATTR_R,  0x08, 0x07, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID08,  ATTR_R,  0x08, 0x08, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID09,  ATTR_R,  0x08, 0x09, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID10,  ATTR_R,  0x08, 0x0A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID11,  ATTR_R,  0x08, 0x0B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID12,  ATTR_R,  0x08, 0x0C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID13,  ATTR_R,  0x08, 0x0D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID14,  ATTR_R,  0x08, 0x0E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID15,  ATTR_R,  0x08, 0x0F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID16,  ATTR_R,  0x08, 0x10, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID17,  ATTR_R,  0x08, 0x11, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID18,  ATTR_R,  0x08, 0x12, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID19,  ATTR_R,  0x08, 0x13, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID20,  ATTR_R,  0x08, 0x14, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID21,  ATTR_R,  0x08, 0x15, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID22,  ATTR_R,  0x08, 0x16, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID23,  ATTR_R,  0x08, 0x17, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID24,  ATTR_R,  0x08, 0x18, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID25,  ATTR_R,  0x08, 0x19, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID26,  ATTR_R,  0x08, 0x1A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID27,  ATTR_R,  0x08, 0x1B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID28,  ATTR_R,  0x08, 0x1C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID29,  ATTR_R,  0x08, 0x1D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID30,  ATTR_R,  0x08, 0x1E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID31,  ATTR_R,  0x08, 0x1F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID32,  ATTR_R,  0x08, 0x20, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID33,  ATTR_R,  0x08, 0x21, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID34,  ATTR_R,  0x08, 0x22, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID35,  ATTR_R,  0x08, 0x23, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID36,  ATTR_R,  0x08, 0x24, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID37,  ATTR_R,  0x08, 0x25, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID38,  ATTR_R,  0x08, 0x26, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID39,  ATTR_R,  0x08, 0x27, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID40,  ATTR_R,  0x08, 0x28, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID41,  ATTR_R,  0x08, 0x29, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID42,  ATTR_R,  0x08, 0x2A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID43,  ATTR_R,  0x08, 0x2B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID44,  ATTR_R,  0x08, 0x2C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID45,  ATTR_R,  0x08, 0x2D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID46,  ATTR_R,  0x08, 0x2E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID47,  ATTR_R,  0x08, 0x2F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID48,  ATTR_R,  0x08, 0x30, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID49,  ATTR_R,  0x08, 0x31, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID50,  ATTR_R,  0x08, 0x32, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID51,  ATTR_R,  0x08, 0x33, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID52,  ATTR_R,  0x08, 0x34, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID53,  ATTR_R,  0x08, 0x35, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID54,  ATTR_R,  0x08, 0x36, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID55,  ATTR_R,  0x08, 0x37, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID56,  ATTR_R,  0x08, 0x38, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID57,  ATTR_R,  0x08, 0x39, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID58,  ATTR_R,  0x08, 0x3A, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID59,  ATTR_R,  0x08, 0x3B, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID60,  ATTR_R,  0x08, 0x3C, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID61,  ATTR_R,  0x08, 0x3D, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID62,  ATTR_R,  0x08, 0x3E, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(ParentNetworkID63,  ATTR_R,  0x08, 0x3F, 0x01, dnt900_print_1_bytes, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr00,       ATTR_R,  0x09, 0x00, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr01,       ATTR_R,  0x09, 0x01, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr02,       ATTR_R,  0x09, 0x02, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr03,       ATTR_R,  0x09, 0x03, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr04,       ATTR_R,  0x09, 0x04, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr05,       ATTR_R,  0x09, 0x05, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr06,       ATTR_R,  0x09, 0x06, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr07,       ATTR_R,  0x09, 0x07, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr08,       ATTR_R,  0x09, 0x08, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr09,       ATTR_R,  0x09, 0x09, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr10,       ATTR_R,  0x09, 0x0A, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr11,       ATTR_R,  0x09, 0x0B, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr12,       ATTR_R,  0x09, 0x0C, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr13,       ATTR_R,  0x09, 0x0D, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr14,       ATTR_R,  0x09, 0x0E, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr15,       ATTR_R,  0x09, 0x0F, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr16,       ATTR_R,  0x09, 0x10, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr17,       ATTR_R,  0x09, 0x11, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr18,       ATTR_R,  0x09, 0x12, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr19,       ATTR_R,  0x09, 0x13, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr20,       ATTR_R,  0x09, 0x14, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr21,       ATTR_R,  0x09, 0x15, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr22,       ATTR_R,  0x09, 0x16, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr23,       ATTR_R,  0x09, 0x17, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr24,       ATTR_R,  0x09, 0x18, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(RegMACAddr25,       ATTR_R,  0x09, 0x19, 0x0F, dnt900_print_5_macs, NULL, NULL, NULL),
+	DNT900_REG_ATTR(UcReset,            ATTR_W,  0xFF, 0x00, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(SleepModeOverride,  ATTR_RW, 0xFF, 0x0C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(RoutingTableUpd,    ATTR_RW, 0xFF, 0x1C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(DiagSerialRate,     ATTR_RW, 0xFF, 0x20, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
+	DNT900_REG_ATTR(MemorySave,         ATTR_W,  0xFF, 0xFF, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL)
 };
 
-static const struct dnt900_report_attribute dnt900_report_attributes[REPORT_REGISTERS] = {
-	DNT900_REPORT_ATTR("report_GPIO0",      0, 0,  1),
-	DNT900_REPORT_ATTR("report_GPIO1",      1, 1,  1),
-	DNT900_REPORT_ATTR("report_GPIO2",      2, 2,  1),
-	DNT900_REPORT_ATTR("report_GPIO3",      3, 3,  1),
-	DNT900_REPORT_ATTR("report_GPIO4",      4, 4,  1),
-	DNT900_REPORT_ATTR("report_GPIO5",      5, 5,  1),
-	DNT900_REPORT_ATTR("report_ADC0",       6, 6,  2),
-	DNT900_REPORT_ATTR("report_ADC1",       7, 8,  2),
-	DNT900_REPORT_ATTR("report_ADC2",       8, 10, 2),
-	DNT900_REPORT_ATTR("report_EventFlags", 9, 12, 2)
+enum {
+	report_GPIO0 = 0,
+	report_GPIO1,
+	report_GPIO2,
+	report_GPIO3,
+	report_GPIO4,
+	report_GPIO5,
+	report_ADC0,
+	report_ADC1,
+	report_ADC2,
+	report_EventFlags
+};
+
+#define DNT900_REPORT_ATTR(_name, _offset, _bytes) { \
+	.attr = { \
+		.attr = { \
+			.name = #_name, \
+			.mode = ATTR_R \
+		}, \
+		.show = dnt900_show_report, \
+		.store = NULL \
+	}, \
+	.index = _name, \
+	.offset = _offset, \
+	.bytes = _bytes \
+}
+
+static const struct dnt900_report_attribute dnt900_report_attributes[] = {
+	DNT900_REPORT_ATTR(report_GPIO0,      0,  1),
+	DNT900_REPORT_ATTR(report_GPIO1,      1,  1),
+	DNT900_REPORT_ATTR(report_GPIO2,      2,  1),
+	DNT900_REPORT_ATTR(report_GPIO3,      3,  1),
+	DNT900_REPORT_ATTR(report_GPIO4,      4,  1),
+	DNT900_REPORT_ATTR(report_GPIO5,      5,  1),
+	DNT900_REPORT_ATTR(report_ADC0,       6,  2),
+	DNT900_REPORT_ATTR(report_ADC1,       8,  2),
+	DNT900_REPORT_ATTR(report_ADC2,       10, 2),
+	DNT900_REPORT_ATTR(report_EventFlags, 12, 2)
+};
+
+struct dnt900_local {
+	struct device dev;
+	struct tty_struct *tty;
+	int gpio_cts;
+	struct list_head transactions;
+	struct mutex transactions_lock;
+	struct mutex radios_lock;
+	struct rw_semaphore closed_lock;
+	spinlock_t param_lock;
+	spinlock_t tx_fifo_lock;
+	spinlock_t rx_fifo_lock;
+	spinlock_t announce_lock;
+	struct workqueue_struct *workqueue;
+	struct dnt900_local_params params;
+	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
+	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
+	wait_queue_head_t tx_queue;
+	unsigned char announce[32];
+};
+
+struct dnt900_radio {
+	struct device dev;
+	bool is_local;
+	spinlock_t param_lock;
+	spinlock_t report_lock;
+	unsigned char mac_address[3];
+	struct dnt900_radio_params params;
+	char name[80];
+	unsigned int tty_index;
+	struct tty_port port;
+	DECLARE_KFIFO(fifo, unsigned char, TTY_BUFFER_SIZE);
+	char report[ARRAY_SIZE(dnt900_report_attributes)][8];
 };
 
 static struct class *dnt900_class;
@@ -1101,8 +1122,8 @@ static int dnt900_radio_add_attributes(struct dnt900_radio *radio)
 	dnt900_radio_read_params(radio, &radio_params);
 	dnt900_local_read_params(local, &local_params);
 
-	for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
-		TRY(device_create_file(&radio->dev, &dnt900_attributes[n].attr));
+	for (n = 0; n < ARRAY_SIZE(dnt900_reg_attributes); ++n)
+		TRY(device_create_file(&radio->dev, &dnt900_reg_attributes[n].attr));
 	if (local_params.is_base && !radio_params.is_base)
 		for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
 			TRY(device_create_file(&radio->dev, &dnt900_report_attributes[n].attr));
@@ -1179,7 +1200,7 @@ static int dnt900_get_base_mac_address(struct dnt900_local *local, unsigned char
 
 	dnt900_local_read_params(local, &local_params);
 	sys_address[2] = local_params.tree_routing ? 0xFF : 0x00;
-	TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[MacAddress].reg, mac_address));
+	TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[MacAddress].reg, mac_address));
 	return 0;
 }
 
@@ -1234,10 +1255,10 @@ static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dn
 	return dnt900_set_remote_register(local, params.sys_address, reg, value);
 }
 
-static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dnt900_show_reg(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+	struct dnt900_reg_attribute *attribute = container_of(attr, struct dnt900_reg_attribute, attr);
 	unsigned char value[32];
 	int error;
 
@@ -1259,18 +1280,18 @@ static ssize_t dnt900_show_report(struct device *dev, struct device_attribute *a
 	return strlen(buf);
 }
 
-static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+static ssize_t dnt900_store_reg(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
-	struct dnt900_attribute *attribute = container_of(attr, struct dnt900_attribute, attr);
+	struct dnt900_reg_attribute *attribute = container_of(attr, struct dnt900_reg_attribute, attr);
 	unsigned char value[32];
 
 	if (!attribute->parse)
 		return -EPERM;
 	TRY(attribute->parse(buf, count, value));
 	TRY(dnt900_radio_set_register(radio, &attribute->reg, value));
-	if (attr == &dnt900_attributes[UcReset].attr && radio->is_local)
+	if (attr == &dnt900_reg_attributes[UcReset].attr && radio->is_local)
 		TRY(dnt900_enter_protocol_mode(local));
 	if (attribute->local_work && radio->is_local)
 		dnt900_schedule_work(local, NULL, attribute->local_work);
@@ -1321,14 +1342,14 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	unsigned char link_status, announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
 	unsigned long flags;
 
-	TRY(dnt900_get_register(local, &dnt900_attributes[LinkStatus].reg, &link_status));
-	TRY(dnt900_get_register(local, &dnt900_attributes[AnnounceOptions].reg, &announce_options));
-	TRY(dnt900_get_register(local, &dnt900_attributes[ProtocolOptions].reg, &protocol_options));
-	TRY(dnt900_get_register(local, &dnt900_attributes[AuthMode].reg, &auth_mode));
-	TRY(dnt900_get_register(local, &dnt900_attributes[TreeRoutingEn].reg, &tree_routing_en));
-	TRY(dnt900_get_register(local, &dnt900_attributes[DeviceMode].reg, &device_mode));
-	TRY(dnt900_get_register(local, &dnt900_attributes[device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
-	TRY(dnt900_get_register(local, &dnt900_attributes[AccessMode].reg, &access_mode));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[LinkStatus].reg, &link_status));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AnnounceOptions].reg, &announce_options));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[ProtocolOptions].reg, &protocol_options));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AuthMode].reg, &auth_mode));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[TreeRoutingEn].reg, &tree_routing_en));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
+	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AccessMode].reg, &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
@@ -1358,13 +1379,13 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	dnt900_local_read_params(local, &local_params);
 	if (radio->is_local) {
 		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
-		TRY(dnt900_get_register(local, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_register(local, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
 	} else if (local_params.tree_routing) {
 		TRY(dnt900_discover(local, radio->mac_address, sys_address));
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
 	} else if (local_params.is_base) {
 		COPY3(sys_address, radio->mac_address);
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
 	} else {
 		unsigned char base_mac_address[3];
 		TRY(dnt900_get_base_mac_address(local, base_mac_address));
@@ -1372,7 +1393,7 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 			sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
 		else
 			COPY3(sys_address, radio->mac_address);
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_attributes[DeviceMode].reg, &device_mode));
+		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
 	}
 	spin_lock_irqsave(&radio->param_lock, flags);
 	radio->params.is_base = device_mode == DEVICE_MODE_BASE;
@@ -1388,7 +1409,7 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	int n;
 
 	for (n = 0; n < 26; ++n)
-		TRY(dnt900_radio_get_register(radio, &dnt900_attributes[RegMACAddr00 + n].reg, mac_addresses + 15 * n));
+		TRY(dnt900_radio_get_register(radio, &dnt900_reg_attributes[RegMACAddr00 + n].reg, mac_addresses + 15 * n));
 	for (n = 0; n < 26 * 5; ++n) {
 		unsigned char *mac_address = mac_addresses + 3 * n;
 		if (mac_address[0] || mac_address[1] || mac_address[2])
@@ -2135,7 +2156,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	unsigned char mac_address[3];
 
-	if (!dnt900_get_remote_register(work->local, work->address, &dnt900_attributes[MacAddress].reg, mac_address))
+	if (!dnt900_get_remote_register(work->local, work->address, &dnt900_reg_attributes[MacAddress].reg, mac_address))
 		dnt900_add_radio(work->local, mac_address, false);
 	kfree(work);
 }
@@ -2175,7 +2196,7 @@ static void dnt900_init_local(struct work_struct *ws)
 	UNWIND(error, dnt900_local_add_attributes(local), fail);
 	UNWIND(error, dnt900_enter_protocol_mode(local), fail);
 	UNWIND(error, dnt900_local_get_params(local), fail);
-	UNWIND(error, dnt900_get_register(local, &dnt900_attributes[MacAddress].reg, mac_address), fail);
+	UNWIND(error, dnt900_get_register(local, &dnt900_reg_attributes[MacAddress].reg, mac_address), fail);
 	UNWIND(error, dnt900_add_radio(local, mac_address, true), fail);
 	if (local->params.is_base)
 		goto success;
