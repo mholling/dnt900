@@ -46,12 +46,12 @@ When you are done with the radio, kill the line discipline and (optionally) remo
 
 In the following sections, we use as example a local DNT900 radio with MAC address `0x00165F`, attached to our computer via `/dev/ttyAMA0`. The radio is configured as a base and connects to a remote radio with MAC address `0x00165E`.
 
-Setting Configuration Registers
-===============================
+Configuration Registers
+=======================
 
 The configuration registers of each radio on the network may be accessed via the sysfs file system, usually mounted at `/sys`. Each radio network is represented as a virtual device under the name of its serial port:
 
-    $ ls -l /sys/class/dnt900/ttyAMA0/
+    $ ls -l /sys/devices/virtual/dnt900/ttyAMA0/
     total 0
     drwxr-xr-x 3 root root    0 Apr 16 15:25 0x00165E
     drwxr-xr-x 4 root root    0 Apr 16 15:25 0x00165F
@@ -67,7 +67,7 @@ This directory lists each radio on the network under its corresponding MAC addre
 
 The configuration registers for a radio are listed within its named subdirectory. These registers are described in detail in the [DNT900 Series Integration Guide](http://www.rfm.com/products/data/dnt900dk_manual.pdf).
 
-    $ ls -l /sys/class/dnt900/ttyAMA0/0x00165E/
+    $ ls -l /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/
     total 0
     -r--r--r-- 1 root root 4096 Apr 16 15:29 ADC0
     -rw-r--r-- 1 root root 4096 Apr 16 15:29 ADC0_ThresholdHi
@@ -120,7 +120,7 @@ The configuration registers for a radio are listed within its named subdirectory
     -rw-r--r-- 1 root root 4096 Apr 16 15:29 DiagSerialRate
     -rw-r--r-- 1 root root 4096 Apr 16 15:29 DiversityMode
     -rw-r--r-- 1 root root 4096 Apr 16 15:29 EnableRtAcks
-    -r--r--r-- 1 root root 4096 Apr 16 15:29 Event_Flags
+    -r--r--r-- 1 root root 4096 Apr 16 15:29 EventFlags
     -rw-r--r-- 1 root root 4096 Apr 16 15:29 ExtSyncEnable
     -r--r--r-- 1 root root 4096 Apr 16 15:29 FirmwareBuildDate
     -r--r--r-- 1 root root 4096 Apr 16 15:29 FirmwareBuildNum
@@ -295,45 +295,28 @@ The configuration registers for a radio are listed within its named subdirectory
 
 Reading an attribute file initiates a radio transmission to retrieve the value of the register from the corresponding radio. For example, to read the current value of `ADC0` as a hex word:
 
-    $ cat /sys/class/dnt900/ttyAMA0/0x00165E/ADC0
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/ADC0
     0x01E2
 
 For registers which are writeable, changing their value is as simple as writing a new value to the attribute file. For example, to configure `GPIO1` as an output and set its value high:
 
-    $ echo 0x02 > /sys/class/dnt900/ttyAMA0/0x00165E/GPIO_Dir
-    $ echo 0x01 > /sys/class/dnt900/ttyAMA0/0x00165E/GPIO1
+    $ echo 0x02 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/GPIO_Dir
+    $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/GPIO1
 
 When you wish your configuration registers changes to be permanent, you will need to save them using the `MemorySave` register:
 
-    $ echo 0x01 > /sys/class/dnt900/ttyAMA0/0x00165E/MemorySave
+    $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/MemorySave
 
 Note that changing some configuration registers relating to the serial port or radio network may cause a temporary loss of connection to the radio. For example, changing the serial rate on the local radio to 115200 would result in the serial connection being lost. After writing the value, interrupt with `ctrl-c` then drop and reattach the line discipline at the new rate:
 
-    $ echo 0x0004 > /sys/class/dnt900/ttyAMA0/0x00165F/SerialRate 
+    $ echo 0x0004 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/SerialRate 
     ^Cbash: echo: write error: Interrupted system call
     $ killall ldattach
     $ ldattach -8n1 -s 115200 29 /dev/ttyAMA0
 
 (Note that a `MemorySave` would then be required to make this change permanent.)
 
-Finally, three system attributes, `discover`, `reset` and `announce`, are also available. Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
-
-    $ echo 0x00165A > /sys/class/dnt900/ttyAMA0/discover
-
-A software reset may be issued to the local radio by writing (anything) to the `reset` attribute file:
-
-    $ echo 1 > /sys/class/dnt900/ttyAMA0/reset
-
-Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
-
-The `announce` attribute file contains the most recent announcement from the DNT900 radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). For example, when running on a remote radio, the following announcement would be received when the radio joins a radio network with base MAC address `0x00165F`:
-
-    $ cat /sys/class/dnt900/ttyAMA0/announce
-    0xA3005F160001
-
-The `announce` attribute is pollable, allowing it to be monitored for announcements as they occur. As an alternative to this attribute file, announcement messages are also output in YAML format on the original tty device (see below).
-
-Also note that reading and writing attribute files may be slow (many seconds) when data is being concurrently transmitted.
+As a general comment, you should expect that reading and writing attribute files may be slow (many seconds) when data is being concurrently transmitted.
 
 Transmitting and Receiving Data
 ===============================
@@ -350,6 +333,8 @@ Here, `/dev/ttyDNT0` is a new tty representing the remote radio with MAC address
 We may also use the same file to read any data sent by the remote radio:
 
     $ cat /dev/ttyDNT0
+
+These virtual ttys are fully implemented, and may be used by any linux application which uses a tty. In particular, the virtual tty can be used to host a Point-to-Point Protocol (PPP) connection, allowing you to establish a TCP/IP network connection over the radio link.
 
 Since there is no data transmission to and from the local radio, the original tty is used for transmitting broadcast messages (which are sent to all radios on the network, at a considerably slower rate). For example, we can broadcast data to all remotes as follows:
 
@@ -375,12 +360,53 @@ This original tty is also used to receive announcements posted by the local radi
 
 Whilst human-readable, these messages are in [YAML](http://en.wikipedia.org/wiki/YAML) format and should be easy to parse in a user-space application.
 
+Local Radio Attributes
+======================
+
+Three additional attributes, `discover`, `reset` and `announce`, are also available for the system-local radio.
+
+Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
+
+    $ echo 0x00165A > /sys/devices/virtual/dnt900/ttyAMA0/discover
+
+A software reset may be issued to the local radio by writing (anything) to the `reset` attribute file:
+
+    $ echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/reset
+
+Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
+
+The `announce` attribute file contains the most recent announcement from the DNT900 radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). For example, when running on a radio configured as a remote, the following announcement would be received when the radio joins a radio network with base MAC address `0x00165F`:
+
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/announce
+    0xA3005F160001
+
+The `announce` attribute is pollable, allowing it to be monitored by your application for new announcements as they occur. (This is in addition to the YAML-formatted output on the original tty device, described previously.)
+
+Receiving I/O Reports
+=====================
+
+Instead of actively querying the I/O registers of a remote radio, you can configure the remote to send I/O reports to the base radio automatically. (See pages 55-58 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf).) These reports can be triggered on a periodic basis, or by certain conditions (ADC threshold, GPIO edge). The report consists of register values for the six GPIOs and three ADCs. If you are using the I/O reporting facility, the reported values are available using the following attribute files:
+
+    $ ls -l /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/report_*
+    -r--r--r-- 1 root root 4096 Jul 31 21:52 report_ADC0
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_ADC1
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_ADC2
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_EventFlags
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO0
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO1
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO2
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO3
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO4
+    -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO5
+
+Each of these attribute files contains the most recently reported value for the corresponding ADC or GPIO. The files can be polled by your application in order to process new values as they arrive from the remote radio.
+
 udev Rules
 ==========
 
 It is suggested to add [udev rules](http://www.reactivated.net/writing_udev_rules.html) to create more meaningful names for the remote ttys. Any of the radio register attributes (in particular, the MAC address) can be used in the rules. `udevadm` is helpful in writing a suitable rule:
 
-    $ udevadm info --attribute-walk /sys/class/tty/ttyDNT0
+    $ udevadm info --attribute-walk /dev/ttyDNT0
 
 For example, a rule which creates a symlink for each remote radio, named for its MAC address, is as follows:
 
@@ -430,12 +456,12 @@ As far as possible, this module takes a 'hands-off' approach to the attached rad
 
 Communication with the local radio is in protocol mode. You may wish to select this mode permanently by configuring the radio's `ProtocolMode` register:
 
-    $ echo 0x01 > /sys/class/dnt900/ttyAMA0/0x00165F/ProtocolMode
-    $ echo 0x01 > /sys/class/dnt900/ttyAMA0/0x00165F/MemorySave
+    $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/ProtocolMode
+    $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/MemorySave
 
 (Alternatively, you can ground the radio's `/CFG` pin in your hardware design.) This is not compulsory as the *EnterProtocolMode* command is also issued. However, unless you do so, use of an external reset source such as a reset button or a remote reset command will render the radio connection unresponsive.
 
-As an observation, reading radio registers (via sysfs attribute files) can be very slow when data is also being transmitted via the radio (the radio appears to prioritise data packets over register queries).
+Reading radio registers (via sysfs attribute files) can be very slow when data is also being transmitted, since the queued data packets must first empty into the radio before the register query is seen.
 
 Finally, if the local radio is configured as a remote in *TDMA Dynamic Slots* mode, data transmission may not succeed if new remotes join the network. (This is due to dynamic changes in the remote slot size in this access mode.)
 
@@ -450,5 +476,4 @@ Release History
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
-  * 30/7/2013: HEAD: added sysfs announce attribute as alternate way of monitoring radio announcements;
-  
+  * 1/8/2013: HEAD: added pollable announce attribute for monitoring radio announcements; added report_* pollable attributes for I/O reports.

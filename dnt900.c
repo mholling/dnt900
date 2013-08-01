@@ -73,6 +73,7 @@
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_RETRIES (2)
+#define REPORT_REGISTERS (10)
 
 #define START_OF_PACKET (0xFB)
 
@@ -227,12 +228,14 @@ struct dnt900_radio {
 	struct device dev;
 	bool is_local;
 	spinlock_t param_lock;
+	spinlock_t report_lock;
 	unsigned char mac_address[3];
 	struct dnt900_radio_params params;
 	char name[80];
 	unsigned int tty_index;
 	struct tty_port port;
 	DECLARE_KFIFO(fifo, unsigned char, TTY_BUFFER_SIZE);
+	char report[REPORT_REGISTERS][8];
 };
 
 struct dnt900_bufdata {
@@ -261,6 +264,13 @@ struct dnt900_attribute {
 	void (*local_work)(struct work_struct *);
 };
 
+struct dnt900_report_attribute {
+	struct device_attribute attr;
+	unsigned int index;
+	unsigned int offset;
+	unsigned int bytes;
+};
+
 #define DNT900_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse, _work, _local_work) { \
 	.attr = { \
 		.attr = { \
@@ -279,6 +289,20 @@ struct dnt900_attribute {
 	.parse = _parse, \
 	.work = _work, \
 	.local_work = _local_work \
+}
+
+#define DNT900_REPORT_ATTR(_name, _index, _offset, _bytes) { \
+	.attr = { \
+		.attr = { \
+			.name = _name, \
+			.mode = ATTR_R \
+		}, \
+		.show = dnt900_show_report, \
+		.store = NULL \
+	}, \
+	.index = _index, \
+	.offset = _offset, \
+	.bytes = _bytes \
 }
 
 static int dnt900_print_bytes(int bytes, const unsigned char *value, char *buf);
@@ -322,6 +346,7 @@ static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dn
 
 static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_show_report(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_show_announce(struct device *dev, struct device_attribute *attr, char *buf);
@@ -516,7 +541,7 @@ enum {
 	ADC0,
 	ADC1,
 	ADC2,
-	Event_Flags,
+	EventFlags,
 	PWM0,
 	PWM1,
 	GPIO_Dir,
@@ -739,7 +764,7 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("ADC0",               ATTR_R,  0x05, 0x06, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("ADC1",               ATTR_R,  0x05, 0x08, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("ADC2",               ATTR_R,  0x05, 0x0A, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
-	DNT900_ATTR("Event_Flags",        ATTR_R,  0x05, 0x0C, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
+	DNT900_ATTR("EventFlags",         ATTR_R,  0x05, 0x0C, 0x02, dnt900_print_2_bytes, NULL, NULL, NULL),
 	DNT900_ATTR("PWM0",               ATTR_RW, 0x05, 0x0E, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_ATTR("PWM1",               ATTR_RW, 0x05, 0x10, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_ATTR("GPIO_Dir",           ATTR_RW, 0x06, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
@@ -873,6 +898,19 @@ static const struct dnt900_attribute dnt900_attributes[] = {
 	DNT900_ATTR("RoutingTableUpd",    ATTR_RW, 0xFF, 0x1C, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
 	DNT900_ATTR("DiagSerialRate",     ATTR_RW, 0xFF, 0x20, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_ATTR("MemorySave",         ATTR_W,  0xFF, 0xFF, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL)
+};
+
+static const struct dnt900_report_attribute dnt900_report_attributes[REPORT_REGISTERS] = {
+	DNT900_REPORT_ATTR("report_GPIO0",      0, 0,  1),
+	DNT900_REPORT_ATTR("report_GPIO1",      1, 1,  1),
+	DNT900_REPORT_ATTR("report_GPIO2",      2, 2,  1),
+	DNT900_REPORT_ATTR("report_GPIO3",      3, 3,  1),
+	DNT900_REPORT_ATTR("report_GPIO4",      4, 4,  1),
+	DNT900_REPORT_ATTR("report_GPIO5",      5, 5,  1),
+	DNT900_REPORT_ATTR("report_ADC0",       6, 6,  2),
+	DNT900_REPORT_ATTR("report_ADC1",       7, 8,  2),
+	DNT900_REPORT_ATTR("report_ADC2",       8, 10, 2),
+	DNT900_REPORT_ATTR("report_EventFlags", 9, 12, 2)
 };
 
 static struct class *dnt900_class;
@@ -1065,10 +1103,19 @@ static int dnt900_parse_16_ascii(const char *buf, size_t count, unsigned char *v
 
 static int dnt900_radio_add_attributes(struct dnt900_radio *radio)
 {
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_radio_params radio_params;
+	struct dnt900_local_params local_params;
 	int n;
+
+	dnt900_radio_read_params(radio, &radio_params);
+	dnt900_local_read_params(local, &local_params);
 
 	for (n = 0; n < ARRAY_SIZE(dnt900_attributes); ++n)
 		TRY(device_create_file(&radio->dev, &dnt900_attributes[n].attr));
+	if (local_params.is_base && !radio_params.is_base)
+		for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
+			TRY(device_create_file(&radio->dev, &dnt900_report_attributes[n].attr));
 	return 0;
 }
 
@@ -1208,6 +1255,18 @@ static ssize_t dnt900_show_attr(struct device *dev, struct device_attribute *att
 		return -EPERM;
 	error = dnt900_radio_get_register(radio, &attribute->reg, value);
 	return error ? error : attribute->print(value, buf);
+}
+
+static ssize_t dnt900_show_report(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	struct dnt900_report_attribute *attribute = container_of(attr, struct dnt900_report_attribute, attr);
+	unsigned long flags;
+
+	spin_lock_irqsave(&radio->report_lock, flags);
+	strcpy(buf, radio->report[attribute->index]);
+	spin_unlock_irqrestore(&radio->report_lock, flags);
+	return strlen(buf);
 }
 
 static ssize_t dnt900_store_attr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -1357,6 +1416,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	radio->is_local = is_local;
 	COPY3(radio->mac_address, mac_address);
 	spin_lock_init(&radio->param_lock);
+	spin_lock_init(&radio->report_lock);
 	snprintf(radio->name, ARRAY_SIZE(radio->name), "0x%02X%02X%02X", mac_address[2], mac_address[1], mac_address[0]);
 	radio->dev.release = dnt900_release_radio;
 	radio->dev.parent = &local->dev;
@@ -2014,6 +2074,15 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 		io[0], io[1], io[2], io[3], io[4], io[5], \
 		io[7], io[6], io[9], io[8], io[11], io[10], \
 		io[13], io[12]);
+	unsigned long flags;
+	int n;
+
+	spin_lock_irqsave(&radio->report_lock, flags);
+	for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
+		dnt900_print_bytes(dnt900_report_attributes[n].bytes, io + dnt900_report_attributes[n].offset, radio->report[dnt900_report_attributes[n].index]);
+	spin_unlock_irqrestore(&radio->report_lock, flags);
+	for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
+		sysfs_notify(&radio->dev.kobj, NULL, dnt900_report_attributes[n].attr.attr.name);
 	return dnt900_local_out(local, text, length);
 }
 
@@ -2471,3 +2540,4 @@ MODULE_VERSION("0.2.4");
 // TODO: Would like to issue ExitProtocolMode command when the line discipline is detached.
 //       However we can't do this as the tty is not available for use in dnt900_ldisc_close.
 // TODO: hangup ttys on ANNOUNCEMENT_BASE_REBOOTED event?
+// TODO: have pollable radio attributes added/removed whenever DeviceMode is refreshed?
