@@ -67,7 +67,6 @@
 // buffer sizes must be powers of 2
 #define  RX_BUFFER_SIZE (512)  // no less
 #define  TX_BUFFER_SIZE (2048)
-#define OUT_BUFFER_SIZE (1024)
 #define TTY_BUFFER_SIZE (512)
 
 #define REGISTER_TIMEOUT_MS (300000)
@@ -213,9 +212,7 @@ struct dnt900_local {
 	struct dnt900_local_params params;
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
-	DECLARE_KFIFO(out_fifo, unsigned char, OUT_BUFFER_SIZE);
 	wait_queue_head_t tx_queue;
-	wait_queue_head_t out_queue;
 	unsigned char announce[32];
 };
 
@@ -397,11 +394,8 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout);
 static void dnt900_tty_flush_buffer(struct tty_struct *tty);
 
 static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, const unsigned char *buf, size_t len);
-static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len);
 static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty);
-static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty);
-static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait);
 static int dnt900_ldisc_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg);
 static void dnt900_ldisc_flush_buffer(struct tty_struct *tty);
 
@@ -412,7 +406,6 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data);
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc);
 
 static int dnt900_radio_out(struct dnt900_radio *radio, void *data);
-static int dnt900_local_out(struct dnt900_local *local, const unsigned char *buf, unsigned int len);
 
 static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char *address, void (*work_function)(struct work_struct *));
 static void dnt900_add_or_refresh_mac_address(struct work_struct *ws);
@@ -918,20 +911,17 @@ static struct tty_driver *dnt900_tty_driver;
 static bool *dnt900_tty_indices;
 
 static struct tty_ldisc_ops dnt900_ldisc_ops = {
-	.magic           = TTY_LDISC_MAGIC,
-	.name            = LDISC_NAME,
-	.open            = dnt900_ldisc_open,
-	.close           = dnt900_ldisc_close,
-	.hangup          = dnt900_ldisc_hangup,
-	.write           = dnt900_ldisc_write,
-	.read            = dnt900_ldisc_read,
-	.receive_buf     = dnt900_ldisc_receive_buf,
-	.write_wakeup    = dnt900_ldisc_write_wakeup,
-	.chars_in_buffer = dnt900_ldisc_chars_in_buffer,
-	.poll            = dnt900_ldisc_poll,
-	.ioctl           = dnt900_ldisc_ioctl,
-	.flush_buffer    = dnt900_ldisc_flush_buffer,
-	.owner           = THIS_MODULE,
+	.magic        = TTY_LDISC_MAGIC,
+	.name         = LDISC_NAME,
+	.open         = dnt900_ldisc_open,
+	.close        = dnt900_ldisc_close,
+	.hangup       = dnt900_ldisc_hangup,
+	.write        = dnt900_ldisc_write,
+	.receive_buf  = dnt900_ldisc_receive_buf,
+	.write_wakeup = dnt900_ldisc_write_wakeup,
+	.ioctl        = dnt900_ldisc_ioctl,
+	.flush_buffer = dnt900_ldisc_flush_buffer,
+	.owner        = THIS_MODULE,
 };
 
 static struct tty_port_operations dnt900_tty_port_ops = {
@@ -1831,43 +1821,11 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 	};
 }
 
-static ssize_t dnt900_ldisc_read(struct tty_struct *tty, struct file *filp, unsigned char __user *buf, size_t len)
-{
-	struct dnt900_local *local = TTY_TO_LOCAL(tty);
-	unsigned int copied;
-
-	if (filp->f_flags & O_NONBLOCK && kfifo_is_empty(&local->out_fifo))
-		return -EAGAIN;
-	TRY(wait_event_interruptible(local->out_queue, !kfifo_is_empty(&local->out_fifo)));
-	TRY(kfifo_to_user(&local->out_fifo, buf, len, &copied));
-	return copied;
-}
-
 static void dnt900_ldisc_write_wakeup(struct tty_struct *tty)
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 
 	dnt900_local_drain_fifo(local);
-}
-
-static ssize_t dnt900_ldisc_chars_in_buffer(struct tty_struct *tty)
-{
-	struct dnt900_local *local = TTY_TO_LOCAL(tty);
-
-	return kfifo_len(&local->out_fifo);
-}
-
-static unsigned int dnt900_ldisc_poll(struct tty_struct *tty, struct file *filp, poll_table *wait)
-{
-	struct dnt900_local *local = TTY_TO_LOCAL(tty);
-	unsigned int mask = 0;
-
-	poll_wait(filp, &local->out_queue, wait);
-	if (!kfifo_is_empty(&local->out_fifo))
-		mask |= POLLIN | POLLRDNORM;
-	if (tty_hung_up_p(filp))
-		mask |= POLLHUP;
-	return mask;
 }
 
 static int dnt900_ldisc_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg)
@@ -2054,117 +2012,53 @@ static int dnt900_process_event(struct dnt900_local *local, unsigned char *respo
 
 static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 {
-	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	unsigned char *io = data;
-	unsigned char text[512];
-	unsigned int length = scnprintf(text, ARRAY_SIZE(text), \
-		"- event: I/O report\n" \
-		"  MAC address: 0x%02X%02X%02X\n" \
-		"  GPIO0: 0x%02X\n" \
-		"  GPIO1: 0x%02X\n" \
-		"  GPIO2: 0x%02X\n" \
-		"  GPIO3: 0x%02X\n" \
-		"  GPIO4: 0x%02X\n" \
-		"  GPIO5: 0x%02X\n" \
-		"  ADC0: 0x%02X%02X\n" \
-		"  ADC1: 0x%02X%02X\n" \
-		"  ADC2: 0x%02X%02X\n" \
-		"  flags: 0x%02X%02X\n", \
-		radio->mac_address[2], radio->mac_address[1], radio->mac_address[0], \
-		io[0], io[1], io[2], io[3], io[4], io[5], \
-		io[7], io[6], io[9], io[8], io[11], io[10], \
-		io[13], io[12]);
 	unsigned long flags;
 	int n;
-
 	spin_lock_irqsave(&radio->report_lock, flags);
 	for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
 		dnt900_print_bytes(dnt900_report_attributes[n].bytes, io + dnt900_report_attributes[n].offset, radio->report[dnt900_report_attributes[n].index]);
 	spin_unlock_irqrestore(&radio->report_lock, flags);
 	for (n = 0; n < ARRAY_SIZE(dnt900_report_attributes); ++n)
 		sysfs_notify(&radio->dev.kobj, NULL, dnt900_report_attributes[n].attr.attr.name);
-	return dnt900_local_out(local, text, length);
+	return 0;
 }
 
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc)
 {
-	unsigned char text[512];
-	unsigned int length;
-	unsigned int bytes = 1;
+	unsigned int bytes;
 	unsigned char sys_address[3];
 	unsigned long flags;
 
+	// TODO: possibly split announce attribute out into distinct attributes for each announcement type?
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: startup complete\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
+		bytes = 1;
 		dnt900_clear_packets(local);
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		bytes = 6;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: joined network\n" \
-			"  code: 0x%02X\n" \
-			"  network ID: 0x%02X\n" \
-			"  base MAC address: 0x%02X%02X%02X\n" \
-			"  range: %d km\n", \
-			annc[0], annc[1], annc[4], annc[3], annc[2], RANGE_TO_KMS(annc[5]));
 		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
 		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		bytes = 2;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: departed network\n" \
-			"  code: 0x%02X\n" \
-			"  network ID 0x%02X\n", \
-			annc[0], annc[1]);
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		bytes = 6;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: remote joined\n" \
-			"  code: 0x%02X\n" \
-			"  MAC address: 0x%02X%02X%02X\n" \
-			"  range: %d km\n", \
-			annc[0], annc[3], annc[2], annc[1], RANGE_TO_KMS(annc[5]));
 		dnt900_schedule_work(local, annc + 1, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		bytes = 4;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: remote departed\n" \
-			"  code: 0x%02X\n" \
-			"  MAC address: 0x%02X%02X%02X\n", \
-			annc[0], annc[3], annc[2], annc[1]);
 		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: base rebooted\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
+		bytes = 1;
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		bytes = 11;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: received heartbeat\n" \
-			"  code: 0x%02X\n" \
-			"  MAC address: 0x%02X%02X%02X\n" \
-			"  network address: 0x%02X\n" \
-			"  network ID: 0x%02X\n" \
-			"  parent network ID: 0x%02X\n" \
-			"  received RSSI: %d dBm\n" \
-			"  reported RSSI: %d dBm\n" \
-			"  packet success rate: %d%%\n" \
-			"  range: %d km\n", \
-			annc[0], annc[3], annc[2], annc[1], annc[4], annc[5], annc[6], \
-			(signed char)annc[7], (signed char)annc[9], \
-			PACKET_SUCCESS_RATE(annc[8]), RANGE_TO_KMS(annc[10]));
 		sys_address[0] = annc[4];
 		sys_address[1] = annc[5];
 		sys_address[2] = 0xFF;
@@ -2172,65 +2066,18 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		bytes = 2;
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- event: router heartbeat timed out\n" \
-			"  code: 0x%02X\n" \
-			"  network ID: 0x%02X\n",
-			annc[0], annc[1]);
 		break;
 	case ERROR_PROTOCOL_TYPE:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: invalid message type\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_PROTOCOL_ARGUMENT:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: invalid argument\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_PROTOCOL_GENERAL:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: general error\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_PROTOCOL_TIMEOUT:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: parser timeout\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_PROTOCOL_READONLY:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: register is read-only\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_UART_OVERFLOW:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: UART receive buffer overflow\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_UART_OVERRUN:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: UART receive overrun\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_UART_FRAMING:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- error: UART framing error\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
-		break;
 	case ERROR_HARDWARE:
-		length = scnprintf(text, ARRAY_SIZE(text), \
-			"- hardware error\n" \
-			"  code: 0x%02X\n", \
-			annc[0]);
+		// TODO: split errors out into a separate pollable attribute
+		bytes = 1;
 		break;
 	default:
 		return 0;
@@ -2239,7 +2086,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	dnt900_print_hex(bytes, annc, local->announce);
 	spin_unlock_irqrestore(&local->announce_lock, flags);
 	sysfs_notify(&local->dev.kobj, NULL, "announce");
-	return dnt900_local_out(local, text, length);
+	return 0;
 }
 
 static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
@@ -2254,15 +2101,6 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 		tty_flip_buffer_push(tty);
 	}
 	tty_kref_put(tty);
-	return 0;
-}
-
-static int dnt900_local_out(struct dnt900_local *local, const unsigned char *buf, unsigned int len)
-{
-	if (kfifo_avail(&local->out_fifo) < len)
-		return -EAGAIN;
-	len = kfifo_in(&local->out_fifo, buf, len);
-	wake_up_interruptible(&local->out_queue);
 	return 0;
 }
 
@@ -2399,9 +2237,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	UNWIND(error, device_register(&local->dev), fail_register);
 	INIT_KFIFO(local->tx_fifo);
 	INIT_KFIFO(local->rx_fifo);
-	INIT_KFIFO(local->out_fifo);
 	init_waitqueue_head(&local->tx_queue);
-	init_waitqueue_head(&local->out_queue);
 	return local;
 
 fail_register:
