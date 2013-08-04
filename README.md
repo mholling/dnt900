@@ -57,7 +57,9 @@ The configuration registers of each radio on the network may be accessed via the
     drwxr-xr-x 4 root root    0 Apr 16 15:25 0x00165F
     -r--r--r-- 1 root root 4096 Apr 16 15:25 announce
     --w------- 1 root root 4096 Apr 16 15:25 discover
+    -r--r--r-- 1 root root 4096 Apr 16 11:06 error
     lrwxrwxrwx 1 root root    0 Apr 16 15:25 local -> 0x00165F
+    -r--r--r-- 1 root root 4096 Apr 16 11:06 parent
     drwxr-xr-x 2 root root    0 Apr 16 15:25 power
     --w------- 1 root root 4096 Apr 16 15:25 reset
     lrwxrwxrwx 1 root root    0 Apr 16 15:25 subsystem -> ../../../../class/dnt900
@@ -340,10 +342,48 @@ Since there is no data transmission to and from the local radio, the original tt
 
     $ echo "some broadcast message" > /dev/ttyAMA0
 
+Remote Radio Attributes
+=======================
+
+Your radio receives status information from remote radios while it operates. This information is available to read in a few extra sysfs attributes.
+
+If the radio is operating as a base, it receives hearbeat packets from remote radios. Information from these heartbeats are presented in the following attribute files:
+
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/beacon_rssi
+    -63
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/parent_rssi
+    -62
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/success_rate
+    100
+
+(Heartbeats are described on page 41 and elsewhere in the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf).) Units for `beacon_rssi`, `parent_rssi` and `success_rate` are dBm, dBm and percent, respectively.
+
+Range and signal strength (RSSI) information is also available when data is received from remote radios:
+
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/rssi
+    -66
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/range
+    933
+
+Units for `range` are metres, although it is in fact a coarse measurement, with increments of about 466 metres. Depending on your radio network configuration, not all radios will have this data available, as indicated by an empty read.
+
+The above attributes are pollable, allowing them to be monitored by your application for updates as they occur. (See below.)
+
 Local Radio Attributes
 ======================
 
-Three additional attributes, `discover`, `reset` and `announce`, are also available for the system-local radio.
+Some additional pollable attributes are available for the local radio:
+
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/announce
+    0xA85E1600000100C004C002
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/error
+    $ cat /sys/devices/virtual/dnt900/ttyAMA0/parent
+
+The `announce` attribute contains the latest announcement from the radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). (The above example shows an announcement received when radio `0x00165E` transmits a heartbeat.)
+
+The `error` contains the most recent error code, if any, that has been received. An empty attribute indicates no error and is normally the case. Error codes are in the range 0xE0 to 0xEE and could be helpful for diagnosing problems.
+
+The `parent` attribute contains the MAC address of the router or base to which the radio is connected. (It is empty if the radio is acting as a base or is not linked to a network.)
 
 Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
 
@@ -354,13 +394,6 @@ A software reset may be issued to the local radio by writing (anything) to the `
     $ echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/reset
 
 Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
-
-The `announce` attribute file contains the most recent announcement from the DNT900 radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). For example, when running on a radio configured as a remote, the following announcement would be received when the radio joins a radio network with base MAC address `0x00165F`:
-
-    $ cat /sys/devices/virtual/dnt900/ttyAMA0/announce
-    0xA3005F160001
-
-The `announce` attribute is pollable, allowing it to be monitored by your application for new announcements as they occur.
 
 Receiving I/O Reports
 =====================
@@ -379,7 +412,25 @@ Instead of actively querying the I/O registers of a remote radio, you can config
     -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO4
     -r--r--r-- 1 root root 4096 Jul 31 21:58 report_GPIO5
 
-Each of these attribute files contains the most recently reported value for the corresponding ADC or GPIO. The files can be polled by your application in order to process new values as they arrive from the remote radio.
+Each of these attribute files contains the most recently reported value for its corresponding ADC or GPIO. The files can be polled by your application in order to process new values as they arrive from the remote radio.
+
+Polling Attributes
+==================
+
+Some attribute files above are described as *pollable*. This means you can monitor changes to their values using the `poll()` function in C. For example, to monitor a radio signal strength and perform an action (say, update a graph or log) each time the value changes, something like the following C snippet would be suitable:
+
+    char attr[10];
+    int fd = open("/sys/devices/virtual/dnt900/ttyAMA0/0x00165E/rssi", O_RDONLY);
+    struct pollfd ufds = { .fd = fd, .events = POLLPRI | POLLERR };
+    do {
+        poll(&ufds, 1, -1);
+        memset(attr, 0, 10);
+        read(fd, attr, 10);
+        // ... process RSSI value in attr
+        lseek(fd, 0, SEEK_SET);
+    } while (1);
+
+Multiple attributes can be simultaneously monitored this way. Other languages, including [Python](http://docs.python.org/dev/library/select.html#select.poll), also expose the `poll()` function.
 
 udev Rules
 ==========
@@ -396,12 +447,10 @@ For example, a rule which creates a symlink for each remote radio, named for its
     $ ls -l /dev/0x*
     lrwxrwxrwx 1 root root 9 Apr 16 15:25 /dev/0x00165E -> ttyDNT0
 
-(Individual MAC addresses could also be used to give custom names to individual radios.)
-
 Flow Control
 ============
 
-Per the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf), it is *highly* recommended that hardware flow control be used if you intend to use your radio network for high-volume data transmission. (This means connecting the `/HOST_CTS` signal on the radio to a `/CTS` line on your serial port). If you are using hardware flow control, you should enable it before loading the line discipline, as follows:
+Per the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf), it is **highly** recommended that hardware flow control be used if you intend to use your radio network for high-volume data transmission. (This means connecting the `/HOST_CTS` signal on the radio to a `/CTS` line on your serial port). If you are using hardware flow control, you should enable it before loading the line discipline, as follows:
 
     $ stty -F /dev/ttyAMA0 crtscts
 
@@ -432,7 +481,7 @@ As far as possible, this module takes a 'hands-off' approach to the attached rad
 * `ProtocolOptions` must have bit 0 set in order to enable protocol message announcements (which are used by the software).
 * `AnnounceOptions` must be set to 0x07 to enable all announcement types.
 * Unless you have grounded the radio's `/CFG` pin, the `ProtocolSequenceEn` register must be set to 0x02. (It is by default). This allows the *EnterProtocolMode* ASCII command string to be used to switch the radio to protocol mode.
-* Bit 2 of `ProtocolOptions` determines whether the local radio issues *TxDataReply* packets, which include a transmission status byte for transmitted data packets. However these status bytes are currently ignored by the software.
+* Bit 2 of `ProtocolOptions` determines whether the local radio issues *TxDataReply* packets, which include a transmission status byte for transmitted data packets. These packets are not required by the software and may be disabled.
 
 Communication with the local radio is in protocol mode. You may wish to select this mode permanently by configuring the radio's `ProtocolMode` register:
 
@@ -456,4 +505,4 @@ Release History
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
-  * 1/8/2013: HEAD: added pollable announce attribute for monitoring radio announcements; added report_* pollable attributes for I/O reports.
+  * 4/8/2013: HEAD: added pollable attributes for announcements, errors, I/O reports, RSSI, range, and heartbeat data.
