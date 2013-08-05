@@ -344,6 +344,7 @@ static int dnt900_process_event(struct dnt900_local *local, unsigned char *respo
 static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data);
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc);
 static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *data);
+static int dnt900_process_argument_error(struct dnt900_local *local);
 static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request);
 static int dnt900_radio_report_rssi(struct dnt900_radio *radio, void *data);
 static int dnt900_radio_out(struct dnt900_radio *radio, void *data);
@@ -686,7 +687,7 @@ enum {
 static const struct dnt900_reg_attribute dnt900_reg_attributes[] = {
 	DNT900_REG_ATTR(DeviceMode,         ATTR_RW, 0x00, 0x00, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, dnt900_refresh_radio, dnt900_refresh_local),
 	DNT900_REG_ATTR(RF_DataRate,        ATTR_RW, 0x00, 0x01, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
-	DNT900_REG_ATTR(HopDuration,        ATTR_RW, 0x00, 0x02, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(HopDuration,        ATTR_RW, 0x00, 0x02, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_REG_ATTR(InitialParentNwkID, ATTR_RW, 0x00, 0x04, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
 	DNT900_REG_ATTR(SecurityKey,        ATTR_W,  0x00, 0x05, 0x10, NULL, dnt900_parse_16_hex, NULL, NULL),
 	DNT900_REG_ATTR(SleepMode,          ATTR_RW, 0x00, 0x15, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
@@ -2117,6 +2118,9 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		if (err == -ENODEV)
 			dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 		break;
+        case ERROR_PROTOCOL_ARGUMENT:
+                dnt900_process_argument_error(local);
+                break;
 	}
 
 	spin_lock_irqsave(&local->attributes_lock, flags);
@@ -2149,11 +2153,6 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		dnt900_print_hex(2, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
 		break;
-	case ERROR_PROTOCOL_TYPE:
-	case ERROR_PROTOCOL_ARGUMENT:
-	case ERROR_PROTOCOL_GENERAL:
-	case ERROR_PROTOCOL_TIMEOUT:
-	case ERROR_PROTOCOL_READONLY:
 	case ERROR_UART_OVERFLOW:
 	case ERROR_UART_OVERRUN:
 	case ERROR_UART_FRAMING:
@@ -2218,6 +2217,24 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 		if (test_bit(n, &updates))
 			sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[n].attr.attr.name);
 	return 0;
+}
+
+static int dnt900_process_argument_error(struct dnt900_local *local)
+{
+        struct dnt900_transaction *transaction;
+
+        TRY(mutex_lock_interruptible(&local->transactions_lock));
+        list_for_each_entry(transaction, &local->transactions, list) {
+                if (completion_done(&transaction->completed))
+                        continue;
+                if (transaction->packet[2] == COMMAND_SET_REGISTER || transaction->packet[2] == COMMAND_SET_REMOTE_REGISTER) {
+                        transaction->err = -EINVAL;
+                        complete(&transaction->completed);
+                        break;
+                }
+        }
+        mutex_unlock(&local->transactions_lock);
+        return 0;
 }
 
 static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request)
