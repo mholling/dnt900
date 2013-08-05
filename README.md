@@ -372,18 +372,36 @@ The above attributes are pollable, allowing them to be monitored by your applica
 Local Radio Attributes
 ======================
 
-Some additional pollable attributes are available for the local radio:
+Some additional attributes are available for the local radio:
+
+    $ ls -l
+    ...
+    -r--r--r-- 1 root root 4096 Aug  5 11:56 announce
+    --w------- 1 root root 4096 Aug  5 11:56 discover
+    -r--r--r-- 1 root root 4096 Aug  5 11:56 error
+    --w------- 1 root root 4096 Aug  5 12:01 join_deny
+    --w------- 1 root root 4096 Aug  5 12:03 join_permit
+    -r--r--r-- 1 root root 4096 Aug  5 11:51 join_request
+    -r--r--r-- 1 root root 4096 Aug  5 11:56 parent
+    --w------- 1 root root 4096 Aug  5 11:56 reset
+    ...
+
+The `announce` attribute contains the latest announcement from the radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). For example, after radio `0x00165E` transmits a heartbeat, the following is output:
 
     $ cat /sys/devices/virtual/dnt900/ttyAMA0/announce
     0xA85E1600000100C004C002
-    $ cat /sys/devices/virtual/dnt900/ttyAMA0/error
-    $ cat /sys/devices/virtual/dnt900/ttyAMA0/parent
-
-The `announce` attribute contains the latest announcement from the radio, as a hex string. DNT900 announcements are detailed on pages 41-42 of the [DNT900 manual](http://www.rfm.com/products/data/dnt900dk_manual.pdf). (The above example shows an announcement received when radio `0x00165E` transmits a heartbeat.)
 
 The `error` contains the most recent error code, if any, that has been received. An empty attribute indicates no error and is normally the case. Error codes are in the range 0xE0 to 0xEE and could be helpful for diagnosing problems.
 
 The `parent` attribute contains the MAC address of the router or base to which the radio is connected. (It is empty if the radio is acting as a base or is not linked to a network.)
+
+When host-based authentication is used (`AuthMode` value of 0x02), the `join_request` attribute announces the MAC addresses of radios seeking to join the network. Respond to these requests by writing that MAC address to `join_permit` to allow the radio to join, or to `join_deny` to deny the request. For example:
+
+    # cat /sys/devices/virtual/dnt900/ttyAMA0/join_request
+    0x00165E
+    # echo 0x00165E > /sys/devices/virtual/dnt900/ttyAMA0/join_permit
+
+(The `announce`, `error`, `parent` and `join_request` attribute files are all pollable.)
 
 Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
 
@@ -505,4 +523,4 @@ Release History
   * 20/4/2013: version 0.2.2: added tty hangups on shutdown and when radios leave network.
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
-  * 4/8/2013: HEAD: added pollable attributes for announcements, errors, I/O reports, RSSI, range, and heartbeat data.
+  * 5/8/2013: HEAD: added pollable attributes for announcements, errors, I/O reports, RSSI, range, and heartbeat data; added support for host-based authentication.

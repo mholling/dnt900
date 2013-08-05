@@ -84,6 +84,7 @@
 #define COMMAND_DISCOVER            (0x06)
 #define COMMAND_GET_REMOTE_REGISTER (0x0A)
 #define COMMAND_SET_REMOTE_REGISTER (0x0B)
+#define COMMAND_JOIN_REPLY          (0x0C)
 
 #define EVENT_RX_DATA      (0x26)
 #define EVENT_ANNOUNCE     (0x27)
@@ -138,6 +139,9 @@
 #define ACCESS_MODE_TDMA_DYNAMIC (0x02)
 #define ACCESS_MODE_TDMA_FIXED   (0x03)
 #define ACCESS_MODE_TDMA_PTT     (0x04)
+
+#define PERMIT_STATUS_DENIED    (0x00)
+#define PERMIT_STATUS_PERMITTED (0x01)
 
 #define LINK_STATUS_READY (0x04)
 
@@ -281,6 +285,8 @@ static ssize_t dnt900_store_reset(struct device *dev, struct device_attribute *a
 static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_show_local_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_show_radio_attr(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t dnt900_store_join_permit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
@@ -338,6 +344,7 @@ static int dnt900_process_event(struct dnt900_local *local, unsigned char *respo
 static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data);
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc);
 static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *data);
+static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request);
 static int dnt900_radio_report_rssi(struct dnt900_radio *radio, void *data);
 static int dnt900_radio_out(struct dnt900_radio *radio, void *data);
 
@@ -377,32 +384,29 @@ module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
 
 static const struct device_attribute dnt900_device_attributes[] = {
-	__ATTR(reset,	 ATTR_W, NULL, dnt900_store_reset),
-	__ATTR(discover, ATTR_W, NULL, dnt900_store_discover),
+	__ATTR(reset,	    ATTR_W, NULL, dnt900_store_reset),
+	__ATTR(discover,    ATTR_W, NULL, dnt900_store_discover),
+	__ATTR(join_permit, ATTR_W, NULL, dnt900_store_join_permit),
+	__ATTR(join_deny,   ATTR_W, NULL, dnt900_store_join_deny),
 };
 
-#define DNT900_POLLABLE_ATTR(_name, _show) { \
-	.attr = { \
-		.attr = { \
-			.name = #_name, \
-			.mode = ATTR_R \
-		}, \
-		.show = _show, \
-		.store = NULL \
-	}, \
-	.index = _name \
+#define DNT900_ATTR_R(_name, _show) { \
+	.attr = __ATTR(_name, ATTR_R, _show, NULL), \
+	.index = _name, \
 }
 
 enum {
 	announce = 0,
 	error,
 	parent,
+	join_request,
 };
 
 static const struct dnt900_pollable_attribute dnt900_local_attributes[] = {
-	DNT900_POLLABLE_ATTR(announce, dnt900_show_local_attr),
-	DNT900_POLLABLE_ATTR(error,    dnt900_show_local_attr),
-	DNT900_POLLABLE_ATTR(parent,   dnt900_show_local_attr),
+	DNT900_ATTR_R(announce,     dnt900_show_local_attr),
+	DNT900_ATTR_R(error,        dnt900_show_local_attr),
+	DNT900_ATTR_R(parent,       dnt900_show_local_attr),
+	DNT900_ATTR_R(join_request, dnt900_show_local_attr),
 };
 
 enum {
@@ -425,22 +429,22 @@ enum {
 };
 
 static const struct dnt900_pollable_attribute dnt900_radio_attributes[] = {
-	DNT900_POLLABLE_ATTR(report_GPIO0,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_GPIO1,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_GPIO2,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_GPIO3,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_GPIO4,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_GPIO5,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_ADC0,       dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_ADC1,       dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_ADC2,       dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(report_EventFlags, dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(range,             dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(success_rate,      dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(beacon_rssi,       dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(parent_rssi,       dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(rssi,              dnt900_show_radio_attr),
-	DNT900_POLLABLE_ATTR(linked,            dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO0,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO1,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO2,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO3,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO4,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_GPIO5,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_ADC0,       dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_ADC1,       dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_ADC2,       dnt900_show_radio_attr),
+	DNT900_ATTR_R(report_EventFlags, dnt900_show_radio_attr),
+	DNT900_ATTR_R(range,             dnt900_show_radio_attr),
+	DNT900_ATTR_R(success_rate,      dnt900_show_radio_attr),
+	DNT900_ATTR_R(beacon_rssi,       dnt900_show_radio_attr),
+	DNT900_ATTR_R(parent_rssi,       dnt900_show_radio_attr),
+	DNT900_ATTR_R(rssi,              dnt900_show_radio_attr),
+	DNT900_ATTR_R(linked,            dnt900_show_radio_attr),
 };
 
 enum {
@@ -667,14 +671,7 @@ enum {
 };
 
 #define DNT900_REG_ATTR(_name, _mode, _bank, _offset, _span, _print, _parse, _work, _local_work) { \
-	.attr = { \
-		.attr = { \
-			.name = #_name, \
-			.mode = _mode \
-		}, \
-		.show = dnt900_show_reg, \
-		.store = dnt900_store_reg \
-	}, \
+	.attr = __ATTR(_name, _mode, dnt900_show_reg, dnt900_store_reg), \
 	.reg = { \
 		.bank = _bank, \
 		.offset = _offset, \
@@ -699,7 +696,7 @@ static const struct dnt900_reg_attribute dnt900_reg_attributes[] = {
 	DNT900_REG_ATTR(ExtSyncEnable,      ATTR_RW, 0x00, 0x19, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
 	DNT900_REG_ATTR(DiversityMode,      ATTR_RW, 0x00, 0x1A, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
 	DNT900_REG_ATTR(UserTag,            ATTR_RW, 0x00, 0x1C, 0x10, dnt900_print_16_ascii, dnt900_parse_16_ascii, NULL, NULL),
-	DNT900_REG_ATTR(RegDenialDelay,     ATTR_RW, 0x00, 0x2C, 0x02, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
+	DNT900_REG_ATTR(RegDenialDelay,     ATTR_RW, 0x00, 0x2C, 0x02, dnt900_print_2_bytes, dnt900_parse_2_bytes, NULL, NULL),
 	DNT900_REG_ATTR(RmtTransDestAddr,   ATTR_RW, 0x00, 0x2E, 0x03, dnt900_print_3_bytes, dnt900_parse_3_bytes, NULL, NULL),
 	DNT900_REG_ATTR(TreeRoutingEn,      ATTR_RW, 0x00, 0x34, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, dnt900_refresh_all),
 	DNT900_REG_ATTR(BaseModeNetID,      ATTR_RW, 0x00, 0x35, 0x01, dnt900_print_1_bytes, dnt900_parse_1_bytes, NULL, NULL),
@@ -1348,6 +1345,26 @@ static ssize_t dnt900_show_radio_attr(struct device *dev, struct device_attribut
 	strcpy(buf, radio->attributes[pollable_attr->index]);
 	spin_unlock_irqrestore(&radio->attributes_lock, flags);
 	return strlen(buf);
+}
+
+static ssize_t dnt900_store_join_permit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+	PACKET(packet, COMMAND_JOIN_REPLY, 0, 0, 0, PERMIT_STATUS_PERMITTED);
+
+	TRY(dnt900_parse_bytes(3, buf, count, packet + 3));
+	TRY(dnt900_send_packet(local, packet));
+	return count;
+}
+
+static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+	PACKET(packet, COMMAND_JOIN_REPLY, 0, 0, 0, PERMIT_STATUS_DENIED);
+
+	TRY(dnt900_parse_bytes(3, buf, count, packet + 3));
+	TRY(dnt900_send_packet(local, packet));
+	return count;
 }
 
 static int dnt900_local_get_params(struct dnt900_local *local)
@@ -2042,7 +2059,7 @@ static int dnt900_process_event(struct dnt900_local *local, unsigned char *respo
 			dnt900_schedule_work(local, response + 3, dnt900_add_new_sys_address);
 		break;
 	case EVENT_JOIN_REQUEST:
-		// unimplemented for now (used for host-based authentication)
+		err = dnt900_process_join_request(local, response + 3);
 		break;
 	}
 	return err;
@@ -2200,6 +2217,17 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 	for (n = 0; n < ARRAY_SIZE(dnt900_radio_attributes); ++n)
 		if (test_bit(n, &updates))
 			sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[n].attr.attr.name);
+	return 0;
+}
+
+static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request)
+{
+	unsigned long flags;
+	
+	spin_lock_irqsave(&local->attributes_lock, flags);
+	dnt900_print_bytes(3, request, local->attributes[join_request], ARRAY_SIZE(*local->attributes));
+	spin_unlock_irqrestore(&local->attributes_lock, flags);
+	sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[join_request].attr.attr.name);
 	return 0;
 }
 
@@ -2519,6 +2547,5 @@ MODULE_VERSION("0.2.4");
 // TODO: check what happens when DeviceMode is changed?
 // TODO: remove 'linked' attribute?
 // TODO: rename beacon_rssi, parent_rssi to rssi_beacon, rssi_parent?
-// TODO: implement host-based authentication using a pollable attribute which responds to
-//       EVENT_JOIN_REQUEST announcements; write a MAC to the attribute to authenticate.
 // TODO: add writeable 'remap' attribute to force remap of entire network
+// TODO: implement RemoteLeave?
