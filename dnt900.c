@@ -923,6 +923,7 @@ struct dnt900_local {
 	struct dnt900_local_params params;
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
+        unsigned char drain_buffer[TX_BUFFER_SIZE];
 	wait_queue_head_t tx_queue;
 	unsigned char attributes[ARRAY_SIZE(dnt900_local_attributes)][32];
 };
@@ -1726,8 +1727,6 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
-	// TODO: copying out to temporary buffer is a bit inefficient, can we do better?
-	unsigned char buf[512]; // TODO: put this temporary buffer into dnt900_local?
 	unsigned int room;
 	unsigned int copied;
 	unsigned long flags;
@@ -1736,10 +1735,10 @@ static void dnt900_local_drain_fifo(struct dnt900_local *local)
 	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
 		return;
 	room = tty_write_room(local->tty);
-	copied = kfifo_out(&local->tx_fifo, buf, min(room, ARRAY_SIZE(buf)));
+	copied = kfifo_out(&local->tx_fifo, local->drain_buffer, min(room, ARRAY_SIZE(local->drain_buffer)));
 	if (copied) {
 		set_bit(TTY_DO_WRITE_WAKEUP, &local->tty->flags);
-		copied = local->tty->ops->write(local->tty, buf, copied);
+		copied = local->tty->ops->write(local->tty, local->drain_buffer, copied);
 	}
 	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 
@@ -2566,3 +2565,5 @@ MODULE_VERSION("0.2.4");
 // TODO: rename beacon_rssi, parent_rssi to rssi_beacon, rssi_parent?
 // TODO: add writeable 'remap' attribute to force remap of entire network
 // TODO: implement RemoteLeave?
+// TODO: dnt900_local_drain_fifo is innefficient as it copies from kfifo to temporary buffer
+//       before writing to tty. Unfortunately we can't get direct access to kfifo buffer.
