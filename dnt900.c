@@ -923,7 +923,7 @@ struct dnt900_local {
 	struct dnt900_local_params params;
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
-        unsigned char drain_buffer[TX_BUFFER_SIZE];
+	unsigned char drain_buffer[TX_BUFFER_SIZE];
 	wait_queue_head_t tx_queue;
 	unsigned char attributes[ARRAY_SIZE(dnt900_local_attributes)][32];
 };
@@ -2117,9 +2117,9 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		if (err == -ENODEV)
 			dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 		break;
-        case ERROR_PROTOCOL_ARGUMENT:
-                dnt900_process_argument_error(local);
-                break;
+	case ERROR_PROTOCOL_ARGUMENT:
+		dnt900_process_argument_error(local);
+		break;
 	}
 
 	spin_lock_irqsave(&local->attributes_lock, flags);
@@ -2220,20 +2220,20 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 
 static int dnt900_process_argument_error(struct dnt900_local *local)
 {
-        struct dnt900_transaction *transaction;
+	struct dnt900_transaction *transaction;
 
-        TRY(mutex_lock_interruptible(&local->transactions_lock));
-        list_for_each_entry(transaction, &local->transactions, list) {
-                if (completion_done(&transaction->completed))
-                        continue;
-                if (transaction->packet[2] == COMMAND_SET_REGISTER || transaction->packet[2] == COMMAND_SET_REMOTE_REGISTER) {
-                        transaction->err = -EINVAL;
-                        complete(&transaction->completed);
-                        break;
-                }
-        }
-        mutex_unlock(&local->transactions_lock);
-        return 0;
+	TRY(mutex_lock_interruptible(&local->transactions_lock));
+	list_for_each_entry(transaction, &local->transactions, list) {
+		if (completion_done(&transaction->completed))
+			continue;
+		if (transaction->packet[2] == COMMAND_SET_REGISTER || transaction->packet[2] == COMMAND_SET_REMOTE_REGISTER) {
+			transaction->err = -EINVAL;
+			complete(&transaction->completed);
+			break;
+		}
+	}
+	mutex_unlock(&local->transactions_lock);
+	return 0;
 }
 
 static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request)
