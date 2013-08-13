@@ -283,11 +283,6 @@ struct dnt900_reg_attribute {
 	void (*local_work)(struct work_struct *);
 };
 
-struct dnt900_pollable_attribute {
-	struct device_attribute attr;
-	unsigned int index;
-};
-
 static int dnt900_print_bytes(int bytes, const unsigned char *value, char *buf, size_t size);
 static int dnt900_print_1_bytes(const unsigned char *value, char *buf);
 static int dnt900_print_2_bytes(const unsigned char *value, char *buf);
@@ -433,16 +428,11 @@ module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
 
 static const struct device_attribute dnt900_device_attributes[] = {
-	__ATTR(reset,	    ATTR_W, NULL, dnt900_store_reset),
+	__ATTR(reset,       ATTR_W, NULL, dnt900_store_reset),
 	__ATTR(discover,    ATTR_W, NULL, dnt900_store_discover),
 	__ATTR(join_permit, ATTR_W, NULL, dnt900_store_join_permit),
 	__ATTR(join_deny,   ATTR_W, NULL, dnt900_store_join_deny),
 };
-
-#define DNT900_ATTR_R(_name, _show) { \
-	.attr = __ATTR(_name, ATTR_R, _show, NULL), \
-	.index = _name, \
-}
 
 enum {
 	announce = 0,
@@ -451,11 +441,11 @@ enum {
 	join_request,
 };
 
-static const struct dnt900_pollable_attribute dnt900_local_attributes[] = {
-	DNT900_ATTR_R(announce,     dnt900_show_local_attr),
-	DNT900_ATTR_R(error,        dnt900_show_local_attr),
-	DNT900_ATTR_R(parent,       dnt900_show_local_attr),
-	DNT900_ATTR_R(join_request, dnt900_show_local_attr),
+static const struct device_attribute dnt900_local_attributes[] = {
+	__ATTR(announce,     ATTR_R, dnt900_show_local_attr, NULL),
+	__ATTR(error,        ATTR_R, dnt900_show_local_attr, NULL),
+	__ATTR(parent,       ATTR_R, dnt900_show_local_attr, NULL),
+	__ATTR(join_request, ATTR_R, dnt900_show_local_attr, NULL),
 };
 
 enum {
@@ -477,23 +467,23 @@ enum {
 	linked,
 };
 
-static const struct dnt900_pollable_attribute dnt900_radio_attributes[] = {
-	DNT900_ATTR_R(report_GPIO0,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_GPIO1,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_GPIO2,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_GPIO3,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_GPIO4,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_GPIO5,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_ADC0,       dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_ADC1,       dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_ADC2,       dnt900_show_radio_attr),
-	DNT900_ATTR_R(report_EventFlags, dnt900_show_radio_attr),
-	DNT900_ATTR_R(range,             dnt900_show_radio_attr),
-	DNT900_ATTR_R(success_rate,      dnt900_show_radio_attr),
-	DNT900_ATTR_R(beacon_rssi,       dnt900_show_radio_attr),
-	DNT900_ATTR_R(parent_rssi,       dnt900_show_radio_attr),
-	DNT900_ATTR_R(rssi,              dnt900_show_radio_attr),
-	DNT900_ATTR_R(linked,            dnt900_show_radio_attr),
+static const struct device_attribute dnt900_radio_attributes[] = {
+	__ATTR(report_GPIO0,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_GPIO1,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_GPIO2,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_GPIO3,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_GPIO4,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_GPIO5,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_ADC0,       ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_ADC1,       ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_ADC2,       ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(report_EventFlags, ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(range,             ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(success_rate,      ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(beacon_rssi,       ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(parent_rssi,       ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(rssi,              ATTR_R, dnt900_show_radio_attr, NULL),
+	__ATTR(linked,            ATTR_R, dnt900_show_radio_attr, NULL),
 };
 
 enum {
@@ -1182,7 +1172,7 @@ static int dnt900_radio_add_attributes(struct dnt900_radio *radio)
 		TRY(device_create_file(&radio->dev, &dnt900_reg_attributes[n].attr));
 	if (!radio->is_local)
 		for (n = 0; n < ARRAY_SIZE(dnt900_radio_attributes); ++n)
-			TRY(device_create_file(&radio->dev, &dnt900_radio_attributes[n].attr));
+			TRY(device_create_file(&radio->dev, dnt900_radio_attributes + n));
 	return 0;
 }
 
@@ -1193,7 +1183,7 @@ static int dnt900_local_add_attributes(struct dnt900_local *local)
 	for (n = 0; n < ARRAY_SIZE(dnt900_device_attributes); ++n)
 		TRY(device_create_file(&local->dev, dnt900_device_attributes + n));
 	for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
-		TRY(device_create_file(&local->dev, &dnt900_local_attributes[n].attr));
+		TRY(device_create_file(&local->dev, dnt900_local_attributes + n));
 	return 0;
 }
 
@@ -1375,11 +1365,11 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 static ssize_t dnt900_show_local_attr(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct dnt900_local *local = DEV_TO_LOCAL(dev);
-	struct dnt900_pollable_attribute *pollable_attr = container_of(attr, struct dnt900_pollable_attribute, attr);
+	int index = attr - dnt900_local_attributes;
 	unsigned long flags;
 
 	spin_lock_irqsave(&local->attributes_lock, flags);
-	strcpy(buf, local->attributes[pollable_attr->index]);
+	strcpy(buf, local->attributes[index]);
 	spin_unlock_irqrestore(&local->attributes_lock, flags);
 	return strlen(buf);
 }
@@ -1387,11 +1377,11 @@ static ssize_t dnt900_show_local_attr(struct device *dev, struct device_attribut
 static ssize_t dnt900_show_radio_attr(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
-	struct dnt900_pollable_attribute *pollable_attr = container_of(attr, struct dnt900_pollable_attribute, attr);
+	int index = attr - dnt900_radio_attributes;
 	unsigned long flags;
 
 	spin_lock_irqsave(&radio->attributes_lock, flags);
-	strcpy(buf, radio->attributes[pollable_attr->index]);
+	strcpy(buf, radio->attributes[index]);
 	spin_unlock_irqrestore(&radio->attributes_lock, flags);
 	return strlen(buf);
 }
@@ -2130,8 +2120,8 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 	PRINT_RSSI(radio->attributes[rssi], response[6]);
 	spin_unlock_irqrestore(&radio->attributes_lock, flags);
 	for (n = 0; n < 10; ++n)
-		sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[report_GPIO0 + n].attr.attr.name);
-	sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[rssi].attr.attr.name);
+		sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[report_GPIO0 + n].attr.name);
+	sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[rssi].attr.name);
 	return 0;
 }
 
@@ -2216,7 +2206,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 
 	for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
 		if (test_bit(n, &updates))
-			sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[n].attr.attr.name);
+			sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[n].attr.name);
 
 	switch (annc[0]) {
 	case ANNOUNCEMENT_REMOTE_JOINED:
@@ -2265,7 +2255,7 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 
 	for (n = 0; n < ARRAY_SIZE(dnt900_radio_attributes); ++n)
 		if (test_bit(n, &updates))
-			sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[n].attr.attr.name);
+			sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[n].attr.name);
 	return 0;
 }
 
@@ -2294,7 +2284,7 @@ static int dnt900_process_join_request(struct dnt900_local *local, unsigned char
 	spin_lock_irqsave(&local->attributes_lock, flags);
 	dnt900_print_bytes(3, request, local->attributes[join_request], ARRAY_SIZE(*local->attributes));
 	spin_unlock_irqrestore(&local->attributes_lock, flags);
-	sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[join_request].attr.attr.name);
+	sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[join_request].attr.name);
 	return 0;
 }
 
@@ -2311,7 +2301,7 @@ static int dnt900_radio_report_rssi(struct dnt900_radio *radio, void *data)
 		spin_lock_irqsave(&radio->attributes_lock, flags);
 		PRINT_RSSI(radio->attributes[rssi], *value);
 		spin_unlock_irqrestore(&radio->attributes_lock, flags);
-		sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[rssi].attr.attr.name);
+		sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[rssi].attr.name);
 	}
 	return 0;
 }
@@ -2613,6 +2603,5 @@ MODULE_VERSION("0.3");
 // TODO: hangup ttys on ANNOUNCEMENT_BASE_REBOOTED event?
 // TODO: check what happens when DeviceMode is changed?
 // TODO: remove 'linked' attribute?
-// TODO: rename beacon_rssi, parent_rssi to rssi_beacon, rssi_parent?
 // TODO: add writeable 'remap' attribute to force remap of entire network
 // TODO: implement RemoteLeave?
