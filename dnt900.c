@@ -85,6 +85,7 @@
 #define COMMAND_GET_REMOTE_REGISTER (0x0A)
 #define COMMAND_SET_REMOTE_REGISTER (0x0B)
 #define COMMAND_JOIN_REPLY          (0x0C)
+#define COMMAND_REMOTE_LEAVE        (0x0D)
 
 #define EVENT_RX_DATA      (0x26)
 #define EVENT_ANNOUNCE     (0x27)
@@ -189,7 +190,7 @@
 /**
  * kfifo_out_prepare - setup a pointer for direct output buffer access
  * @fifo: address of the fifo to be used
- * @sgl: address of buffer pointer to be initialized
+ * @pbuf: address of buffer pointer to be initialized
  *
  * This macro sets the provided buffer pointer to the address of the
  * current fifo output location.
@@ -330,6 +331,7 @@ static ssize_t dnt900_show_local_attr(struct device *dev, struct device_attribut
 static ssize_t dnt900_show_radio_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_join_permit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
@@ -427,11 +429,15 @@ MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
 
-static const struct device_attribute dnt900_device_attributes[] = {
+static const struct device_attribute dnt900_local_command_attributes[] = {
 	__ATTR(reset,       ATTR_W, NULL, dnt900_store_reset),
 	__ATTR(discover,    ATTR_W, NULL, dnt900_store_discover),
 	__ATTR(join_permit, ATTR_W, NULL, dnt900_store_join_permit),
 	__ATTR(join_deny,   ATTR_W, NULL, dnt900_store_join_deny),
+};
+
+static const struct device_attribute dnt900_radio_command_attributes[] = {
+	__ATTR(leave, ATTR_W, NULL, dnt900_store_leave),
 };
 
 enum {
@@ -1170,9 +1176,12 @@ static int dnt900_radio_add_attributes(struct dnt900_radio *radio)
 
 	for (n = 0; n < ARRAY_SIZE(dnt900_reg_attributes); ++n)
 		TRY(device_create_file(&radio->dev, &dnt900_reg_attributes[n].attr));
-	if (!radio->is_local)
-		for (n = 0; n < ARRAY_SIZE(dnt900_radio_attributes); ++n)
-			TRY(device_create_file(&radio->dev, dnt900_radio_attributes + n));
+	if (radio->is_local)
+		return 0;
+	for (n = 0; n < ARRAY_SIZE(dnt900_radio_command_attributes); ++n)
+		TRY(device_create_file(&radio->dev, dnt900_radio_command_attributes + n));
+	for (n = 0; n < ARRAY_SIZE(dnt900_radio_attributes); ++n)
+		TRY(device_create_file(&radio->dev, dnt900_radio_attributes + n));
 	return 0;
 }
 
@@ -1180,8 +1189,8 @@ static int dnt900_local_add_attributes(struct dnt900_local *local)
 {
 	int n;
 
-	for (n = 0; n < ARRAY_SIZE(dnt900_device_attributes); ++n)
-		TRY(device_create_file(&local->dev, dnt900_device_attributes + n));
+	for (n = 0; n < ARRAY_SIZE(dnt900_local_command_attributes); ++n)
+		TRY(device_create_file(&local->dev, dnt900_local_command_attributes + n));
 	for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
 		TRY(device_create_file(&local->dev, dnt900_local_attributes + n));
 	return 0;
@@ -1402,6 +1411,20 @@ static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribut
 	PACKET(packet, COMMAND_JOIN_REPLY, 0, 0, 0, PERMIT_STATUS_DENIED);
 
 	TRY(dnt900_parse_bytes(3, buf, count, packet + 3));
+	TRY(dnt900_send_packet(local, packet));
+	return count;
+}
+
+static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_radio_params params;
+	PACKET(packet, COMMAND_REMOTE_LEAVE, 0, 0, 0, 0, 0);
+
+	TRY(dnt900_parse_bytes(2, buf, count, packet + 6));
+	dnt900_radio_read_params(radio, &params);
+	COPY3(packet + 3, params.sys_address);
 	TRY(dnt900_send_packet(local, packet));
 	return count;
 }
@@ -2604,4 +2627,3 @@ MODULE_VERSION("0.3");
 // TODO: check what happens when DeviceMode is changed?
 // TODO: remove 'linked' attribute?
 // TODO: add writeable 'remap' attribute to force remap of entire network
-// TODO: implement RemoteLeave?

@@ -369,6 +369,12 @@ Units for `range` are metres, although it is in fact a coarse measurement, with 
 
 The above attributes are pollable, allowing them to be monitored by your application for updates as they occur. (See below.)
 
+A final `leave` attribute is available for remote radios. This attribute implements the `RemoteLeave` command. Write a number of seconds to the attribute to remove the radio from the network for that amount of time. For example, to force radio `0x00165E` to leave the network for ten minutes:
+
+    # echo 600 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165E/leave
+
+(This will only be effective when the local radio is a base or router, and the remote radio is a child.)
+
 Local Radio Attributes
 ======================
 
@@ -524,3 +530,4 @@ Release History
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
+  * HEAD: added remote leave attribute.
