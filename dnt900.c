@@ -337,9 +337,9 @@ static int dnt900_local_get_params(struct dnt900_local *local);
 static int dnt900_radio_get_params(struct dnt900_radio *radio);
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local);
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address);
 static void dnt900_release_radio(struct device *dev);
-static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local);
+static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address);
 static int dnt900_unregister_radio(struct device *dev, void *unused);
 
 static int dnt900_radio_matches_sys_address(struct device *dev, void *data);
@@ -967,6 +967,7 @@ struct dnt900_local {
 	spinlock_t attributes_lock;
 	struct workqueue_struct *workqueue;
 	struct dnt900_local_params params;
+	unsigned char mac_address[3];
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
 	wait_queue_head_t tx_queue;
@@ -1358,7 +1359,7 @@ static ssize_t dnt900_store_discover(struct device *dev, struct device_attribute
 		mac_address[n] = mac_address_int & 0xFF;
 	if (mac_address_int)
 		return -EINVAL;
-	TRY(dnt900_add_radio(local, mac_address, false));
+	TRY(dnt900_add_radio(local, mac_address));
 	return count;
 }
 
@@ -1442,7 +1443,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	if (local_params.link_status == LINK_STATUS_READY && local_params.slot_size <= 10)
 		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", local_params.slot_size);
 	if (local_params.device_mode == DEVICE_MODE_BASE)
-		TRY(dnt900_get_register(local, REG(MacAddress), local_params.base_mac_address));
+		COPY3(local_params.base_mac_address, local->mac_address);
 	else if (local_params.link_status == LINK_STATUS_READY) {
 		unsigned char base_sys_address[3] = { 0x00, 0x00, local_params.tree_routing_en ? 0xFF : 0x00 };
 		TRY(dnt900_get_remote_register(local, base_sys_address, REG(MacAddress), local_params.base_mac_address));
@@ -1489,18 +1490,18 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	for (n = 0; n < 26 * 5; ++n) {
 		unsigned char *mac_address = mac_addresses + 3 * n;
 		if (mac_address[0] || mac_address[1] || mac_address[2])
-			dnt900_add_radio(local, mac_address, false);
+			dnt900_add_radio(local, mac_address);
 	}
 	return 0;
 }
 
-static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local)
+static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address)
 {
 	int err;
 	struct dnt900_radio *radio = kzalloc(sizeof(*radio), GFP_KERNEL);
 
 	UNWIND(err, radio ? 0 : -ENOMEM, fail_alloc);
-	radio->is_local = is_local;
+	radio->is_local = EQUAL_ADDRESSES(local->mac_address, mac_address);
 	COPY3(radio->mac_address, mac_address);
 	spin_lock_init(&radio->param_lock);
 	spin_lock_init(&radio->attributes_lock);
@@ -1529,14 +1530,14 @@ static void dnt900_release_radio(struct device *dev)
 	kfree(radio);
 }
 
-static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address, bool is_local)
+static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac_address)
 {
 	int err;
 	struct dnt900_radio *radio;
 
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	UNWIND(err, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
-	radio = dnt900_create_radio(local, mac_address, is_local);
+	radio = dnt900_create_radio(local, mac_address);
 	UNWIND(err, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
 	tty_port_init(&radio->port);
 	radio->port.ops = &dnt900_tty_port_ops;
@@ -2288,7 +2289,7 @@ static int dnt900_process_argument_error(struct dnt900_local *local)
 static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request)
 {
 	unsigned long flags;
-	
+
 	spin_lock_irqsave(&local->attributes_lock, flags);
 	dnt900_print_bytes(3, request, local->attributes[join_request], ARRAY_SIZE(*local->attributes));
 	spin_unlock_irqrestore(&local->attributes_lock, flags);
@@ -2350,7 +2351,7 @@ static void dnt900_add_new_mac_address(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 
-	dnt900_add_radio(work->local, work->address, false);
+	dnt900_add_radio(work->local, work->address);
 	kfree(work);
 }
 
@@ -2360,7 +2361,7 @@ static void dnt900_add_or_refresh_mac_address(struct work_struct *ws)
 
 	int err = dnt900_dispatch_to_radio_no_data(work->local, work->address, dnt900_radio_matches_mac_address, dnt900_radio_get_params);
 	if (err == -ENODEV)
-		dnt900_add_radio(work->local, work->address, false);
+		dnt900_add_radio(work->local, work->address);
 	kfree(work);
 }
 
@@ -2370,7 +2371,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 	unsigned char mac_address[3];
 
 	if (!dnt900_get_remote_register(work->local, work->address, REG(MacAddress), mac_address))
-		dnt900_add_radio(work->local, mac_address, false);
+		dnt900_add_radio(work->local, mac_address);
 	kfree(work);
 }
 
@@ -2404,18 +2405,17 @@ static void dnt900_init_local(struct work_struct *ws)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	struct dnt900_local *local = work->local;
 	struct dnt900_local_params local_params;
-	unsigned char mac_address[3];
 	int err;
 
 	UNWIND(err, dnt900_local_add_attributes(local), fail);
 	UNWIND(err, dnt900_enter_protocol_mode(local), fail);
+	UNWIND(err, dnt900_get_register(local, REG(MacAddress), local->mac_address), fail);
 	UNWIND(err, dnt900_local_get_params(local), fail);
-	UNWIND(err, dnt900_get_register(local, REG(MacAddress), mac_address), fail);
-	UNWIND(err, dnt900_add_radio(local, mac_address, true), fail);
+	UNWIND(err, dnt900_add_radio(local, local->mac_address), fail);
 	dnt900_local_read_params(local, &local_params);
 	if (local_params.device_mode == DEVICE_MODE_BASE || local_params.link_status != LINK_STATUS_READY)
 		goto success;
-	UNWIND(err, dnt900_add_radio(local, local_params.base_mac_address, false), success);
+	UNWIND(err, dnt900_add_radio(local, local_params.base_mac_address), success);
 	goto success;
 
 fail:
