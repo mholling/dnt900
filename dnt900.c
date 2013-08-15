@@ -950,6 +950,8 @@ static const struct dnt900_reg_attribute dnt900_reg_attributes[] = {
 	DNT900_REG_ATTR(MemorySave,         ATTR_W,  0xFF, 0xFF, 0x01, NULL, dnt900_parse_1_bytes, NULL, NULL),
 };
 
+#define REG(name) (&dnt900_reg_attributes[(name)].reg)
+
 struct dnt900_local {
 	struct device dev;
 	struct tty_struct *tty;
@@ -1256,7 +1258,7 @@ static int dnt900_get_base_mac_address(struct dnt900_local *local, unsigned char
 
 	dnt900_local_read_params(local, &local_params);
 	sys_address[2] = local_params.tree_routing ? 0xFF : 0x00;
-	TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[MacAddress].reg, mac_address));
+	TRY(dnt900_get_remote_register(local, sys_address, REG(MacAddress), mac_address));
 	return 0;
 }
 
@@ -1433,13 +1435,13 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	unsigned char link_status, announce_options, protocol_options, device_mode, slot_size, tree_routing_en, access_mode;
 	unsigned long flags;
 
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[LinkStatus].reg, &link_status));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AnnounceOptions].reg, &announce_options));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[ProtocolOptions].reg, &protocol_options));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[TreeRoutingEn].reg, &tree_routing_en));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AccessMode].reg, &access_mode));
+	TRY(dnt900_get_register(local, REG(LinkStatus), &link_status));
+	TRY(dnt900_get_register(local, REG(AnnounceOptions), &announce_options));
+	TRY(dnt900_get_register(local, REG(ProtocolOptions), &protocol_options));
+	TRY(dnt900_get_register(local, REG(TreeRoutingEn), &tree_routing_en));
+	TRY(dnt900_get_register(local, REG(DeviceMode), &device_mode));
+	TRY(dnt900_get_register(local, REG(device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize), &slot_size));
+	TRY(dnt900_get_register(local, REG(AccessMode), &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
@@ -1473,7 +1475,7 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	else {
 		unsigned char base_sys_address[3] = { 0x00, 0x00, 0x00 };
 		unsigned char base_mac_address[3]; // TODO: move this into local_params?
-		TRY(dnt900_get_remote_register(local, base_sys_address, &dnt900_reg_attributes[MacAddress].reg, base_mac_address));
+		TRY(dnt900_get_remote_register(local, base_sys_address, REG(MacAddress), base_mac_address));
 		if (EQUAL_ADDRESSES(base_mac_address, radio->mac_address))
 			memset(radio_params.sys_address, 0x00, 3);
 		else
@@ -1492,7 +1494,7 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	int n;
 
 	for (n = 0; n < 26; ++n)
-		TRY(dnt900_radio_get_register(radio, &dnt900_reg_attributes[RegMACAddr00 + n].reg, mac_addresses + 15 * n));
+		TRY(dnt900_radio_get_register(radio, REG(RegMACAddr00 + n), mac_addresses + 15 * n));
 	for (n = 0; n < 26 * 5; ++n) {
 		unsigned char *mac_address = mac_addresses + 3 * n;
 		if (mac_address[0] || mac_address[1] || mac_address[2])
@@ -2375,7 +2377,7 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	unsigned char mac_address[3];
 
-	if (!dnt900_get_remote_register(work->local, work->address, &dnt900_reg_attributes[MacAddress].reg, mac_address))
+	if (!dnt900_get_remote_register(work->local, work->address, REG(MacAddress), mac_address))
 		dnt900_add_radio(work->local, mac_address, false);
 	kfree(work);
 }
@@ -2415,7 +2417,7 @@ static void dnt900_init_local(struct work_struct *ws)
 	UNWIND(err, dnt900_local_add_attributes(local), fail);
 	UNWIND(err, dnt900_enter_protocol_mode(local), fail);
 	UNWIND(err, dnt900_local_get_params(local), fail);
-	UNWIND(err, dnt900_get_register(local, &dnt900_reg_attributes[MacAddress].reg, mac_address), fail);
+	UNWIND(err, dnt900_get_register(local, REG(MacAddress), mac_address), fail);
 	UNWIND(err, dnt900_add_radio(local, mac_address, true), fail);
 	if (local->params.is_base)
 		goto success;
