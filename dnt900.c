@@ -244,9 +244,11 @@ struct dnt900_transaction {
 };
 
 struct dnt900_local_params {
-	bool is_base;
-	bool tree_routing;
-	unsigned int slot_size;
+	unsigned char device_mode;
+	unsigned char tree_routing_en;
+	unsigned char slot_size;
+	unsigned char link_status;
+	unsigned char base_mac_address[3];
 };
 
 struct dnt900_local;
@@ -313,7 +315,6 @@ static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value);
 static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, const unsigned char *value);
 static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_address, unsigned char *sys_address);
-static int dnt900_get_base_mac_address(struct dnt900_local *local, unsigned char *mac_address);
 
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data);
 static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params);
@@ -1251,17 +1252,6 @@ static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_
 	return err == -EAGAIN ? -ENODEV : err;
 }
 
-static int dnt900_get_base_mac_address(struct dnt900_local *local, unsigned char *mac_address)
-{
-	struct dnt900_local_params local_params;
-	unsigned char sys_address[3] = { 0x00, 0x00, 0x00 };
-
-	dnt900_local_read_params(local, &local_params);
-	sys_address[2] = local_params.tree_routing ? 0xFF : 0x00;
-	TRY(dnt900_get_remote_register(local, sys_address, REG(MacAddress), mac_address));
-	return 0;
-}
-
 static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
 {
 	const unsigned char *sys_address = data;
@@ -1432,28 +1422,34 @@ static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *a
 
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
-	unsigned char link_status, announce_options, protocol_options, device_mode, slot_size, tree_routing_en, access_mode;
+	struct dnt900_local_params local_params;
+	unsigned char announce_options, protocol_options, access_mode;
 	unsigned long flags;
 
-	TRY(dnt900_get_register(local, REG(LinkStatus), &link_status));
+	TRY(dnt900_get_register(local, REG(LinkStatus), &local_params.link_status));
 	TRY(dnt900_get_register(local, REG(AnnounceOptions), &announce_options));
 	TRY(dnt900_get_register(local, REG(ProtocolOptions), &protocol_options));
-	TRY(dnt900_get_register(local, REG(TreeRoutingEn), &tree_routing_en));
-	TRY(dnt900_get_register(local, REG(DeviceMode), &device_mode));
-	TRY(dnt900_get_register(local, REG(device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize), &slot_size));
+	TRY(dnt900_get_register(local, REG(TreeRoutingEn), &local_params.tree_routing_en));
+	TRY(dnt900_get_register(local, REG(DeviceMode), &local_params.device_mode));
+	TRY(dnt900_get_register(local, REG(local_params.device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize), &local_params.slot_size));
 	TRY(dnt900_get_register(local, REG(AccessMode), &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
 		pr_err(LDISC_NAME ": set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
-	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
+	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && local_params.device_mode != DEVICE_MODE_BASE)
 		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
-	if (link_status == LINK_STATUS_READY && slot_size <= 10)
-		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", slot_size);
+	if (local_params.link_status == LINK_STATUS_READY && local_params.slot_size <= 10)
+		pr_warn(LDISC_NAME ": slot size of %i likely to be insufficient\n", local_params.slot_size);
+	if (local_params.device_mode == DEVICE_MODE_BASE)
+		TRY(dnt900_get_register(local, REG(MacAddress), local_params.base_mac_address));
+	else if (local_params.link_status == LINK_STATUS_READY) {
+		unsigned char base_sys_address[3] = { 0x00, 0x00, local_params.tree_routing_en ? 0xFF : 0x00 };
+		TRY(dnt900_get_remote_register(local, base_sys_address, REG(MacAddress), local_params.base_mac_address));
+	} else
+		memset(local_params.base_mac_address, 0x00, 3);
 	spin_lock_irqsave(&local->param_lock, flags);
-	local->params.is_base = device_mode == DEVICE_MODE_BASE;
-	local->params.slot_size = slot_size;
-	local->params.tree_routing = tree_routing_en;
+	local->params = local_params;
 	spin_unlock_irqrestore(&local->param_lock, flags);
 	return 0;
 }
@@ -1468,19 +1464,14 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 	dnt900_local_read_params(local, &local_params);
 	if (radio->is_local)
 		memset(radio_params.sys_address, 0x00, 3);
-	else if (local_params.tree_routing)
+	else if (local_params.tree_routing_en)
 		TRY(dnt900_discover(local, radio->mac_address, radio_params.sys_address));
-	else if (local_params.is_base)
+	else if (local_params.device_mode == DEVICE_MODE_BASE)
 		COPY3(radio_params.sys_address, radio->mac_address);
-	else {
-		unsigned char base_sys_address[3] = { 0x00, 0x00, 0x00 };
-		unsigned char base_mac_address[3]; // TODO: move this into local_params?
-		TRY(dnt900_get_remote_register(local, base_sys_address, REG(MacAddress), base_mac_address));
-		if (EQUAL_ADDRESSES(base_mac_address, radio->mac_address))
-			memset(radio_params.sys_address, 0x00, 3);
-		else
-			COPY3(radio_params.sys_address, radio->mac_address);
-	}
+	else if (EQUAL_ADDRESSES(local_params.base_mac_address, radio->mac_address))
+		memset(radio_params.sys_address, 0x00, 3);
+	else
+		COPY3(radio_params.sys_address, radio->mac_address);
 	spin_lock_irqsave(&radio->param_lock, flags);
 	radio->params = radio_params;
 	spin_unlock_irqrestore(&radio->param_lock, flags);
@@ -1766,7 +1757,7 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 	if (!radio->is_local)
 		COPY3(packet + 3, radio_params.sys_address);
 	do {
-		int length = min(local_params.slot_size, kfifo_len(&radio->fifo) + 6);
+		unsigned int length = min((unsigned int)local_params.slot_size, kfifo_len(&radio->fifo) + 6);
 		spin_lock_irqsave(&local->tx_fifo_lock, flags);
 		tx_available = kfifo_avail(&local->tx_fifo) >= length;
 		if (tx_available) {
@@ -2158,6 +2149,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
+		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
@@ -2411,6 +2403,7 @@ static void dnt900_init_local(struct work_struct *ws)
 {
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 	struct dnt900_local *local = work->local;
+	struct dnt900_local_params local_params;
 	unsigned char mac_address[3];
 	int err;
 
@@ -2419,10 +2412,10 @@ static void dnt900_init_local(struct work_struct *ws)
 	UNWIND(err, dnt900_local_get_params(local), fail);
 	UNWIND(err, dnt900_get_register(local, REG(MacAddress), mac_address), fail);
 	UNWIND(err, dnt900_add_radio(local, mac_address, true), fail);
-	if (local->params.is_base)
+	dnt900_local_read_params(local, &local_params);
+	if (local_params.device_mode == DEVICE_MODE_BASE || local_params.link_status != LINK_STATUS_READY)
 		goto success;
-	UNWIND(err, dnt900_get_base_mac_address(local, mac_address), success);
-	UNWIND(err, dnt900_add_radio(local, mac_address, false), success);
+	UNWIND(err, dnt900_add_radio(local, local_params.base_mac_address, false), success);
 	goto success;
 
 fail:
