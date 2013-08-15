@@ -253,7 +253,6 @@ struct dnt900_local;
 
 struct dnt900_radio_params {
 	unsigned char sys_address[3];
-	bool is_base;
 };
 
 struct dnt900_radio;
@@ -1431,13 +1430,12 @@ static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *a
 
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
-	unsigned char link_status, announce_options, protocol_options, auth_mode, device_mode, slot_size, tree_routing_en, access_mode;
+	unsigned char link_status, announce_options, protocol_options, device_mode, slot_size, tree_routing_en, access_mode;
 	unsigned long flags;
 
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[LinkStatus].reg, &link_status));
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AnnounceOptions].reg, &announce_options));
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[ProtocolOptions].reg, &protocol_options));
-	TRY(dnt900_get_register(local, &dnt900_reg_attributes[AuthMode].reg, &auth_mode));
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[TreeRoutingEn].reg, &tree_routing_en));
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
 	TRY(dnt900_get_register(local, &dnt900_reg_attributes[device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize].reg, &slot_size));
@@ -1446,8 +1444,6 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
 		pr_err(LDISC_NAME ": set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
-	if (auth_mode == AUTH_MODE_HOST)
-		pr_warn(LDISC_NAME ": AuthMode register is set to 0x02 but host-based authentication is not supported\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && device_mode != DEVICE_MODE_BASE)
 		pr_warn(LDISC_NAME ": driver may not operate correctly on a remote when using dynamic TDMA access mode\n");
 	if (link_status == LINK_STATUS_READY && slot_size <= 10)
@@ -1463,33 +1459,28 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 static int dnt900_radio_get_params(struct dnt900_radio *radio)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
-	unsigned char sys_address[3];
-	unsigned char device_mode;
 	struct dnt900_local_params local_params;
+	struct dnt900_radio_params radio_params;
 	unsigned long flags;
 
 	dnt900_local_read_params(local, &local_params);
-	if (radio->is_local) {
-		sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
-		TRY(dnt900_get_register(local, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
-	} else if (local_params.tree_routing) {
-		TRY(dnt900_discover(local, radio->mac_address, sys_address));
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
-	} else if (local_params.is_base) {
-		COPY3(sys_address, radio->mac_address);
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
-	} else {
-		unsigned char base_mac_address[3];
-		TRY(dnt900_get_base_mac_address(local, base_mac_address));
+	if (radio->is_local)
+		memset(radio_params.sys_address, 0x00, 3);
+	else if (local_params.tree_routing)
+		TRY(dnt900_discover(local, radio->mac_address, radio_params.sys_address));
+	else if (local_params.is_base)
+		COPY3(radio_params.sys_address, radio->mac_address);
+	else {
+		unsigned char base_sys_address[3] = { 0x00, 0x00, 0x00 };
+		unsigned char base_mac_address[3]; // TODO: move this into local_params?
+		TRY(dnt900_get_remote_register(local, base_sys_address, &dnt900_reg_attributes[MacAddress].reg, base_mac_address));
 		if (EQUAL_ADDRESSES(base_mac_address, radio->mac_address))
-			sys_address[0] = sys_address[1] = sys_address[2] = 0x00;
+			memset(radio_params.sys_address, 0x00, 3);
 		else
-			COPY3(sys_address, radio->mac_address);
-		TRY(dnt900_get_remote_register(local, sys_address, &dnt900_reg_attributes[DeviceMode].reg, &device_mode));
+			COPY3(radio_params.sys_address, radio->mac_address);
 	}
 	spin_lock_irqsave(&radio->param_lock, flags);
-	radio->params.is_base = device_mode == DEVICE_MODE_BASE;
-	COPY3(radio->params.sys_address, sys_address);
+	radio->params = radio_params;
 	spin_unlock_irqrestore(&radio->param_lock, flags);
 	return 0;
 }
