@@ -146,6 +146,8 @@
 
 #define LINK_STATUS_READY (0x04)
 
+#define MAX_NETWORK_ID (0x3F)
+
 #define ATTR_R  (S_IRUGO)
 #define ATTR_W  (S_IWUSR)
 #define ATTR_RW (S_IRUGO | S_IWUSR)
@@ -249,12 +251,16 @@ struct dnt900_local_params {
 	unsigned char slot_size;
 	unsigned char link_status;
 	unsigned char base_mac_address[3];
+	unsigned char base_mode_net_id;
 };
 
 struct dnt900_local;
 
 struct dnt900_radio_params {
 	unsigned char sys_address[3];
+	unsigned char device_mode;
+	unsigned char curr_nwk_id;
+	unsigned char base_mode_net_id;
 };
 
 struct dnt900_radio;
@@ -283,6 +289,12 @@ struct dnt900_reg_attribute {
 	int (*parse)(const char *buf, size_t count, unsigned char *value);
 	void (*work)(struct work_struct *);
 	void (*local_work)(struct work_struct *);
+};
+
+struct dnt900_matcher {
+	void *data;
+	int (*match)(struct device *, void *);
+	int (*action)(struct dnt900_radio *);
 };
 
 static int dnt900_print_bytes(int bytes, const unsigned char *value, char *buf, size_t size);
@@ -345,12 +357,17 @@ static int dnt900_unregister_radio(struct device *dev, void *unused);
 static int dnt900_radio_matches_sys_address(struct device *dev, void *data);
 static int dnt900_radio_matches_mac_address(struct device *dev, void *data);
 static int dnt900_radio_is_local(struct device *dev, void *data);
+static int dnt900_radio_matches_net_id(struct device *dev, void *data);
+static int dnt900_radio_routes_net_id(struct device *dev, void *data);
+static int dnt900_radio_in_subnet(struct dnt900_radio *radio, void *data);
 
 static bool dnt900_radio_exists(struct dnt900_local *local, const unsigned char *mac_address);
 static int dnt900_dispatch_to_radio(struct dnt900_local *local, void *finder_data, int (*finder)(struct device *, void *), void *action_data, int (*action)(struct dnt900_radio *, void *));
 static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *finder_data, int (*finder)(struct device *, void *), int (*action)(struct dnt900_radio *));
 static int dnt900_apply_to_radio(struct device *dev, void *data);
 static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(struct dnt900_radio *));
+static int dnt900_apply_to_matching(struct device *dev, void *data);
+static void dnt900_for_matching_radios(struct dnt900_radio *radio, void *data, int (*match)(struct device *, void *), int (*action)(struct dnt900_radio *));
 
 static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet);
 static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsigned char *packet, unsigned char *result);
@@ -358,6 +375,7 @@ static int dnt900_clear_packets(struct dnt900_local *local);
 
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio);
 static int dnt900_radio_hangup_tty(struct dnt900_radio *radio);
+static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio);
 
 static int dnt900_radio_drain_fifo(struct dnt900_radio *radio);
 static void dnt900_local_drain_fifo(struct dnt900_local *local);
@@ -1411,12 +1429,25 @@ static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *a
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
-	struct dnt900_radio_params params;
+	struct dnt900_radio_params radio_params;
+	struct dnt900_local_params local_params;
 	PACKET(packet, COMMAND_REMOTE_LEAVE, 0, 0, 0, 0, 0);
 
+	dnt900_local_read_params(local, &local_params);
+	switch(local_params.device_mode) {
+	case DEVICE_MODE_BASE:
+		if (!radio->is_local)
+			break;
+		return -EPERM;
+	case DEVICE_MODE_ROUTER:
+		if (dnt900_radio_in_subnet(radio, &local_params.base_mode_net_id))
+			break;
+	default:
+		return -EPERM;
+	}
 	TRY(dnt900_parse_bytes(2, buf, count, packet + 6));
-	dnt900_radio_read_params(radio, &params);
-	COPY3(packet + 3, params.sys_address);
+	dnt900_radio_read_params(radio, &radio_params);
+	COPY3(packet + 3, radio_params.sys_address);
 	TRY(dnt900_send_packet(local, packet));
 	return count;
 }
@@ -1433,6 +1464,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	TRY(dnt900_get_register(local, REG(TreeRoutingEn), &local_params.tree_routing_en));
 	TRY(dnt900_get_register(local, REG(DeviceMode), &local_params.device_mode));
 	TRY(dnt900_get_register(local, REG(local_params.device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize), &local_params.slot_size));
+	TRY(dnt900_get_register(local, REG(BaseModeNetID), &local_params.base_mode_net_id));
 	TRY(dnt900_get_register(local, REG(AccessMode), &access_mode));
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
@@ -1473,6 +1505,15 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 		memset(radio_params.sys_address, 0x00, 3);
 	else
 		COPY3(radio_params.sys_address, radio->mac_address);
+	if (radio->is_local) {
+		TRY(dnt900_get_register(local, REG(CurrNwkID), &radio_params.curr_nwk_id));
+		TRY(dnt900_get_register(local, REG(DeviceMode), &radio_params.device_mode));
+		TRY(dnt900_get_register(local, REG(BaseModeNetID), &radio_params.base_mode_net_id));
+	} else {
+		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(CurrNwkID), &radio_params.curr_nwk_id));
+		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(DeviceMode), &radio_params.device_mode));
+		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(BaseModeNetID), &radio_params.base_mode_net_id));
+	}
 	spin_lock_irqsave(&radio->param_lock, flags);
 	radio->params = radio_params;
 	spin_unlock_irqrestore(&radio->param_lock, flags);
@@ -1615,6 +1656,39 @@ static int dnt900_radio_is_local(struct device *dev, void *data)
 	return radio->is_local;
 }
 
+static int dnt900_radio_matches_net_id(struct device *dev, void *data)
+{
+	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	struct dnt900_radio_params params;
+	unsigned char *net_id = data;
+
+	dnt900_radio_read_params(radio, &params);
+	return *net_id <= MAX_NETWORK_ID && params.curr_nwk_id == *net_id;
+}
+
+static int dnt900_radio_routes_net_id(struct device *dev, void *data)
+{
+	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	struct dnt900_radio_params params;
+	unsigned char *net_id = data;
+
+	dnt900_radio_read_params(radio, &params);
+	return *net_id <= MAX_NETWORK_ID && params.device_mode == DEVICE_MODE_ROUTER && params.base_mode_net_id == *net_id;
+}
+
+static int dnt900_radio_in_subnet(struct dnt900_radio *radio, void *data)
+{
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_radio_params radio_params;
+
+	if (dnt900_radio_matches_net_id(&radio->dev, data))
+		return true;
+	dnt900_radio_read_params(radio, &radio_params);
+	if (radio_params.curr_nwk_id == 0x00)
+		return false;
+	return dnt900_dispatch_to_radio(local, &radio_params.curr_nwk_id, dnt900_radio_routes_net_id, data, dnt900_radio_in_subnet) > 0;
+}
+
 static bool dnt900_radio_exists(struct dnt900_local *local, const unsigned char *mac_address)
 {
 	return device_for_each_child(&local->dev, (void *)mac_address, dnt900_radio_matches_mac_address);
@@ -1658,6 +1732,24 @@ static int dnt900_apply_to_radio(struct device *dev, void *data)
 static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(struct dnt900_radio *))
 {
 	device_for_each_child(&local->dev, action, dnt900_apply_to_radio);
+}
+
+static int dnt900_apply_to_matching(struct device *dev, void *data)
+{
+	struct dnt900_matcher *matcher = data;
+	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+
+	if (matcher->match(dev, matcher->data))
+		matcher->action(radio);
+	return 0;
+}
+
+static void dnt900_for_matching_radios(struct dnt900_radio *radio, void *data, int (*match)(struct device *, void *), int (*action)(struct dnt900_radio *))
+{
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	struct dnt900_matcher matcher = { .data = data, .match = match, .action = action };
+
+	device_for_each_child(&local->dev, &matcher, dnt900_apply_to_matching);
 }
 
 static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *packet)
@@ -1737,6 +1829,17 @@ static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
 		tty_hangup(tty);
 		tty_kref_put(tty);
 	}
+	return 0;
+}
+
+static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio)
+{
+	struct dnt900_radio_params params;
+
+	dnt900_radio_read_params(radio, &params);
+	dnt900_radio_hangup_tty(radio);
+	if (params.device_mode == DEVICE_MODE_ROUTER && params.base_mode_net_id > 0x00)
+		dnt900_for_matching_radios(radio, &params.base_mode_net_id, dnt900_radio_matches_net_id, dnt900_radio_hangup_ttys);
 	return 0;
 }
 
@@ -2157,7 +2260,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_schedule_work(local, annc + 1, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
-		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_tty);
+		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_ttys);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		sys_address[0] = annc[4];
@@ -2603,6 +2706,10 @@ MODULE_VERSION("0.3");
 //MODULE_ALIAS_LDISC(N_DNT900);
 
 // Future work:
+// 
+// TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
+// TODO: on ANNOUNCEMENT_HEARTBEAT, compare sys_address and refresh radio if different
+// TODO: add work task for MemorySave (and remove for some other attributes)
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
