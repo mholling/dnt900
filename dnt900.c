@@ -1437,6 +1437,7 @@ static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *a
 	dnt900_radio_read_params(radio, &radio_params);
 	COPY3(packet + 3, radio_params.sys_address);
 	TRY(dnt900_send_packet(local, packet));
+	dnt900_radio_hangup_ttys(radio);
 	return count;
 }
 
@@ -2434,7 +2435,7 @@ static int dnt900_radio_check_heartbeat(struct dnt900_radio *radio, void *data)
 	if (changed) {
 		// TODO: this should be hangup_ttys, but with the old base_mode_net_id
 		dnt900_radio_hangup_tty(radio);
-		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio); // TODO: needed?
+		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio);
 	}
 	return 0;
 }
@@ -2719,7 +2720,8 @@ MODULE_VERSION("0.3");
 // Future work:
 // 
 // TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
-// TODO: hangup ttys when leave attribute is written
+// TODO: fix possible bug where module unload while tty open causes problems?
+// TODO: add and remove tty port according to whether link is up?
 // TODO: add work task for MemorySave (and remove for some other attributes)
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
