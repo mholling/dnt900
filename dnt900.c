@@ -328,7 +328,6 @@ static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_r
 static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, const unsigned char *value);
 static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_address, unsigned char *sys_address);
 
-static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data);
 static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params);
 static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_local_params *params);
 
@@ -410,6 +409,7 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 static int dnt900_process_argument_error(struct dnt900_local *local);
 static int dnt900_process_join_request(struct dnt900_local *local, unsigned char *request);
 static int dnt900_radio_report_rssi(struct dnt900_radio *radio, void *data);
+static int dnt900_radio_check_heartbeat(struct dnt900_radio *radio, void *data);
 static int dnt900_radio_out(struct dnt900_radio *radio, void *data);
 
 static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char *address, void (*work_function)(struct work_struct *));
@@ -1269,17 +1269,6 @@ static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_
 
 	err = dnt900_send_packet_get_result(local, packet, sys_address);
 	return err == -EAGAIN ? -ENODEV : err;
-}
-
-static int dnt900_set_sys_address(struct dnt900_radio *radio, void *data)
-{
-	const unsigned char *sys_address = data;
-	unsigned long flags;
-
-	spin_lock_irqsave(&radio->param_lock, flags);
-	COPY3(radio->params.sys_address, sys_address);
-	spin_unlock_irqrestore(&radio->param_lock, flags);
-	return 0;
 }
 
 static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params)
@@ -2239,7 +2228,6 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc)
 {
 	unsigned long updates = BIT(announce);
-	unsigned char sys_address[3];
 	unsigned long flags;
 	int n, err;
 
@@ -2263,10 +2251,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_ttys);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
-		sys_address[0] = annc[4];
-		sys_address[1] = annc[5];
-		sys_address[2] = 0xFF;
-		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, sys_address, dnt900_set_sys_address);
+		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_check_heartbeat);
 		if (err == -ENODEV)
 			dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 		break;
@@ -2414,6 +2399,33 @@ static int dnt900_radio_report_rssi(struct dnt900_radio *radio, void *data)
 		PRINT_RSSI(radio->attributes[rssi], *value);
 		spin_unlock_irqrestore(&radio->attributes_lock, flags);
 		sysfs_notify(&radio->dev.kobj, NULL, dnt900_radio_attributes[rssi].attr.name);
+	}
+	return 0;
+}
+
+static int dnt900_radio_check_heartbeat(struct dnt900_radio *radio, void *data)
+{
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
+	const unsigned char *annc = data;
+	unsigned long flags;
+	bool changed = false;
+
+	spin_lock_irqsave(&radio->param_lock, flags);
+	changed = radio->params.sys_address[0] != annc[4] || radio->params.sys_address[1] != annc[5] || radio->params.curr_nwk_id != annc[6];
+	if (radio->params.sys_address[0] != annc[4]) {
+		radio->params.device_mode = annc[4] == 0x00 ? DEVICE_MODE_ROUTER : DEVICE_MODE_REMOTE;
+		if (annc[4] == 0x00)
+			radio->params.base_mode_net_id = annc[5];
+	}
+	radio->params.sys_address[0] = annc[4];
+	radio->params.sys_address[1] = annc[5];
+	radio->params.curr_nwk_id = annc[6];
+	spin_unlock_irqrestore(&radio->param_lock, flags);
+
+	if (changed) {
+		// TODO: this should be hangup_ttys, but with the old base_mode_net_id
+		dnt900_radio_hangup_tty(radio);
+		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio); // TODO: needed?
 	}
 	return 0;
 }
@@ -2710,6 +2722,9 @@ MODULE_VERSION("0.3");
 // TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
 // TODO: on ANNOUNCEMENT_HEARTBEAT, compare sys_address and refresh radio if different
 // TODO: add work task for MemorySave (and remove for some other attributes)
+// TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
+// TODO: hangup subnet ttys on ANNOUNCEMENT_HEARTBEAT_TIMEOUT?
+// TODO: refactor dnt900_process_reply & dnt900_radio_process_reply
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
