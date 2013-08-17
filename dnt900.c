@@ -414,7 +414,6 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data);
 
 static void dnt900_schedule_work(struct dnt900_local *local, const unsigned char *address, void (*work_function)(struct work_struct *));
 static void dnt900_add_new_mac_address(struct work_struct *ws);
-static void dnt900_add_or_refresh_mac_address(struct work_struct *ws);
 static void dnt900_add_new_sys_address(struct work_struct *ws);
 static void dnt900_refresh_radio(struct work_struct *ws);
 static void dnt900_refresh_local(struct work_struct *ws);
@@ -2229,7 +2228,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 {
 	unsigned long updates = BIT(announce);
 	unsigned long flags;
-	int n, err;
+	int n, err = 0;
 
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
@@ -2238,22 +2237,10 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		break;
 	case ANNOUNCEMENT_JOINED:
 		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
-		dnt900_schedule_work(local, annc + 2, dnt900_add_or_refresh_mac_address);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
 		dnt900_for_each_radio(local, dnt900_radio_hangup_tty);
-		break;
-	case ANNOUNCEMENT_REMOTE_JOINED:
-		dnt900_schedule_work(local, annc + 1, dnt900_add_or_refresh_mac_address);
-		break;
-	case ANNOUNCEMENT_REMOTE_EXITED:
-		dnt900_dispatch_to_radio_no_data(local, annc + 1, dnt900_radio_matches_mac_address, dnt900_radio_hangup_ttys);
-		break;
-	case ANNOUNCEMENT_HEARTBEAT:
-		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_check_heartbeat);
-		if (err == -ENODEV)
-			dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 		break;
 	case ERROR_PROTOCOL_ARGUMENT:
 		dnt900_process_argument_error(local);
@@ -2306,24 +2293,42 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 			sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[n].attr.name);
 
 	switch (annc[0]) {
+	case ANNOUNCEMENT_JOINED:
+		err = dnt900_dispatch_to_radio(local, annc + 2, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
+		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
-	case ANNOUNCEMENT_REMOTE_EXITED:
 	case ANNOUNCEMENT_HEARTBEAT:
+		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
+		break;
+	case ANNOUNCEMENT_REMOTE_EXITED:
 		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
 		break;
-	case ANNOUNCEMENT_JOINED:
-		dnt900_dispatch_to_radio(local, annc + 2, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
-		break;
 	}
+	if (err == -ENODEV)
+		dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 	return 0;
 }
 
 static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *data)
 {
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	unsigned char *annc = data;
 	unsigned long updates;
 	unsigned long flags;
 	int n;
+
+	switch (annc[0]) {
+	case ANNOUNCEMENT_JOINED:
+	case ANNOUNCEMENT_REMOTE_JOINED:
+		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio);
+		break;
+	case ANNOUNCEMENT_REMOTE_EXITED:
+		dnt900_radio_hangup_ttys(radio);
+		break;
+	case ANNOUNCEMENT_HEARTBEAT:
+		dnt900_radio_check_heartbeat(radio, annc);
+		break;
+	}
 
 	spin_lock_irqsave(&radio->attributes_lock, flags);
 	switch (annc[0]) {
@@ -2467,16 +2472,6 @@ static void dnt900_add_new_mac_address(struct work_struct *ws)
 	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
 
 	dnt900_add_radio(work->local, work->address);
-	kfree(work);
-}
-
-static void dnt900_add_or_refresh_mac_address(struct work_struct *ws)
-{
-	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
-
-	int err = dnt900_dispatch_to_radio_no_data(work->local, work->address, dnt900_radio_matches_mac_address, dnt900_radio_get_params);
-	if (err == -ENODEV)
-		dnt900_add_radio(work->local, work->address);
 	kfree(work);
 }
 
@@ -2724,7 +2719,6 @@ MODULE_VERSION("0.3");
 // TODO: add work task for MemorySave (and remove for some other attributes)
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
 // TODO: hangup subnet ttys on ANNOUNCEMENT_HEARTBEAT_TIMEOUT?
-// TODO: refactor dnt900_process_reply & dnt900_radio_process_reply
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
