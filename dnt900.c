@@ -2303,6 +2303,9 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
 		break;
+	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
+		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_routes_net_id, annc, dnt900_radio_process_announcement);
+		break;
 	}
 	if (err == -ENODEV)
 		dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
@@ -2323,6 +2326,7 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
+	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		dnt900_radio_hangup_ttys(radio);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
@@ -2715,10 +2719,9 @@ MODULE_VERSION("0.3");
 // Future work:
 // 
 // TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
-// TODO: on ANNOUNCEMENT_HEARTBEAT, compare sys_address and refresh radio if different
+// TODO: hangup ttys when leave attribute is written
 // TODO: add work task for MemorySave (and remove for some other attributes)
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
-// TODO: hangup subnet ttys on ANNOUNCEMENT_HEARTBEAT_TIMEOUT?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
