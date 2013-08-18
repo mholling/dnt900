@@ -530,4 +530,5 @@ Release History
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
-  * HEAD: added remote leave attribute; hangup routed radio ttys in tree-routing networks when heartbeat times out or router exits.
+  * HEAD: added remote leave attribute; hangup routed radio ttys in tree-routing networks when router times out or exits; fixed bug whereby kernel could hang on module unload if radio tty still open.
+.

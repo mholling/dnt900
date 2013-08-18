@@ -1543,6 +1543,7 @@ static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, cons
 	UNWIND(err, dnt900_radio_get_params(radio), fail_params);
 	UNWIND(err, kobject_set_name(&radio->dev.kobj, radio->name), fail_name);
 	UNWIND(err, device_register(&radio->dev), fail_register);
+	get_device(&local->dev);
 	return radio;
 
 fail_register:
@@ -1556,7 +1557,9 @@ fail_alloc:
 static void dnt900_release_radio(struct device *dev)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
+	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 
+	put_device(&local->dev);
 	kfree(radio);
 }
 
@@ -2720,10 +2723,11 @@ MODULE_VERSION("0.3");
 // Future work:
 // 
 // TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
-// TODO: fix possible bug where module unload while tty open causes problems?
 // TODO: add and remove tty port according to whether link is up?
 // TODO: add work task for MemorySave (and remove for some other attributes)
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
+// TODO: `linked` and `parent` attributes can be updated elsewhere?
+// 
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
