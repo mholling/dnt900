@@ -2230,7 +2230,7 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 
 static int dnt900_process_announcement(struct dnt900_local *local, unsigned char *annc)
 {
-	unsigned long updates = BIT(announce);
+	unsigned long updates = 0;
 	unsigned long flags;
 	int n, err = 0;
 
@@ -2253,31 +2253,37 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	switch (annc[0]) {
 	case ANNOUNCEMENT_STARTED:
 		dnt900_print_hex(1, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ANNOUNCEMENT_JOINED:
 		dnt900_print_hex(6, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
 		dnt900_print_bytes(3, annc + 2, local->attributes[parent], ARRAY_SIZE(*local->attributes));
-		updates |= BIT(parent);
+		updates = BIT(announce) | BIT(parent);
 		break;
 	case ANNOUNCEMENT_EXITED:
 		dnt900_print_hex(2, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
 		local->attributes[parent][0] = 0;
-		updates |= BIT(parent);
+		updates = BIT(announce) | BIT(parent);
 		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		dnt900_print_hex(6, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
 		dnt900_print_hex(4, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ANNOUNCEMENT_BASE_REBOOTED:
 		dnt900_print_hex(1, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT:
 		dnt900_print_hex(11, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
 		dnt900_print_hex(2, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
+		updates = BIT(announce);
 		break;
 	case ERROR_UART_OVERFLOW:
 	case ERROR_UART_OVERRUN:
@@ -2285,7 +2291,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	case ERROR_HARDWARE:
 		dnt900_print_hex(1, annc, local->attributes[announce], ARRAY_SIZE(*local->attributes));
 		dnt900_print_hex(1, annc, local->attributes[error], ARRAY_SIZE(*local->attributes));
-		updates |= BIT(error);
+		updates = BIT(announce) | BIT(error);
 		break;
 	}
 	spin_unlock_irqrestore(&local->attributes_lock, flags);
@@ -2716,7 +2722,6 @@ MODULE_VERSION("0.3");
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
 // TODO: `linked`, `parent`, `parent` attributes can be updated elsewhere?
 // TODO: hangup ttys when UcReset attribute is written?
-// TODO: fix extra [announce] notifications on ERROR_*
 // 
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
