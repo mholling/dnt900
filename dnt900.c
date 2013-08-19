@@ -993,8 +993,8 @@ struct dnt900_radio {
 	unsigned char mac_address[3];
 	struct dnt900_radio_params params;
 	char name[80];
-	unsigned int tty_index;
 	struct tty_port port;
+	struct device *tty_dev;
 	DECLARE_KFIFO(fifo, unsigned char, TTY_BUFFER_SIZE);
 	unsigned char attributes[ARRAY_SIZE(dnt900_radio_attributes)][8];
 };
@@ -1525,6 +1525,31 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 	return 0;
 }
 
+static int dnt900_radio_register_tty(struct dnt900_radio *radio)
+{
+	unsigned int index;
+	struct device *tty_dev;
+
+	for (index = 0; dnt900_tty_indices[index]; ++index)
+		if (index >= radios)
+			return -EMLINK;
+	tty_dev = tty_register_device(dnt900_tty_driver, index, &radio->dev);
+	TRY(IS_ERR(tty_dev) ? PTR_ERR(tty_dev) : 0);
+	dnt900_tty_indices[index] = true;
+	radio->tty_dev = tty_dev;
+	return 0;
+}
+
+static void dnt900_radio_unregister_tty(struct dnt900_radio *radio)
+{
+	if (radio->tty_dev) {
+		int index = radio->tty_dev->devt - MKDEV(dnt900_tty_driver->major, dnt900_tty_driver->minor_start);
+
+		tty_unregister_device(dnt900_tty_driver, index);
+		dnt900_tty_indices[index] = false;
+	}
+}
+
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address)
 {
 	int err;
@@ -1572,27 +1597,19 @@ static int dnt900_add_radio(struct dnt900_local *local, const unsigned char *mac
 	UNWIND(err, dnt900_radio_exists(local, mac_address) ? -EEXIST : 0, fail_exists);
 	radio = dnt900_create_radio(local, mac_address);
 	UNWIND(err, IS_ERR(radio) ? PTR_ERR(radio) : 0, fail_create);
+	INIT_KFIFO(radio->fifo);
 	tty_port_init(&radio->port);
 	radio->port.ops = &dnt900_tty_port_ops;
 	UNWIND(err, dnt900_radio_add_attributes(radio), fail_attributes);
 	if (radio->is_local)
 		UNWIND(err, sysfs_create_link(&local->dev.kobj, &radio->dev.kobj, LOCAL_SYMLINK_NAME), fail_symlink);
-	else {
-		struct device *tty_dev;
-		for (radio->tty_index = 0; radio->tty_index < radios && dnt900_tty_indices[radio->tty_index]; ++radio->tty_index)
-			;
-		UNWIND(err, radio->tty_index < radios ? 0 : -EMLINK, fail_index);
-		dnt900_tty_indices[radio->tty_index] = true;
-		tty_dev = tty_register_device(dnt900_tty_driver, radio->tty_index, &radio->dev);
-		UNWIND(err, IS_ERR(tty_dev) ? PTR_ERR(tty_dev) : 0, fail_tty);
-	}
-	INIT_KFIFO(radio->fifo);
+	else
+		UNWIND(err, dnt900_radio_register_tty(radio), fail_tty);
 	dnt900_schedule_work(local, mac_address, dnt900_map_remotes);
 	pr_info(LDISC_NAME ": added new radio %s\n", radio->name);
 	goto success;
 
 fail_tty:
-fail_index:
 fail_symlink:
 fail_attributes:
 	tty_port_put(&radio->port);
@@ -1613,10 +1630,8 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 	TRY(mutex_lock_interruptible(&local->radios_lock));
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, LOCAL_SYMLINK_NAME);
-	else {
-		tty_unregister_device(dnt900_tty_driver, radio->tty_index);
-		dnt900_tty_indices[radio->tty_index] = false;
-	}
+	else
+		dnt900_radio_unregister_tty(radio);
 	tty_port_put(&radio->port);
 	device_unregister(dev);
 	mutex_unlock(&local->radios_lock);
@@ -2724,6 +2739,7 @@ MODULE_VERSION("0.3");
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: hangup ttys when UcReset attribute is written?
 // 
+// TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
