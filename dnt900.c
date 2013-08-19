@@ -379,6 +379,7 @@ static void dnt900_local_drain_fifo(struct dnt900_local *local);
 
 static int dnt900_tty_port_activate(struct tty_port *port, struct tty_struct *tty);
 static void dnt900_tty_port_shutdown(struct tty_port *port);
+static void dnt900_tty_port_destruct(struct tty_port *port);
 
 static int dnt900_radio_write(struct dnt900_radio *radio, void *data);
 
@@ -1019,6 +1020,7 @@ static struct tty_ldisc_ops dnt900_ldisc_ops = {
 static struct tty_port_operations dnt900_tty_port_ops = {
 	.activate = dnt900_tty_port_activate,
 	.shutdown = dnt900_tty_port_shutdown,
+	.destruct = dnt900_tty_port_destruct,
 };
 
 static struct tty_operations dnt900_tty_ops = {
@@ -1593,6 +1595,7 @@ fail_tty:
 fail_index:
 fail_symlink:
 fail_attributes:
+	tty_port_put(&radio->port);
 	device_unregister(&radio->dev);
 fail_create:
 	pr_warn(LDISC_NAME ": unable to add radio with MAC address 0x%02X%02X%02X (error %d)\n", mac_address[2], mac_address[1], mac_address[0], -err);
@@ -1614,6 +1617,7 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 		tty_unregister_device(dnt900_tty_driver, radio->tty_index);
 		dnt900_tty_indices[radio->tty_index] = false;
 	}
+	tty_port_put(&radio->port);
 	device_unregister(dev);
 	mutex_unlock(&local->radios_lock);
 	return 0;
@@ -1892,6 +1896,7 @@ static int dnt900_tty_port_activate(struct tty_port *port, struct tty_struct *tt
 {
 	struct dnt900_radio *radio = PORT_TO_RADIO(port);
 
+	tty_port_get(&radio->port);
 	get_device(&radio->dev);
 	return 0;
 }
@@ -1900,7 +1905,13 @@ static void dnt900_tty_port_shutdown(struct tty_port *port)
 {
 	struct dnt900_radio *radio = PORT_TO_RADIO(port);
 
+	tty_port_put(&radio->port);
 	put_device(&radio->dev);
+}
+
+static void dnt900_tty_port_destruct(struct tty_port *port)
+{
+	// do nothing
 }
 
 static int dnt900_radio_write(struct dnt900_radio *radio, void *data)
