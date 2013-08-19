@@ -484,7 +484,6 @@ enum {
 	beacon_rssi,
 	parent_rssi,
 	rssi,
-	linked,
 };
 
 static const struct device_attribute dnt900_radio_attributes[] = {
@@ -503,7 +502,6 @@ static const struct device_attribute dnt900_radio_attributes[] = {
 	__ATTR(beacon_rssi,       ATTR_R, dnt900_show_radio_attr, NULL),
 	__ATTR(parent_rssi,       ATTR_R, dnt900_show_radio_attr, NULL),
 	__ATTR(rssi,              ATTR_R, dnt900_show_radio_attr, NULL),
-	__ATTR(linked,            ATTR_R, dnt900_show_radio_attr, NULL),
 };
 
 enum {
@@ -2324,13 +2322,13 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	unsigned char *annc = data;
-	unsigned long updates;
+	unsigned long updates = 0;
 	unsigned long flags;
 	int n;
 
 	switch (annc[0]) {
-	case ANNOUNCEMENT_JOINED:
 	case ANNOUNCEMENT_REMOTE_JOINED:
+	case ANNOUNCEMENT_JOINED:
 		dnt900_schedule_work(local, radio->mac_address, dnt900_refresh_radio);
 		break;
 	case ANNOUNCEMENT_REMOTE_EXITED:
@@ -2352,17 +2350,9 @@ static int dnt900_radio_process_announcement(struct dnt900_radio *radio, void *d
 		updates = BIT(range) | BIT(success_rate) | BIT(beacon_rssi) | BIT(parent_rssi);
 		break;
 	case ANNOUNCEMENT_JOINED:
-		PRINT_RANGE(radio->attributes[range], annc[5]);
-		updates = BIT(range);
-		break;
 	case ANNOUNCEMENT_REMOTE_JOINED:
 		PRINT_RANGE(radio->attributes[range], annc[5]);
-		scnprintf(radio->attributes[linked], ARRAY_SIZE(*radio->attributes), "1\n");
-		updates = BIT(range) | BIT(linked);
-		break;
-	case ANNOUNCEMENT_REMOTE_EXITED:
-		scnprintf(radio->attributes[linked], ARRAY_SIZE(*radio->attributes), "0\n");
-		updates = BIT(linked);
+		updates = BIT(range);
 		break;
 	}
 	spin_unlock_irqrestore(&radio->attributes_lock, flags);
@@ -2720,7 +2710,7 @@ MODULE_VERSION("0.3");
 // TODO: refresh entire subnet when ANNOUNCEMENT_REMOTE_JOINED?
 // TODO: add and remove tty port according to whether link is up?
 // TODO: hangup tty when TxStatus = 0x03 received in TxDataReply?
-// TODO: `linked`, `parent`, `parent` attributes can be updated elsewhere?
+// TODO: `parent` attributes can be updated elsewhere?
 // TODO: hangup ttys when UcReset attribute is written?
 // 
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
@@ -2730,5 +2720,4 @@ MODULE_VERSION("0.3");
 // TODO: Would like to issue ExitProtocolMode command when the line discipline is detached.
 //       However we can't do this as the tty is not available for use in dnt900_ldisc_close.
 // TODO: hangup ttys on ANNOUNCEMENT_BASE_REBOOTED event?
-// TODO: remove 'linked' attribute?
 // TODO: add writeable 'remap' attribute to force remap of entire network
