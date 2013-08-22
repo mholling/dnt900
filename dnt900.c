@@ -350,6 +350,7 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio);
 
 static int dnt900_radio_register_tty(struct dnt900_radio *radio);
 static int dnt900_radio_unregister_tty(struct dnt900_radio *radio);
+static int dnt900_radio_unregister_tty_unconditional(struct dnt900_radio *radio);
 
 static int dnt900_radio_unregister_ttys(struct dnt900_radio *radio);
 static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio);
@@ -444,6 +445,7 @@ static int dnt900_ldisc_hangup(struct tty_struct *tty);
 static int n_dnt900 = N_DNT900;
 static int radios = 255;
 static int gpio_cts = -1;
+static bool static_ttys = false;
 
 module_param(radios, int, S_IRUGO);
 MODULE_PARM_DESC(radios, "maximum number of radios");
@@ -451,6 +453,8 @@ module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
+module_param(static_ttys, bool, S_IRUGO);
+MODULE_PARM_DESC(static_ttys, "keep remote radio TTY device when unlinked");
 
 static const struct device_attribute dnt900_local_command_attributes[] = {
 	__ATTR(reset,       ATTR_W, NULL, dnt900_store_reset),
@@ -1563,6 +1567,12 @@ static int dnt900_radio_register_tty(struct dnt900_radio *radio)
 
 static int dnt900_radio_unregister_tty(struct dnt900_radio *radio)
 {
+	return static_ttys ? 0 : dnt900_radio_unregister_tty_unconditional(radio);
+}
+
+
+static int dnt900_radio_unregister_tty_unconditional(struct dnt900_radio *radio)
+{
 	TRY(mutex_lock_interruptible(&radio->tty_lock));
 	if (radio->tty_dev) {
 		dnt900_radio_hangup_tty(radio);
@@ -1704,7 +1714,7 @@ static int dnt900_unregister_radio(struct device *dev, void *unused)
 	if (radio->is_local)
 		sysfs_remove_link(&radio->dev.kobj, LOCAL_SYMLINK_NAME);
 	else
-		dnt900_radio_unregister_tty(radio);
+		dnt900_radio_unregister_tty_unconditional(radio);
 	tty_port_put(&radio->port);
 	device_unregister(dev);
 	mutex_unlock(&local->radios_lock);
@@ -2808,7 +2818,6 @@ MODULE_VERSION("0.3");
 // TODO: `parent` attributes can be updated elsewhere? needed at all?
 // TODO: hangup ttys when UcReset attribute is written? or in dnt900_store_reset?
 // TODO: remap network after ANNOUNCEMENT_JOINED?
-// TODO: have dynamic TTYs be optional via module parameter
 // TODO: how to reinstate TTYs when running on a router?
 // TODO: register TTYs if RxData received?
 // 
