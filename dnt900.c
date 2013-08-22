@@ -2320,7 +2320,7 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 	unsigned long flags;
 	int n;
 
-	// TODO: dnt900_radio_register_tty(radio);
+	dnt900_radio_register_tty(radio);
 	spin_lock_irqsave(&radio->attributes_lock, flags);
 	for (n = 0; n < 10; report += bytes[n], ++n)
 		dnt900_print_bytes(bytes[n], report, radio->attributes[report_GPIO0 + n], ARRAY_SIZE(*radio->attributes));
@@ -2549,7 +2549,7 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 	unsigned int len = response[1] - 5;
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
 
-	// TODO: dnt900_radio_register_tty(radio);
+	dnt900_radio_register_tty(radio);
 	if (tty) {
 		while (len > 0) {
 			len -= tty_insert_flip_string(tty, response + 7, len);
@@ -2819,7 +2819,6 @@ MODULE_VERSION("0.3");
 // TODO: hangup ttys when UcReset attribute is written? or in dnt900_store_reset?
 // TODO: remap network after ANNOUNCEMENT_JOINED?
 // TODO: how to reinstate TTYs when running on a router?
-// TODO: register TTYs if RxData received?
 // 
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
