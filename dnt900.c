@@ -261,6 +261,7 @@ struct dnt900_radio_params {
 	unsigned char device_mode;
 	unsigned char curr_nwk_id;
 	unsigned char base_mode_net_id;
+	unsigned char enable_rt_acks;
 };
 
 struct dnt900_radio;
@@ -352,6 +353,7 @@ static int dnt900_radio_unregister_tty(struct dnt900_radio *radio);
 
 static int dnt900_radio_unregister_ttys(struct dnt900_radio *radio);
 static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio);
+static int dnt900_radio_check_nack(struct dnt900_radio *radio);
 
 static struct dnt900_radio *dnt900_create_radio(struct dnt900_local *local, const unsigned char *mac_address);
 static void dnt900_release_radio(struct device *dev);
@@ -1358,6 +1360,11 @@ static ssize_t dnt900_store_reg(struct device *dev, struct device_attribute *att
 			spin_unlock_irqrestore(&local->param_lock, flags);
 		}
 	}
+	if (attr == &dnt900_reg_attributes[EnableRtAcks].attr) {
+		spin_lock_irqsave(&radio->param_lock, flags);
+		radio->params.enable_rt_acks = *value;
+		spin_unlock_irqrestore(&radio->param_lock, flags);
+	}
 	return count;
 }
 
@@ -1515,10 +1522,12 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 		TRY(dnt900_get_register(local, REG(CurrNwkID), &radio_params.curr_nwk_id));
 		TRY(dnt900_get_register(local, REG(DeviceMode), &radio_params.device_mode));
 		TRY(dnt900_get_register(local, REG(BaseModeNetID), &radio_params.base_mode_net_id));
+		TRY(dnt900_get_register(local, REG(EnableRtAcks), &radio_params.enable_rt_acks));
 	} else {
 		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(CurrNwkID), &radio_params.curr_nwk_id));
 		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(DeviceMode), &radio_params.device_mode));
 		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(BaseModeNetID), &radio_params.base_mode_net_id));
+		TRY(dnt900_get_remote_register(local, radio_params.sys_address, REG(EnableRtAcks), &radio_params.enable_rt_acks));
 	}
 	dnt900_radio_write_params(radio, &radio_params);
 	return 0;
@@ -1585,6 +1594,16 @@ static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio)
 	dnt900_radio_hangup_tty(radio);
 	if (params.device_mode == DEVICE_MODE_ROUTER && params.base_mode_net_id > 0x00)
 		dnt900_for_matching_radios(local, &params.base_mode_net_id, dnt900_radio_matches_net_id, dnt900_radio_hangup_ttys);
+	return 0;
+}
+
+static int dnt900_radio_check_nack(struct dnt900_radio *radio)
+{
+	struct dnt900_radio_params params;
+
+	dnt900_radio_read_params(radio, &params);
+	if (params.enable_rt_acks)
+		dnt900_radio_unregister_ttys(radio);
 	return 0;
 }
 
@@ -2241,9 +2260,17 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 	switch (command) {
 	case COMMAND_GET_REMOTE_REGISTER:
 	case COMMAND_SET_REMOTE_REGISTER:
-	case COMMAND_TX_DATA:
+		if (response[3] == STATUS_NOT_ACKNOWLEDGED)
+			dnt900_dispatch_to_radio_no_data(local, response + 4, dnt900_radio_matches_sys_address, dnt900_radio_unregister_ttys);
 		if (response[3] == STATUS_ACKNOWLEDGED)
 			dnt900_dispatch_to_radio(local, response + 4, dnt900_radio_matches_sys_address, response + 7, dnt900_radio_report_rssi);
+		break;
+	case COMMAND_TX_DATA:
+		if (response[3] == STATUS_NOT_ACKNOWLEDGED)
+			dnt900_dispatch_to_radio_no_data(local, response + 4, dnt900_radio_matches_sys_address, dnt900_radio_check_nack);
+		if (response[3] == STATUS_ACKNOWLEDGED)
+			dnt900_dispatch_to_radio(local, response + 4, dnt900_radio_matches_sys_address, response + 7, dnt900_radio_report_rssi);
+		break;
 	}
 
 	return 0;
@@ -2283,6 +2310,7 @@ static int dnt900_process_rx_event(struct dnt900_radio *radio, void *data)
 	unsigned long flags;
 	int n;
 
+	// TODO: dnt900_radio_register_tty(radio);
 	spin_lock_irqsave(&radio->attributes_lock, flags);
 	for (n = 0; n < 10; report += bytes[n], ++n)
 		dnt900_print_bytes(bytes[n], report, radio->attributes[report_GPIO0 + n], ARRAY_SIZE(*radio->attributes));
@@ -2511,6 +2539,7 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 	unsigned int len = response[1] - 5;
 	struct tty_struct *tty = tty_port_tty_get(&radio->port);
 
+	// TODO: dnt900_radio_register_tty(radio);
 	if (tty) {
 		while (len > 0) {
 			len -= tty_insert_flip_string(tty, response + 7, len);
@@ -2776,12 +2805,12 @@ MODULE_VERSION("0.3");
 
 // Future work:
 // 
-// TODO: unregister ttys when TxStatus = 0x03 received in TxDataReply/GetRemoteRegisterReply/SetRemoteRegisterReply?
 // TODO: `parent` attributes can be updated elsewhere? needed at all?
 // TODO: hangup ttys when UcReset attribute is written? or in dnt900_store_reset?
 // TODO: remap network after ANNOUNCEMENT_JOINED?
 // TODO: have dynamic TTYs be optional via module parameter
 // TODO: how to reinstate TTYs when running on a router?
+// TODO: register TTYs if RxData received?
 // 
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
