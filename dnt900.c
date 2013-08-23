@@ -342,6 +342,7 @@ static ssize_t dnt900_show_local_attr(struct device *dev, struct device_attribut
 static ssize_t dnt900_show_radio_attr(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t dnt900_store_join_permit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t dnt900_store_remap(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static int dnt900_local_get_params(struct dnt900_local *local);
@@ -427,6 +428,7 @@ static void dnt900_refresh_radio(struct work_struct *ws);
 static void dnt900_refresh_local(struct work_struct *ws);
 static void dnt900_init_local(struct work_struct *ws);
 static void dnt900_map_remotes(struct work_struct *ws);
+static void dnt900_map_all_remotes(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
 
@@ -461,6 +463,7 @@ static const struct device_attribute dnt900_local_command_attributes[] = {
 	__ATTR(discover,    ATTR_W, NULL, dnt900_store_discover),
 	__ATTR(join_permit, ATTR_W, NULL, dnt900_store_join_permit),
 	__ATTR(join_deny,   ATTR_W, NULL, dnt900_store_join_deny),
+	__ATTR(remap,       ATTR_W, NULL, dnt900_store_remap),
 };
 
 static const struct device_attribute dnt900_radio_command_attributes[] = {
@@ -1442,6 +1445,14 @@ static ssize_t dnt900_store_join_deny(struct device *dev, struct device_attribut
 	return count;
 }
 
+static ssize_t dnt900_store_remap(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dnt900_local *local = DEV_TO_LOCAL(dev);
+
+	dnt900_schedule_work(local, NULL, dnt900_map_all_remotes);
+	return count;
+}
+
 static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
@@ -1541,14 +1552,17 @@ static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	unsigned char mac_addresses[15 * 26];
-	int n;
+	int n, err;
 
 	for (n = 0; n < 26; ++n)
 		TRY(dnt900_radio_get_register(radio, REG(RegMACAddr00 + n), mac_addresses + 15 * n));
 	for (n = 0; n < 26 * 5; ++n) {
 		unsigned char *mac_address = mac_addresses + 3 * n;
-		if (mac_address[0] || mac_address[1] || mac_address[2])
-			dnt900_add_radio(local, mac_address);
+		if (mac_address[0] || mac_address[1] || mac_address[2]) {
+			err = dnt900_dispatch_to_radio_no_data(local, mac_address, dnt900_radio_matches_mac_address, dnt900_radio_map_remotes);
+			if (err == -ENODEV)
+				dnt900_schedule_work(local, mac_address, dnt900_add_new_mac_address);
+		}
 	}
 	return 0;
 }
@@ -2642,6 +2656,16 @@ static void dnt900_map_remotes(struct work_struct *ws)
 	kfree(work);
 }
 
+static void dnt900_map_all_remotes(struct work_struct *ws)
+{
+	struct dnt900_work *work = container_of(ws, struct dnt900_work, ws);
+	struct dnt900_local_params params;
+
+	dnt900_local_read_params(work->local, &params);
+	dnt900_dispatch_to_radio_no_data(work->local, params.base_mac_address, dnt900_radio_matches_mac_address, dnt900_radio_map_remotes);
+	kfree(work);
+}
+
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 {
 	struct dnt900_local *local = dev_id;
@@ -2828,4 +2852,3 @@ MODULE_VERSION("0.3");
 // TODO: Would like to issue ExitProtocolMode command when the line discipline is detached.
 //       However we can't do this as the tty is not available for use in dnt900_ldisc_close.
 // TODO: hangup ttys on ANNOUNCEMENT_BASE_REBOOTED event?
-// TODO: add writeable 'remap' attribute to force remap of entire network
