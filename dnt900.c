@@ -2286,8 +2286,10 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 	case COMMAND_SET_REMOTE_REGISTER:
 		if (response[3] == STATUS_NOT_ACKNOWLEDGED)
 			dnt900_dispatch_to_radio_no_data(local, response + 4, dnt900_radio_matches_sys_address, dnt900_radio_unregister_ttys);
-		if (response[3] == STATUS_ACKNOWLEDGED)
+		if (response[3] == STATUS_ACKNOWLEDGED) {
 			dnt900_dispatch_to_radio(local, response + 4, dnt900_radio_matches_sys_address, response + 7, dnt900_radio_report_rssi);
+			dnt900_dispatch_to_radio_no_data(local, response + 4, dnt900_radio_matches_sys_address, dnt900_radio_register_tty);
+		}
 		break;
 	case COMMAND_TX_DATA:
 		if (response[3] == STATUS_NOT_ACKNOWLEDGED)
@@ -2360,6 +2362,7 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 		break;
 	case ANNOUNCEMENT_JOINED:
 		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
+		dnt900_schedule_work(local, NULL, dnt900_map_all_remotes);
 		break;
 	case ERROR_PROTOCOL_ARGUMENT:
 		dnt900_process_argument_error(local);
@@ -2841,7 +2844,6 @@ MODULE_VERSION("0.3");
 // 
 // TODO: `parent` attributes can be updated elsewhere? needed at all?
 // TODO: hangup ttys when UcReset attribute is written? or in dnt900_store_reset?
-// TODO: remap network after ANNOUNCEMENT_JOINED?
 // TODO: how to reinstate TTYs when running on a router?
 // 
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
