@@ -2841,6 +2841,12 @@ MODULE_VERSION("0.3");
 // Future work:
 // 
 // TODO: `parent` attributes can be updated elsewhere?
+// TODO: when running on router/remote, and another remote exits then re-links, sys address
+//       can become invalid. need to catch this condition!
+// TODO: when mapping remotes, stop getting RegMACAddrXX once zeros are encountered
+// TODO: in get_register, replace EAGAIN with ECOMM; remove RETRIES
+// TODO: warn when ProtocolMode is 0x00?
+// TODO: change tty unregister behaviour when running on router or remote?
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could

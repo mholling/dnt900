@@ -380,7 +380,7 @@ Local Radio Attributes
 
 Some additional attributes are available for the local radio:
 
-    $ ls -l
+    $ ls -l /sys/devices/virtual/dnt900/ttyAMA0/
     ...
     -r--r--r-- 1 root root 4096 Aug  5 11:56 announce
     --w------- 1 root root 4096 Aug  5 11:56 discover
@@ -389,6 +389,7 @@ Some additional attributes are available for the local radio:
     --w------- 1 root root 4096 Aug  5 12:03 join_permit
     -r--r--r-- 1 root root 4096 Aug  5 11:51 join_request
     -r--r--r-- 1 root root 4096 Aug  5 11:56 parent
+    --w------- 1 root root 4096 Aug  5 11:56 remap
     --w------- 1 root root 4096 Aug  5 11:56 reset
     ...
 
@@ -409,13 +410,17 @@ When host-based authentication is used (`AuthMode` value of 0x02), the `join_req
 
 (The `announce`, `error`, `parent` and `join_request` attribute files are all pollable.)
 
-Radios on the network are usually discovered and added automatically, however if this fails for any reason a radio may be added manually by writing its MAC address to the `discover` attribute file:
+Radios on the network are usually discovered and added automatically when the line discipline is loaded. However, when operating on a remote or router, the line discipline is not always able to detect radios which subsequently link to the network. Such a radio may be added manually by writing its MAC address to the `discover` attribute file:
 
-    $ echo 0x00165A > /sys/devices/virtual/dnt900/ttyAMA0/discover
+    # echo 0x00165A > /sys/devices/virtual/dnt900/ttyAMA0/discover
 
-A software reset may be issued to the local radio by writing (anything) to the `reset` attribute file:
+Alternatively, you can remap the entire radio network to find new radios by using the `remap` attribute:
 
-    $ echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/reset
+    # echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/remap
+
+Finally, a software reset may be issued to the local radio by writing (anything) to the `reset` attribute file:
+
+    # echo 1 > /sys/devices/virtual/dnt900/ttyAMA0/reset
 
 Note that issuing a software reset may cause the radio to fail to restart properly, requiring a power cycle. This is due to the DNT900's power-on reset requirements, which state that the `RADIO_TXD` pin must remain low for 10ms after a reset. Depending on your serial port and driver, this requirement may not be met. (Specifically, this can occur if your serial port sets a pull-up on its receive line.) The USB interface to the development kit does not exhibit this problem.
 
@@ -456,6 +461,13 @@ Some attribute files above are described as *pollable*. This means you can monit
 
 Multiple attributes can be simultaneously monitored this way. Other languages, including [Python](http://docs.python.org/dev/library/select.html#select.poll), also expose the `poll()` function.
 
+Dynamic TTYs
+============
+
+By default, the virtual tty for a remote DNT900 radio is dynamic: it hangs up and is removed when the radio leaves the network. This is a convenient way to tell when the radio has gone out of range, lost power or been otherwise unlinked. The tty reappears when the remote radio next joins the network. You can use a udev rule to easily start up a service (e.g. point-to-point protocol) when the tty for a radio appears.
+
+When running on a remote or router, the reconnection of other previously-unlinked remotes can go unnoticted, leaving their ttys absent if they are not sending data. You can always 'ping' the remote radio (by reading any register value) in order to reinstate the tty device. Alternatively, a `static_ttys` module parameter is available to disable the dynamic tty behaviour, causing the radio tty devices to be permanent. (See below.)
+
 udev Rules
 ==========
 
@@ -489,12 +501,13 @@ Several module parameters are available:
     radios:maximum number of radios (int)
     n_dnt900:line discipline number (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
+    static_ttys:keep remote radio TTY device when unlinked (bool)
 
-You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
+You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`. Finally, you can require TTY devices for remote radios to be permanent (even when the radio is not linked) by setting the `static_ttys` parameter.
 
-For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20 and GPIO27 as `/HOST_CTS`:
+For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20, GPIO27 as `/HOST_CTS` and static tty devices :
 
-    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27
+    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27 static_ttys=Y
     $ ldattach -8n1 -s 115200 20 /dev/ttyAMA0
 
 Caveats
@@ -505,9 +518,11 @@ As far as possible, this module takes a 'hands-off' approach to the attached rad
 * `ProtocolOptions` must have bit 0 set in order to enable protocol message announcements (which are used by the software).
 * `AnnounceOptions` must be set to 0x07 to enable all announcement types.
 * Unless you have grounded the radio's `/CFG` pin, the `ProtocolSequenceEn` register must be set to 0x02. (It is by default). This allows the *EnterProtocolMode* ASCII command string to be used to switch the radio to protocol mode.
-* Bit 2 of `ProtocolOptions` determines whether the local radio issues *TxDataReply* packets, which include a transmission status byte for transmitted data packets. These packets are not required by the software and may be disabled.
+* Bit 2 of `ProtocolOptions` determines whether the local radio issues *TxDataReply* packets, which include a transmission status byte for transmitted data packets. If enabled, these packets help when using dynamic ttys.
 
-Communication with the local radio is in protocol mode. You may wish to select this mode permanently by configuring the radio's `ProtocolMode` register:
+A small amount of state information is kept for radios; in particular, the values of the `DeviceMode`, `TreeRoutingEn`, `BaseModeNetId` and `EnableRtAcks` registers are held. After configuring these registers, it is recommended to save their values and reload the line discipline to ensure consistency.
+
+Communication with the local radio is in protocol mode. For best operation, you should select this mode permanently by configuring the radio's `ProtocolMode` register:
 
     $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/ProtocolMode
     $ echo 0x01 > /sys/devices/virtual/dnt900/ttyAMA0/0x00165F/MemorySave
@@ -530,5 +545,4 @@ Release History
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
-  * HEAD: added remote leave attribute; hangup routed radio ttys in tree-routing networks when router times out or exits; fixed bug whereby kernel could hang on module unload if radio tty still open.
-.
+  * HEAD: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented dynamic radio ttys which are removed when radios depart network.
