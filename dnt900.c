@@ -2352,17 +2352,33 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 {
 	unsigned long updates = 0;
 	unsigned long flags;
-	int n, err = 0;
+	int n, err;
 
 	switch (annc[0]) {
+	case ANNOUNCEMENT_JOINED:
+		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
+		err = dnt900_dispatch_to_radio(local, annc + 2, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
+		if (err == -ENODEV)
+			dnt900_schedule_work(local, annc + 2, dnt900_add_new_mac_address);
+		dnt900_schedule_work(local, NULL, dnt900_map_all_remotes);
+		break;
+	case ANNOUNCEMENT_REMOTE_JOINED:
+	case ANNOUNCEMENT_HEARTBEAT:
+		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
+		if (err == -ENODEV)
+			dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
+		break;
 	case ANNOUNCEMENT_STARTED:
 	case ANNOUNCEMENT_EXITED:
 		dnt900_clear_packets(local);
 		dnt900_for_each_radio(local, dnt900_radio_unregister_tty);
-		break;
-	case ANNOUNCEMENT_JOINED:
 		dnt900_schedule_work(local, NULL, dnt900_refresh_local);
-		dnt900_schedule_work(local, NULL, dnt900_map_all_remotes);
+		break;
+	case ANNOUNCEMENT_REMOTE_EXITED:
+		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
+		break;
+	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
+		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_routes_net_id, annc, dnt900_radio_process_announcement);
 		break;
 	case ERROR_PROTOCOL_ARGUMENT:
 		dnt900_process_argument_error(local);
@@ -2420,24 +2436,6 @@ static int dnt900_process_announcement(struct dnt900_local *local, unsigned char
 	for (n = 0; n < ARRAY_SIZE(dnt900_local_attributes); ++n)
 		if (test_bit(n, &updates))
 			sysfs_notify(&local->dev.kobj, NULL, dnt900_local_attributes[n].attr.name);
-
-	switch (annc[0]) {
-	case ANNOUNCEMENT_JOINED:
-		err = dnt900_dispatch_to_radio(local, annc + 2, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
-		break;
-	case ANNOUNCEMENT_REMOTE_JOINED:
-	case ANNOUNCEMENT_HEARTBEAT:
-		err = dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
-		break;
-	case ANNOUNCEMENT_REMOTE_EXITED:
-		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_matches_mac_address, annc, dnt900_radio_process_announcement);
-		break;
-	case ANNOUNCEMENT_HEARTBEAT_TIMEOUT:
-		dnt900_dispatch_to_radio(local, annc + 1, dnt900_radio_routes_net_id, annc, dnt900_radio_process_announcement);
-		break;
-	}
-	if (err == -ENODEV)
-		dnt900_schedule_work(local, annc + 1, dnt900_add_new_mac_address);
 	return 0;
 }
 
@@ -2842,10 +2840,7 @@ MODULE_VERSION("0.3");
 
 // Future work:
 // 
-// TODO: `parent` attributes can be updated elsewhere? needed at all?
-// TODO: hangup ttys when UcReset attribute is written? or in dnt900_store_reset?
-// TODO: how to reinstate TTYs when running on a router?
-// 
+// TODO: `parent` attributes can be updated elsewhere?
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
