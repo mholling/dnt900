@@ -71,7 +71,6 @@
 
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
-#define REMOTE_REGISTER_RETRIES (2)
 
 #define START_OF_PACKET (0xFB)
 
@@ -1249,11 +1248,8 @@ static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_r
 static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
 {
 	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
-	int tries, err = -EAGAIN;
 
-	for (tries = REMOTE_REGISTER_RETRIES + 1; err == -EAGAIN && tries; --tries)
-		err = dnt900_send_packet_get_result(local, packet, value);
-	return err;
+	return dnt900_send_packet_get_result(local, packet, value);
 }
 
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value)
@@ -1280,7 +1276,7 @@ static int dnt900_discover(struct dnt900_local *local, const unsigned char *mac_
 	PACKET(packet, COMMAND_DISCOVER, mac_address[0], mac_address[1], mac_address[2]);
 
 	err = dnt900_send_packet_get_result(local, packet, sys_address);
-	return err == -EAGAIN ? -ENODEV : err;
+	return err == -ECOMM ? -ENODEV : err;
 }
 
 static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_radio_params *params)
@@ -1907,7 +1903,7 @@ static int dnt900_clear_packets(struct dnt900_local *local)
 	list_for_each_entry(transaction, &local->transactions, list) {
 		if (completion_done(&transaction->completed))
 			continue;
-		transaction->err = -EAGAIN;
+		transaction->err = -ECOMM;
 		complete(&transaction->completed);
 	}
 	mutex_unlock(&local->transactions_lock);
@@ -2268,10 +2264,10 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 		case STATUS_ACKNOWLEDGED:
 			transaction->err = 0;
 			break;
-		case STATUS_NOT_ACKNOWLEDGED:
 		case STATUS_HOLDING_FOR_FLOW:
 			transaction->err = -EAGAIN;
 			break;
+		case STATUS_NOT_ACKNOWLEDGED:
 		case STATUS_NOT_LINKED:
 		default:
 			transaction->err = -ECOMM;
@@ -2844,7 +2840,6 @@ MODULE_VERSION("0.3");
 // TODO: when running on router/remote, and another remote exits then re-links, sys address
 //       can become invalid. need to catch this condition!
 // TODO: when mapping remotes, stop getting RegMACAddrXX once zeros are encountered
-// TODO: in get_register, replace EAGAIN with ECOMM; remove RETRIES
 // TODO: warn when ProtocolMode is 0x00?
 // TODO: change tty unregister behaviour when running on router or remote?
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
