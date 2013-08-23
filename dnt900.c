@@ -330,6 +330,7 @@ static void dnt900_radio_read_params(struct dnt900_radio *radio, struct dnt900_r
 static void dnt900_radio_write_params(struct dnt900_radio *radio, struct dnt900_radio_params *params);
 static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_local_params *params);
 
+static int dnt900_radio_get_register_once(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dnt900_register *reg, const unsigned char *value);
 
@@ -1306,7 +1307,7 @@ static void dnt900_local_read_params(struct dnt900_local *local, struct dnt900_l
 	spin_unlock_irqrestore(&local->param_lock, flags);
 }
 
-static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value)
+static int dnt900_radio_get_register_once(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
 	struct dnt900_radio_params params;
@@ -1315,6 +1316,15 @@ static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dn
 		return dnt900_get_register(local, reg, value);
 	dnt900_radio_read_params(radio, &params);
 	return dnt900_get_remote_register(local, params.sys_address, reg, value);
+}
+
+static int dnt900_radio_get_register(struct dnt900_radio *radio, const struct dnt900_register *reg, unsigned char *value)
+{
+	int err = dnt900_radio_get_register_once(radio, reg, value);
+	if (err != -ECOMM)
+		return err;
+	err = dnt900_radio_get_params(radio);
+	return err == -ENODEV ? -ECOMM : err ? err : dnt900_radio_get_register_once(radio, reg, value);
 }
 
 static int dnt900_radio_set_register(struct dnt900_radio *radio, const struct dnt900_register *reg, const unsigned char *value)
