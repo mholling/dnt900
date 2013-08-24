@@ -1559,14 +1559,15 @@ static int dnt900_radio_get_params(struct dnt900_radio *radio)
 static int dnt900_radio_map_remotes(struct dnt900_radio *radio)
 {
 	struct dnt900_local *local = RADIO_TO_LOCAL(radio);
-	unsigned char mac_addresses[15 * 26];
-	int n, err;
+	unsigned char mac_addresses[15];
+	int n, m, err;
 
-	for (n = 0; n < 26; ++n)
-		TRY(dnt900_radio_get_register(radio, REG(RegMACAddr00 + n), mac_addresses + 15 * n));
-	for (n = 0; n < 26 * 5; ++n) {
-		unsigned char *mac_address = mac_addresses + 3 * n;
-		if (mac_address[0] || mac_address[1] || mac_address[2]) {
+	for (n = 0; n < 26; ++n) {
+		TRY(dnt900_radio_get_register(radio, REG(RegMACAddr00 + n), mac_addresses));
+		for (m = 0; m < 5; ++m) {
+			unsigned char *mac_address = mac_addresses + 3 * m;
+			if (!mac_address[0] && !mac_address[1] && !mac_address[2])
+				return 0;
 			err = dnt900_dispatch_to_radio_no_data(local, mac_address, dnt900_radio_matches_mac_address, dnt900_radio_map_remotes);
 			if (err == -ENODEV)
 				dnt900_schedule_work(local, mac_address, dnt900_add_new_mac_address);
@@ -2865,9 +2866,6 @@ MODULE_VERSION("0.3.1");
 // Future work:
 // 
 // TODO: `parent` attributes can be updated elsewhere?
-// TODO: when mapping remotes, stop getting RegMACAddrXX once zeros are encountered
-// TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
-// 
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
 //       expose a 'priority' attribute to determine how many packets are sent at once)
