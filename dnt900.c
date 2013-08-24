@@ -123,6 +123,8 @@
 #define DEVICE_MODE_BASE   (0x01)
 #define DEVICE_MODE_ROUTER (0x03)
 
+#define PROTOCOL_MODE_ON (0x01)
+
 #define PROTOCOL_OPTIONS_ENABLE_TX_REPLY (0x04)
 #define PROTOCOL_OPTIONS_ENABLE_ANNOUNCE (0x01)
 
@@ -1487,11 +1489,12 @@ static ssize_t dnt900_store_leave(struct device *dev, struct device_attribute *a
 static int dnt900_local_get_params(struct dnt900_local *local)
 {
 	struct dnt900_local_params local_params;
-	unsigned char announce_options, protocol_options, access_mode;
+	unsigned char announce_options, protocol_mode, protocol_options, access_mode;
 	unsigned long flags;
 
 	TRY(dnt900_get_register(local, REG(LinkStatus), &local_params.link_status));
 	TRY(dnt900_get_register(local, REG(AnnounceOptions), &announce_options));
+	TRY(dnt900_get_register(local, REG(ProtocolMode), &protocol_mode));
 	TRY(dnt900_get_register(local, REG(ProtocolOptions), &protocol_options));
 	TRY(dnt900_get_register(local, REG(TreeRoutingEn), &local_params.tree_routing_en));
 	TRY(dnt900_get_register(local, REG(DeviceMode), &local_params.device_mode));
@@ -1507,6 +1510,8 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		memset(local_params.base_mac_address, 0x00, 3);
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
+	if (protocol_mode != PROTOCOL_MODE_ON)
+		pr_warn(LDISC_NAME ": set ProtocolMode to 0x01 for reliable driver operation");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
 		pr_err(LDISC_NAME ": set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && local_params.device_mode != DEVICE_MODE_BASE)
@@ -2861,7 +2866,6 @@ MODULE_VERSION("0.3");
 // 
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: when mapping remotes, stop getting RegMACAddrXX once zeros are encountered
-// TODO: warn when ProtocolMode is 0x00?
 // TODO: use TTY_DRIVER_DYNAMIC_ALLOC?
 // 
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
