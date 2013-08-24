@@ -461,13 +461,6 @@ Some attribute files above are described as *pollable*. This means you can monit
 
 Multiple attributes can be simultaneously monitored this way. Other languages, including [Python](http://docs.python.org/dev/library/select.html#select.poll), also expose the `poll()` function.
 
-Dynamic TTYs
-============
-
-By default, the virtual tty for a remote DNT900 radio is dynamic: it hangs up and is removed when the radio leaves the network. This is a convenient way to tell when the radio has gone out of range, lost power or been otherwise unlinked. The tty reappears when the remote radio next joins the network. You can use a udev rule to easily start up a service (e.g. point-to-point protocol) when the tty for a radio appears.
-
-When running on a remote or router, the reconnection of other previously-unlinked remotes can go unnoticted, leaving their ttys absent if they are not sending data. You can always 'ping' the remote radio (by reading any register value) in order to reinstate the tty device. Alternatively, a `static_ttys` module parameter is available to disable the dynamic tty behaviour, causing the radio tty devices to be permanent. (See below.)
-
 udev Rules
 ==========
 
@@ -501,13 +494,12 @@ Several module parameters are available:
     radios:maximum number of radios (int)
     n_dnt900:line discipline number (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
-    static_ttys:keep remote radio TTY device when unlinked (bool)
 
-You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`. Finally, you can require TTY devices for remote radios to be permanent (even when the radio is not linked) by setting the `static_ttys` parameter.
+You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
 
-For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20, GPIO27 as `/HOST_CTS` and static tty devices :
+For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://www.raspberrypi.org/) using a line discipline number of 20 and GPIO27 as `/HOST_CTS`:
 
-    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27 static_ttys=Y
+    $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27
     $ ldattach -8n1 -s 115200 20 /dev/ttyAMA0
 
 Caveats
@@ -545,4 +537,4 @@ Release History
   * 4/7/2013: version 0.2.3: new Makefile; added flush_buffer and ioctl for line discipline; changed tty driver to avoid shutdown bug.
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
-  * HEAD: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented dynamic radio ttys which are removed when radios depart network.
+  * HEAD: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented carrier up/down functions for radio ttys.
