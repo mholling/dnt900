@@ -2611,7 +2611,10 @@ static void dnt900_add_new_sys_address(struct work_struct *ws)
 	unsigned char mac_address[3];
 
 	if (!dnt900_get_remote_register(work->local, work->address, REG(MacAddress), mac_address))
-		dnt900_add_radio(work->local, mac_address);
+		if (dnt900_add_radio(work->local, mac_address) == -EEXIST) {
+			dnt900_dispatch_to_radio_no_data(work->local, mac_address, dnt900_radio_matches_mac_address, dnt900_radio_hangup_ttys);
+			dnt900_dispatch_to_radio_no_data(work->local, mac_address, dnt900_radio_matches_mac_address, dnt900_radio_get_params);
+		}
 	kfree(work);
 }
 
