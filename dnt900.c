@@ -291,6 +291,10 @@ struct dnt900_reg_attribute {
 	int (*parse)(const char *buf, size_t count, unsigned char *value);
 };
 
+struct dnt900_radio_action {
+	int (*action)(struct dnt900_radio *);
+};
+
 struct dnt900_matcher {
 	void *data;
 	int (*match)(struct device *, void *);
@@ -1812,16 +1816,17 @@ static int dnt900_dispatch_to_radio_no_data(struct dnt900_local *local, void *fi
 
 static int dnt900_apply_to_radio(struct device *dev, void *data)
 {
-	int (*action)(struct dnt900_radio *) = data;
+	struct dnt900_radio_action *action = data;
 	struct dnt900_radio *radio = DEV_TO_RADIO(dev);
 
-	action(radio);
+	action->action(radio);
 	return 0;
 }
 
 static void dnt900_for_each_radio(struct dnt900_local *local, int (*action)(struct dnt900_radio *))
 {
-	device_for_each_child(&local->dev, action, dnt900_apply_to_radio);
+	struct dnt900_radio_action data = { .action = action };
+	device_for_each_child(&local->dev, &data, dnt900_apply_to_radio);
 }
 
 static int dnt900_apply_to_matching(struct device *dev, void *data)
