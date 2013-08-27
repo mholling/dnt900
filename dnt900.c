@@ -1942,14 +1942,14 @@ static int dnt900_radio_drop_carrier(struct dnt900_radio *radio)
 static int dnt900_radio_raise_carrier(struct dnt900_radio *radio)
 {
 	unsigned long flags;
-	bool hangup;
+	bool wakeup;
 
 	spin_lock_irqsave(&radio->carrier_lock, flags);
-	hangup = !radio->carrier;
+	wakeup = !radio->carrier;
 	radio->carrier = 1;
 	spin_unlock_irqrestore(&radio->carrier_lock, flags);
-	if (hangup)
-		dnt900_radio_hangup_tty(radio);
+	if (wakeup)
+		wake_up_interruptible(&radio->port.open_wait);
 	return 0;
 }
 
