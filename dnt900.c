@@ -384,7 +384,6 @@ static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsig
 static int dnt900_clear_packets(struct dnt900_local *local);
 
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio);
-static int dnt900_radio_hangup_tty(struct dnt900_radio *radio);
 static int dnt900_radio_drop_carrier(struct dnt900_radio *radio);
 static int dnt900_radio_raise_carrier(struct dnt900_radio *radio);
 
@@ -1598,7 +1597,7 @@ static int dnt900_radio_hangup_ttys(struct dnt900_radio *radio)
 	struct dnt900_radio_params params;
 
 	dnt900_radio_read_params(radio, &params);
-	dnt900_radio_hangup_tty(radio);
+	tty_port_tty_hangup(&radio->port, false);
 	if (params.device_mode == DEVICE_MODE_ROUTER && params.base_mode_net_id > 0x00)
 		dnt900_for_matching_radios(local, &params.base_mode_net_id, dnt900_radio_matches_net_id, dnt900_radio_hangup_ttys);
 	return 0;
@@ -1905,23 +1904,7 @@ static int dnt900_clear_packets(struct dnt900_local *local)
 
 static int dnt900_radio_wake_tty(struct dnt900_radio *radio)
 {
-	struct tty_struct *tty = tty_port_tty_get(&radio->port);
-
-	if (tty) {
-		tty_wakeup(tty);
-		tty_kref_put(tty);
-	}
-	return 0;
-}
-
-static int dnt900_radio_hangup_tty(struct dnt900_radio *radio)
-{
-	struct tty_struct *tty = tty_port_tty_get(&radio->port);
-
-	if (tty) {
-		tty_hangup(tty);
-		tty_kref_put(tty);
-	}
+	tty_port_tty_wakeup(&radio->port);
 	return 0;
 }
 
@@ -1935,7 +1918,7 @@ static int dnt900_radio_drop_carrier(struct dnt900_radio *radio)
 	radio->carrier = 0;
 	spin_unlock_irqrestore(&radio->carrier_lock, flags);
 	if (hangup)
-		dnt900_radio_hangup_tty(radio);
+		tty_port_tty_hangup(&radio->port, false);
 	return 0;
 }
 
@@ -2590,15 +2573,11 @@ static int dnt900_radio_out(struct dnt900_radio *radio, void *data)
 {
 	unsigned char *response = data;
 	unsigned int len = response[1] - 5;
-	struct tty_struct *tty = tty_port_tty_get(&radio->port);
 
 	dnt900_radio_raise_carrier(radio);
-	if (tty) {
-		while (len > 0) {
-			len -= tty_insert_flip_string(tty, response + 7, len);
-			tty_flip_buffer_push(tty);
-		}
-		tty_kref_put(tty);
+	while (len > 0) {
+		len -= tty_insert_flip_string(&radio->port, response + 7, len);
+		tty_flip_buffer_push(&radio->port);
 	}
 	dnt900_radio_report_rssi(radio, response + 6);
 	return 0;
