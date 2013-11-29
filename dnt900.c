@@ -2171,6 +2171,7 @@ static void dnt900_ldisc_flush_buffer(struct tty_struct *tty)
 
 	spin_lock_irqsave(&local->rx_fifo_lock, flags);
 	kfifo_reset_out(&local->rx_fifo);
+	tty->receive_room = RX_BUFFER_SIZE;
 	spin_unlock_irqrestore(&local->rx_fifo_lock, flags);
 }
 
@@ -2204,6 +2205,7 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 				dnt900_process_event(local, response);
 			spin_lock_irqsave(&local->rx_fifo_lock, flags);
 		}
+		tty->receive_room = kfifo_avail(&local->rx_fifo);
 		spin_unlock_irqrestore(&local->rx_fifo_lock, flags);
 	}
 }
@@ -2762,6 +2764,7 @@ static int dnt900_ldisc_open(struct tty_struct *tty)
 	local = dnt900_create_local(tty);
 	UNWIND(err, IS_ERR(local) ? PTR_ERR(local) : 0, fail_create_local);
 	tty->disc_data = local;
+	tty->receive_room = RX_BUFFER_SIZE;
 	dnt900_schedule_work(local, NULL, dnt900_init_local);
 	pr_info(LDISC_NAME ": attached to %s\n", tty->name);
 	return 0;
