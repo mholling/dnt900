@@ -27,7 +27,7 @@ OBJS = $(PACKAGE).o
 $(PACKAGE).ko: $(PACKAGE).c
 	$(MAKE) -C $(KSRC) M=$(PWD) modules
 
-modules_install:
+modules_install: $(PACKAGE).ko
 	$(MAKE) -C $(KSRC) M=$(PWD) INSTALL_MOD_PATH=$(DESTDIR) modules_install
 
 clean:
