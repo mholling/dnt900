@@ -397,6 +397,7 @@ static void dnt900_tty_port_destruct(struct tty_port *port);
 
 static int dnt900_radio_write(struct dnt900_radio *radio, void *data);
 
+static int dnt900_tty_install(struct tty_driver *driver, struct tty_struct *tty);
 static int dnt900_tty_open(struct tty_struct *tty, struct file *filp);
 static void dnt900_tty_close(struct tty_struct *tty, struct file *filp);
 static void dnt900_tty_hangup(struct tty_struct *tty);
@@ -1044,6 +1045,7 @@ static struct tty_port_operations dnt900_tty_port_ops = {
 };
 
 static struct tty_operations dnt900_tty_ops = {
+	.install         = dnt900_tty_install,
 	.open            = dnt900_tty_open,
 	.close           = dnt900_tty_close,
 	.hangup          = dnt900_tty_hangup,
@@ -2033,6 +2035,13 @@ static int dnt900_radio_write(struct dnt900_radio *radio, void *data)
 
 	dnt900_local_drain_fifo(local);
 	return count;
+}
+
+static int dnt900_tty_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
+
+	return tty_port_install(&radio->port, driver, tty);
 }
 
 static int dnt900_tty_open(struct tty_struct *tty, struct file *filp)
