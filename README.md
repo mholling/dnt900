@@ -8,7 +8,7 @@ The DNT900 series includes the DNT900P and the DNT900C. This software is also li
 Building the Module
 ===================
 
-To build the module, your linux system should be set up for kernel development. This is probably as simple as installing the `kernel-devel` package, or its equivalent in your distribution.
+To build the module, your linux system should be set up for kernel development. This is probably as simple as installing the `kernel-devel` package, or its equivalent in your distribution. Your kernel version should be 3.10 or later.
 
 All going well, running the provided makefile should result in a sucessfully built kernel module called `dnt900.ko`:
 
@@ -538,3 +538,4 @@ Release History
   * 22/7/2013: version 0.2.4: reduced internal buffer sizes; fixed attribute timeout issues; fixed bug wherein tty minor number was not correct.
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
   * 24/8/2013: version 0.3.1: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented carrier up/down functions for radio ttys.
+  * 30/11/2013: version 0.3.2: update for kernel version 3.10.
