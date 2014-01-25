@@ -71,6 +71,7 @@
 
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
+#define REMOTE_REGISTER_ATTEMPTS (4)
 
 #define START_OF_PACKET (0xFB)
 
@@ -1516,7 +1517,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
 		pr_err(LDISC_NAME ": set radio AnnounceOptions register to 0x07 for correct driver operation\n");
 	if (protocol_mode != PROTOCOL_MODE_ON)
-		pr_warn(LDISC_NAME ": set ProtocolMode to 0x01 for reliable driver operation");
+		pr_warn(LDISC_NAME ": set ProtocolMode to 0x01 for reliable driver operation\n");
 	if (!(protocol_options & PROTOCOL_OPTIONS_ENABLE_ANNOUNCE))
 		pr_err(LDISC_NAME ": set radio ProtocolOptions register to 0x01 or 0x05 for correct driver operation\n");
 	if (access_mode == ACCESS_MODE_TDMA_DYNAMIC && local_params.device_mode != DEVICE_MODE_BASE)
@@ -1869,6 +1870,7 @@ static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsig
 {
 	struct dnt900_transaction transaction = { .result = result, .err = 0, .packet = packet };
 	int err;
+	int attempts = packet[2] == COMMAND_GET_REMOTE_REGISTER ? REMOTE_REGISTER_ATTEMPTS : 1;
 	long completed;
 
 	INIT_LIST_HEAD(&transaction.list);
@@ -1878,9 +1880,11 @@ static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsig
 	list_add_tail(&transaction.list, &local->transactions);
 	mutex_unlock(&local->transactions_lock);
 
-	UNWIND(err, dnt900_send_packet(local, packet), exit);
-	completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
-	err = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.err;
+	do {
+		UNWIND(err, dnt900_send_packet(local, packet), exit);
+		completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
+		err = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.err;
+	} while (err == -ECOMM && --attempts);
 
 exit:
 	mutex_lock(&local->transactions_lock);
@@ -2299,7 +2303,8 @@ static int dnt900_process_reply(struct dnt900_local *local, unsigned char *respo
 			transaction->err = -ECOMM;
 		}
 		complete(&transaction->completed);
-		break;
+		if (command != COMMAND_GET_REMOTE_REGISTER)
+			break;
 	}
 	mutex_unlock(&local->transactions_lock);
 
