@@ -494,6 +494,7 @@ Several module parameters are available:
     radios:maximum number of radios (int)
     n_dnt900:line discipline number (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
+    remote_register_interval:interval in ms between remote register reads (int)
 
 You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
 
@@ -501,6 +502,8 @@ For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://
 
     $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27
     $ ldattach -8n1 -s 115200 20 /dev/ttyAMA0
+
+A bug in the DNT900 firmware in point-to-point or multipoint mode can cause successive register requests to the base radio from a remote radio to fail if they occur too quickly. To counter this, such requests are throttled according to the value of `remote_register_interval`, representing an interval in milliseconds between successive requests. The default value is 350 ms; if you find your base radio is not being recognised when running on a remote radio, try setting a higher value.
 
 Caveats
 =======
@@ -539,4 +542,4 @@ Release History
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
   * 24/8/2013: version 0.3.1: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented carrier up/down functions for radio ttys.
   * 30/11/2013: version 0.3.2: update for kernel version 3.10.
-  * 25/1/2014: HEAD: fixed bug whereby NACK for a GetRemoteRegister request causes radio not to load.
+  * 3/2/2014: HEAD: added throttling of remote register requests to prevent NACKs due to radio firmware bug.

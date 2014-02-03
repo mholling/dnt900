@@ -53,6 +53,7 @@
 #include <linux/kfifo.h>
 #include <linux/delay.h>
 #include <linux/bitops.h>
+#include <linux/timer.h>
 
 #define LDISC_NAME "dnt900"
 #define CLASS_NAME "dnt900"
@@ -72,6 +73,7 @@
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_ATTEMPTS (4)
+#define REMOTE_REGISTER_INTERVAL_MS (350)
 
 #define START_OF_PACKET (0xFB)
 
@@ -328,6 +330,8 @@ static int dnt900_local_add_attributes(struct dnt900_local *local);
 
 static int dnt900_enter_protocol_mode(struct dnt900_local *local);
 static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_register *reg, unsigned char *value);
+static int dnt900_get_remote_register_simple(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
+static int dnt900_get_remote_register_throttled(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value);
 static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, const unsigned char *value);
@@ -437,6 +441,7 @@ static void dnt900_map_remotes(struct work_struct *ws);
 static void dnt900_map_all_remotes(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
+static void dnt900_next_remote_read(unsigned long data);
 
 static struct dnt900_local *dnt900_create_local(struct tty_struct *tty);
 static void dnt900_unregister_local(struct dnt900_local *local);
@@ -453,6 +458,7 @@ static int dnt900_ldisc_hangup(struct tty_struct *tty);
 static int n_dnt900 = N_DNT900;
 static int radios = 255;
 static int gpio_cts = -1;
+static int remote_register_interval = REMOTE_REGISTER_INTERVAL_MS;
 
 module_param(radios, int, S_IRUGO);
 MODULE_PARM_DESC(radios, "maximum number of radios");
@@ -460,6 +466,8 @@ module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
+module_param(remote_register_interval, int, S_IRUGO);
+MODULE_PARM_DESC(remote_register_interval, "interval in ms between remote register reads");
 
 static const struct device_attribute dnt900_local_command_attributes[] = {
 	__ATTR(reset,       ATTR_W, NULL, dnt900_store_reset),
@@ -989,6 +997,7 @@ struct dnt900_local {
 	struct list_head transactions;
 	struct mutex transactions_lock;
 	struct mutex radios_lock;
+	struct mutex remote_read_lock;
 	struct rw_semaphore closed_lock;
 	spinlock_t param_lock;
 	spinlock_t tx_fifo_lock;
@@ -1000,6 +1009,8 @@ struct dnt900_local {
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
 	wait_queue_head_t tx_queue;
+	wait_queue_head_t remote_read_queue;
+	struct timer_list remote_read_timer;
 	unsigned char attributes[ARRAY_SIZE(dnt900_local_attributes)][32];
 };
 
@@ -1251,11 +1262,40 @@ static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_r
 	return dnt900_send_packet_get_result(local, packet, value);
 }
 
-static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
+static int dnt900_get_remote_register_simple(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
 {
 	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
 
 	return dnt900_send_packet_get_result(local, packet, value);
+}
+
+static int dnt900_get_remote_register_throttled(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
+{
+	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
+	int result;
+
+	TRY(mutex_lock_interruptible(&local->remote_read_lock));
+	UNWIND(result, wait_event_interruptible(local->remote_read_queue, !timer_pending(&local->remote_read_timer)), exit);
+	result = dnt900_send_packet_get_result(local, packet, value);
+	if (down_read_trylock(&local->closed_lock)) {
+		mod_timer(&local->remote_read_timer, jiffies + msecs_to_jiffies(remote_register_interval));
+		up_read(&local->closed_lock);
+	}
+
+exit:
+	mutex_unlock(&local->remote_read_lock);
+	return result;
+}
+
+static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
+{
+	struct dnt900_local_params local_params;
+
+	dnt900_local_read_params(local, &local_params);
+	if (local_params.tree_routing_en || local_params.device_mode == DEVICE_MODE_BASE)
+		return dnt900_get_remote_register_simple(local, sys_address, reg, value);
+	else
+		return dnt900_get_remote_register_throttled(local, sys_address, reg, value);
 }
 
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value)
@@ -1511,7 +1551,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 		COPY3(local_params.base_mac_address, local->mac_address);
 	else if (local_params.link_status == LINK_STATUS_READY) {
 		unsigned char base_sys_address[3] = { 0x00, 0x00, local_params.tree_routing_en ? 0xFF : 0x00 };
-		TRY(dnt900_get_remote_register(local, base_sys_address, REG(MacAddress), local_params.base_mac_address));
+		TRY(dnt900_get_remote_register_throttled(local, base_sys_address, REG(MacAddress), local_params.base_mac_address));
 	} else
 		memset(local_params.base_mac_address, 0x00, 3);
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
@@ -2140,6 +2180,7 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 
 	while (true) {
 		int sent;
+		// TODO: 'true' condition below is ineffective:
 		TRY(wait_event_interruptible(local->tx_queue, true));
 		sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
 		if (sent || !len)
@@ -2702,6 +2743,13 @@ static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static void dnt900_next_remote_read(unsigned long data)
+{
+	struct dnt900_local *local = (struct dnt900_local *)data;
+
+	wake_up_interruptible(&local->remote_read_queue);
+}
+
 static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 {
 	int err;
@@ -2712,6 +2760,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	UNWIND(err, local->tty ? 0 : -EPERM, fail_tty_get);
 	mutex_init(&local->transactions_lock);
 	mutex_init(&local->radios_lock);
+	mutex_init(&local->remote_read_lock);
 	init_rwsem(&local->closed_lock);
 	spin_lock_init(&local->param_lock);
 	spin_lock_init(&local->tx_fifo_lock);
@@ -2734,6 +2783,10 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	INIT_KFIFO(local->tx_fifo);
 	INIT_KFIFO(local->rx_fifo);
 	init_waitqueue_head(&local->tx_queue);
+	init_waitqueue_head(&local->remote_read_queue);
+	init_timer(&local->remote_read_timer);
+	local->remote_read_timer.data = (unsigned long)local;
+	local->remote_read_timer.function = dnt900_next_remote_read;
 	return local;
 
 fail_register:
@@ -2794,6 +2847,8 @@ static void dnt900_ldisc_close(struct tty_struct *tty)
 
 	down_write(&local->closed_lock);
 	destroy_workqueue(local->workqueue);
+	del_timer_sync(&local->remote_read_timer);
+	wake_up(&local->remote_read_queue);
 	if (local->gpio_cts >= 0)
 		free_irq(gpio_to_irq(local->gpio_cts), local);
 	tty->disc_data = NULL;
@@ -2866,6 +2921,9 @@ MODULE_VERSION("0.3.2");
 
 // Future work:
 // 
+// TODO: should be able to remove REMOTE_REGISTER_ATTEMPTS stuff now that we're throttling
+//       remote register requests
+// TODO: use uint for module parameters
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
