@@ -73,7 +73,8 @@
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define REMOTE_REGISTER_ATTEMPTS (4)
-#define REMOTE_REGISTER_INTERVAL_MS (350)
+#define MIN_THROTTLE_MS (20)
+#define HOP_DURATION_COUNTS_PER_MS (20)
 
 #define START_OF_PACKET (0xFB)
 
@@ -256,6 +257,7 @@ struct dnt900_local_params {
 	unsigned char link_status;
 	unsigned char base_mac_address[3];
 	unsigned char base_mode_net_id;
+	unsigned int hop_duration;
 };
 
 struct dnt900_local;
@@ -331,7 +333,7 @@ static int dnt900_local_add_attributes(struct dnt900_local *local);
 static int dnt900_enter_protocol_mode(struct dnt900_local *local);
 static int dnt900_get_register(struct dnt900_local *local, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_get_remote_register_simple(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
-static int dnt900_get_remote_register_throttled(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
+static int dnt900_get_remote_register_throttled(struct dnt900_local *local, unsigned int hop_duration, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value);
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value);
 static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, const unsigned char *value);
@@ -458,7 +460,7 @@ static int dnt900_ldisc_hangup(struct tty_struct *tty);
 static int n_dnt900 = N_DNT900;
 static int radios = 255;
 static int gpio_cts = -1;
-static int remote_register_interval = REMOTE_REGISTER_INTERVAL_MS;
+static int hop_delay = 6;
 
 module_param(radios, int, S_IRUGO);
 MODULE_PARM_DESC(radios, "maximum number of radios");
@@ -466,8 +468,8 @@ module_param(n_dnt900, int, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
-module_param(remote_register_interval, int, S_IRUGO);
-MODULE_PARM_DESC(remote_register_interval, "interval in ms between remote register reads");
+module_param(hop_delay, int, S_IRUGO); // TODO: better name!
+MODULE_PARM_DESC(hop_delay, "number of hops delay between remote register reads");
 
 static const struct device_attribute dnt900_local_command_attributes[] = {
 	__ATTR(reset,       ATTR_W, NULL, dnt900_store_reset),
@@ -1269,7 +1271,7 @@ static int dnt900_get_remote_register_simple(struct dnt900_local *local, const u
 	return dnt900_send_packet_get_result(local, packet, value);
 }
 
-static int dnt900_get_remote_register_throttled(struct dnt900_local *local, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
+static int dnt900_get_remote_register_throttled(struct dnt900_local *local, unsigned int hop_duration, const unsigned char *sys_address, const struct dnt900_register *reg, unsigned char *value)
 {
 	PACKET(packet, COMMAND_GET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span);
 	int result;
@@ -1278,7 +1280,9 @@ static int dnt900_get_remote_register_throttled(struct dnt900_local *local, cons
 	UNWIND(result, wait_event_interruptible(local->remote_read_queue, !timer_pending(&local->remote_read_timer)), exit);
 	result = dnt900_send_packet_get_result(local, packet, value);
 	if (down_read_trylock(&local->closed_lock)) {
-		mod_timer(&local->remote_read_timer, jiffies + msecs_to_jiffies(remote_register_interval));
+		unsigned int interval_ms = MIN_THROTTLE_MS + (hop_duration + HOP_DURATION_COUNTS_PER_MS - 1) / HOP_DURATION_COUNTS_PER_MS * hop_delay;
+
+		mod_timer(&local->remote_read_timer, jiffies + msecs_to_jiffies(interval_ms));
 		up_read(&local->closed_lock);
 	}
 
@@ -1295,7 +1299,7 @@ static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned
 	if (local_params.tree_routing_en || local_params.device_mode == DEVICE_MODE_BASE)
 		return dnt900_get_remote_register_simple(local, sys_address, reg, value);
 	else
-		return dnt900_get_remote_register_throttled(local, sys_address, reg, value);
+		return dnt900_get_remote_register_throttled(local, local_params.hop_duration, sys_address, reg, value);
 }
 
 static int dnt900_set_register(struct dnt900_local *local, const struct dnt900_register *reg, const unsigned char *value)
@@ -1536,6 +1540,7 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 {
 	struct dnt900_local_params local_params;
 	unsigned char announce_options, protocol_mode, protocol_options, access_mode;
+	unsigned char hop_duration[2];
 	unsigned long flags;
 
 	TRY(dnt900_get_register(local, REG(LinkStatus), &local_params.link_status));
@@ -1547,11 +1552,13 @@ static int dnt900_local_get_params(struct dnt900_local *local)
 	TRY(dnt900_get_register(local, REG(local_params.device_mode == DEVICE_MODE_BASE ? BaseSlotSize : RemoteSlotSize), &local_params.slot_size));
 	TRY(dnt900_get_register(local, REG(BaseModeNetID), &local_params.base_mode_net_id));
 	TRY(dnt900_get_register(local, REG(AccessMode), &access_mode));
+	TRY(dnt900_get_register(local, REG(HopDuration), hop_duration));
+	local_params.hop_duration = hop_duration[0] + (hop_duration[1] << 8);
 	if (local_params.device_mode == DEVICE_MODE_BASE)
 		COPY3(local_params.base_mac_address, local->mac_address);
 	else if (local_params.link_status == LINK_STATUS_READY) {
 		unsigned char base_sys_address[3] = { 0x00, 0x00, local_params.tree_routing_en ? 0xFF : 0x00 };
-		TRY(dnt900_get_remote_register_throttled(local, base_sys_address, REG(MacAddress), local_params.base_mac_address));
+		TRY(dnt900_get_remote_register_throttled(local, local_params.hop_duration, base_sys_address, REG(MacAddress), local_params.base_mac_address));
 	} else
 		memset(local_params.base_mac_address, 0x00, 3);
 	if (!(announce_options & ANNOUNCE_OPTIONS_LINKS) || !(announce_options & ANNOUNCE_OPTIONS_INIT))
@@ -2921,6 +2928,7 @@ MODULE_VERSION("0.3.2");
 
 // Future work:
 // 
+// TODO: solve issue with long timeouts!
 // TODO: should be able to remove REMOTE_REGISTER_ATTEMPTS stuff now that we're throttling
 //       remote register requests
 // TODO: use uint for module parameters

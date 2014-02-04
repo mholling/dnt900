@@ -494,7 +494,7 @@ Several module parameters are available:
     radios:maximum number of radios (int)
     n_dnt900:line discipline number (int)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
-    remote_register_interval:interval in ms between remote register reads (int)
+    hop_delay:number of hops delay between remote register reads (int)
 
 You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
 
@@ -503,7 +503,7 @@ For example, to connect the DNT900 to `/dev/ttyAMA0` on a [Raspberry Pi](http://
     $ sudo insmod dnt900.ko n_dnt900=20 gpio_cts=27
     $ ldattach -8n1 -s 115200 20 /dev/ttyAMA0
 
-A bug in the DNT900 firmware in point-to-point or multipoint mode can cause successive register requests to the base radio from a remote radio to fail if they occur too quickly. To counter this, such requests are throttled according to the value of `remote_register_interval`, representing an interval in milliseconds between successive requests. The default value is 350 ms; if you find your base radio is not being recognised when running on a remote radio, try setting a higher value.
+A bug in the DNT900 firmware in point-to-point or multipoint mode causes successive register requests to the base radio from a remote radio to fail if they occur too quickly. To counter this, such requests are throttled according to the value of `hop_delay`, representing a multiple of the hop duration to delay between successive requests. The default value is 6; if you find your base radio is not being recognised when running on a remote radio, try setting a higher value.
 
 Caveats
 =======
