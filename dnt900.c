@@ -456,18 +456,18 @@ static int dnt900_ldisc_hangup(struct tty_struct *tty);
 #define N_DNT900 29
 #endif
 
-static int n_dnt900 = N_DNT900;
-static int radios = 255;
+static uint n_dnt900 = N_DNT900;
+static uint radios = 255;
 static int gpio_cts = -1;
-static int hop_delay = 6;
+static uint hop_delay = 6;
 
-module_param(radios, int, S_IRUGO);
+module_param(radios, uint, S_IRUGO);
 MODULE_PARM_DESC(radios, "maximum number of radios");
-module_param(n_dnt900, int, S_IRUGO);
+module_param(n_dnt900, uint, S_IRUGO);
 MODULE_PARM_DESC(n_dnt900, "line discipline number");
 module_param(gpio_cts, int, S_IRUGO);
 MODULE_PARM_DESC(gpio_cts, "GPIO number for /HOST_CTS signal");
-module_param(hop_delay, int, S_IRUGO); // TODO: better name!
+module_param(hop_delay, uint, S_IRUGO);
 MODULE_PARM_DESC(hop_delay, "number of hops delay between remote register reads");
 
 static const struct device_attribute dnt900_local_command_attributes[] = {
@@ -2925,7 +2925,6 @@ MODULE_VERSION("0.3.2");
 // Future work:
 // 
 // TODO: solve issue with long timeouts!
-// TODO: use uint for module parameters
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could

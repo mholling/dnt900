@@ -491,10 +491,10 @@ Module Parameters
 Several module parameters are available:
 
     $ modinfo --parameters dnt900.ko 
-    radios:maximum number of radios (int)
-    n_dnt900:line discipline number (int)
+    radios:maximum number of radios (uint)
+    n_dnt900:line discipline number (uint)
     gpio_cts:GPIO number for /HOST_CTS signal (int)
-    hop_delay:number of hops delay between remote register reads (int)
+    hop_delay:number of hops delay between remote register reads (uint)
 
 You can specify the maximum number of radios allowed using the `radios` parameter (default = 255). You can specify a line discipline number to be used with the `n_dnt900` parameter (default = 29); the linux kernel allows at most 30 line disciplines, the first 17 of which are already in use. If you have connected the radio's `/HOST_CTS` to a GPIO for flow control, set the number of that GPIO using `gpio_cts`.
 
@@ -542,4 +542,4 @@ Release History
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
   * 24/8/2013: version 0.3.1: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented carrier up/down functions for radio ttys.
   * 30/11/2013: version 0.3.2: update for kernel version 3.10.
-  * 3/2/2014: HEAD: added throttling of remote register requests to prevent NACKs due to radio firmware bug.
+  * 4/2/2014: HEAD: added throttling of remote register requests to prevent NACKs due to radio firmware bug.
