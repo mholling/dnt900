@@ -2183,8 +2183,7 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 
 	while (true) {
 		int sent;
-		// TODO: 'true' condition below is ineffective:
-		TRY(wait_event_interruptible(local->tx_queue, true));
+		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->tx_fifo)));
 		sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
 		if (sent || !len)
 			return sent;
