@@ -72,7 +72,6 @@
 
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
-#define REMOTE_REGISTER_ATTEMPTS (4)
 #define MIN_THROTTLE_MS (20)
 #define HOP_DURATION_COUNTS_PER_MS (20)
 
@@ -1917,7 +1916,6 @@ static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsig
 {
 	struct dnt900_transaction transaction = { .result = result, .err = 0, .packet = packet };
 	int err;
-	int attempts = packet[2] == COMMAND_GET_REMOTE_REGISTER ? REMOTE_REGISTER_ATTEMPTS : 1;
 	long completed;
 
 	INIT_LIST_HEAD(&transaction.list);
@@ -1927,11 +1925,9 @@ static int dnt900_send_packet_get_result(struct dnt900_local *local, const unsig
 	list_add_tail(&transaction.list, &local->transactions);
 	mutex_unlock(&local->transactions_lock);
 
-	do {
-		UNWIND(err, dnt900_send_packet(local, packet), exit);
-		completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
-		err = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.err;
-	} while (err == -ECOMM && --attempts);
+	UNWIND(err, dnt900_send_packet(local, packet), exit);
+	completed = wait_for_completion_interruptible_timeout(&transaction.completed, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
+	err = !completed ? -ETIMEDOUT : completed < 0 ? completed : transaction.err;
 
 exit:
 	mutex_lock(&local->transactions_lock);
@@ -2929,8 +2925,6 @@ MODULE_VERSION("0.3.2");
 // Future work:
 // 
 // TODO: solve issue with long timeouts!
-// TODO: should be able to remove REMOTE_REGISTER_ATTEMPTS stuff now that we're throttling
-//       remote register requests
 // TODO: use uint for module parameters
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
