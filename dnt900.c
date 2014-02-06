@@ -66,10 +66,10 @@
 #define MAX_PACKET_SIZE (2+255)
 
 // buffer sizes must be powers of 2
-#define  RX_BUFFER_SIZE (512)  // no less
-#define  TX_BUFFER_SIZE (2048)
-#define TTY_BUFFER_SIZE (512)
-
+#define     RX_BUFFER_SIZE (512)  // no less
+#define     TX_BUFFER_SIZE (2048)
+#define    TTY_BUFFER_SIZE (512)
+#define PACKET_BUFFER_SIZE (256)
 #define REGISTER_TIMEOUT_MS (300000)
 #define STARTUP_DELAY_MS (500)
 #define MIN_THROTTLE_MS (20)
@@ -394,6 +394,7 @@ static int dnt900_radio_drop_carrier(struct dnt900_radio *radio);
 static int dnt900_radio_raise_carrier(struct dnt900_radio *radio);
 
 static int dnt900_radio_drain_fifo(struct dnt900_radio *radio);
+static int dnt900_local_drain_packets(struct dnt900_local *local);
 static void dnt900_local_drain_fifo(struct dnt900_local *local);
 
 static int dnt900_tty_port_carrier_raised(struct tty_port *port);
@@ -1003,12 +1004,15 @@ struct dnt900_local {
 	spinlock_t param_lock;
 	spinlock_t tx_fifo_lock;
 	spinlock_t rx_fifo_lock;
+	spinlock_t packet_fifo_lock;
 	spinlock_t attributes_lock;
 	struct workqueue_struct *workqueue;
 	struct dnt900_local_params params;
 	unsigned char mac_address[3];
 	DECLARE_KFIFO(rx_fifo, unsigned char, RX_BUFFER_SIZE);
 	DECLARE_KFIFO(tx_fifo, unsigned char, TX_BUFFER_SIZE);
+	// TODO: change packet_fifo to a pointer fifo?
+	DECLARE_KFIFO(packet_fifo, unsigned char, PACKET_BUFFER_SIZE);
 	wait_queue_head_t tx_queue;
 	wait_queue_head_t remote_read_queue;
 	struct timer_list remote_read_timer;
@@ -1295,6 +1299,7 @@ static int dnt900_get_remote_register(struct dnt900_local *local, const unsigned
 	struct dnt900_local_params local_params;
 
 	dnt900_local_read_params(local, &local_params);
+// TODO: check slot_size is sufficient for the packet
 	if (local_params.tree_routing_en || local_params.device_mode == DEVICE_MODE_BASE)
 		return dnt900_get_remote_register_simple(local, sys_address, reg, value);
 	else
@@ -1315,6 +1320,7 @@ static int dnt900_set_remote_register(struct dnt900_local *local, const unsigned
 	bool expect_reply = reg->bank != 0xFF || (reg->offset != 0x00 && (reg->offset != 0xFF || *value != 0x02));
 	unsigned char packet[32 + 9] = { START_OF_PACKET, reg->span + 7, COMMAND_SET_REMOTE_REGISTER, sys_address[0], sys_address[1], sys_address[2], reg->offset, reg->bank, reg->span };
 
+// TODO: check slot_size is sufficient for the packet
 	memcpy(packet + 9, value, reg->span);
 	return expect_reply ? dnt900_send_packet_get_result(local, packet, NULL) : dnt900_send_packet(local, packet);
 }
@@ -1901,12 +1907,12 @@ static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *p
 	bool done;
 
 	for (done = false; !done; ) {
-		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->tx_fifo) >= length));
-		spin_lock_irqsave(&local->tx_fifo_lock, flags);
-		done = kfifo_avail(&local->tx_fifo) >= length;
+		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->packet_fifo) >= length));
+		spin_lock_irqsave(&local->packet_fifo_lock, flags);
+		done = kfifo_avail(&local->packet_fifo) >= length;
 		if (done)
-			length = kfifo_in(&local->tx_fifo, packet, length);
-		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
+			length = kfifo_in(&local->packet_fifo, packet, length);
+		spin_unlock_irqrestore(&local->packet_fifo_lock, flags);
 	}
 	dnt900_local_drain_fifo(local);
 	return 0;
@@ -2015,11 +2021,39 @@ static int dnt900_radio_drain_fifo(struct dnt900_radio *radio)
 	return 0;
 }
 
+static int dnt900_local_drain_packets(struct dnt900_local *local)
+{
+	unsigned long flags;
+	bool tx_available = true;
+	unsigned char packet[MAX_PACKET_SIZE];
+	unsigned int length;
+
+	for(; tx_available && kfifo_out_peek(&local->packet_fifo, packet, 2) == 2; ) {
+		length = 2 + packet[1];
+		if (kfifo_avail(&local->packet_fifo) < length)
+			break;
+		spin_lock_irqsave(&local->tx_fifo_lock, flags);
+		tx_available = kfifo_avail(&local->tx_fifo) >= length;
+		if (tx_available) {
+			length = kfifo_out(&local->packet_fifo, packet, length);
+			length = kfifo_in(&local->tx_fifo, packet, length);
+		}
+		spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
+	}
+	return tx_available ? 0 : -EBUSY;
+}
+
+// TODO: radio_drain_fifo and local_drain_fifo are not necessarily serialised
+// so radio->fifo and local->packet_fifo probably need locking! (Or could we
+// encompass them all under the tx_fifo_lock?)
+
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
 	unsigned long flags;
 	unsigned char *buf;
 
+	if (dnt900_local_drain_packets(local) < 0)
+		return;
 	dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
 	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
 		return;
@@ -2767,6 +2801,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	spin_lock_init(&local->param_lock);
 	spin_lock_init(&local->tx_fifo_lock);
 	spin_lock_init(&local->rx_fifo_lock);
+	spin_lock_init(&local->packet_fifo_lock);
 	spin_lock_init(&local->attributes_lock);
 	INIT_LIST_HEAD(&local->transactions);
 	local->workqueue = create_singlethread_workqueue(tty->name);
@@ -2784,6 +2819,7 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	UNWIND(err, device_register(&local->dev), fail_register);
 	INIT_KFIFO(local->tx_fifo);
 	INIT_KFIFO(local->rx_fifo);
+	INIT_KFIFO(local->packet_fifo);
 	init_waitqueue_head(&local->tx_queue);
 	init_waitqueue_head(&local->remote_read_queue);
 	init_timer(&local->remote_read_timer);
