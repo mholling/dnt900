@@ -1905,7 +1905,8 @@ static int dnt900_send_packet(struct dnt900_local *local, const unsigned char *p
 	bool done;
 
 	for (done = false; !done; ) {
-		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->packet_fifo) >= length));
+		int remaining = wait_event_interruptible_timeout(local->tx_queue, kfifo_avail(&local->packet_fifo) >= length, msecs_to_jiffies(REGISTER_TIMEOUT_MS));
+		TRY(remaining < 0 ? remaining : remaining > 0 ? 0 : -ETIMEDOUT);
 		spin_lock_irqsave(&local->packet_fifo_lock, flags);
 		done = kfifo_avail(&local->packet_fifo) >= length;
 		if (done)
@@ -2200,9 +2201,9 @@ static ssize_t dnt900_ldisc_write(struct tty_struct *tty, struct file *filp, con
 {
 	struct dnt900_local *local = TTY_TO_LOCAL(tty);
 	struct dnt900_bufdata bufdata = { .buf = buf, .len = len };
+	int sent;
 
 	while (true) {
-		int sent;
 		TRY(wait_event_interruptible(local->tx_queue, kfifo_avail(&local->tx_fifo)));
 		sent = dnt900_dispatch_to_radio(local, NULL, dnt900_radio_is_local, &bufdata, dnt900_radio_write);
 		if (sent || !len)
@@ -2945,7 +2946,7 @@ MODULE_VERSION("0.3.3");
 
 // Future work:
 // 
-// TODO: check where wait_event_interruptible (and mutex_lock_...) could be made to timeout
+// TODO: replace REGISTER_TIMEOUT_MS with a value that varies according to serial rate?
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
