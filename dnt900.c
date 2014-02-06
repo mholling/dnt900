@@ -2178,8 +2178,7 @@ static void dnt900_tty_wait_until_sent(struct tty_struct *tty, int timeout)
 	while (true) {
 		if (kfifo_is_empty(&radio->fifo))
 			break;
-		// TODO: possible bug - should the next line wait for a different condition?
-		if (wait_event_interruptible_timeout(local->tx_queue, kfifo_is_empty(&local->tx_fifo), timeout) <= 0)
+		if (wait_event_interruptible_timeout(local->tx_queue, kfifo_is_empty(&radio->fifo), timeout) <= 0)
 			break;
 		dnt900_local_drain_fifo(local);
 	}
