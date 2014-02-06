@@ -70,7 +70,8 @@
 #define     TX_BUFFER_SIZE (2048)
 #define    TTY_BUFFER_SIZE (512)
 #define PACKET_BUFFER_SIZE (256)
-#define REGISTER_TIMEOUT_MS (300000)
+
+#define REGISTER_TIMEOUT_MS (10000)
 #define STARTUP_DELAY_MS (500)
 #define MIN_THROTTLE_MS (20)
 #define HOP_DURATION_COUNTS_PER_MS (20)
@@ -2945,7 +2946,7 @@ MODULE_VERSION("0.3.3");
 
 // Future work:
 // 
-// TODO: solve issue with long timeouts!
+// TODO: check where wait_event_interruptible (and mutex_lock_...) could be made to timeout
 // TODO: `parent` attributes can be updated elsewhere?
 // TODO: in dnt900_radio_drain_fifo, we could just send a single packet per call to get a
 //       better round-robin effect when transmitting data to multiple radios (or we could
