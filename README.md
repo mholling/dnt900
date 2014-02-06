@@ -542,4 +542,4 @@ Release History
 * 7/8/2013: version 0.3: added pollable attributes for announcements, I/O reports, RSSI, range, and heartbeats; support for host-based authentication; handled invalid argument errors.
   * 24/8/2013: version 0.3.1: fixed bug whereby kernel could hang on module unload when radio tty open; added remote leave attribute; added network remap attribute; implemented carrier up/down functions for radio ttys.
   * 30/11/2013: version 0.3.2: update for kernel version 3.10.
-  * 4/2/2014: HEAD: added throttling of remote register requests to prevent NACKs due to radio firmware bug.
+  * 5/2/2014: version 0.3.3: added throttling of remote register requests to prevent NACKs due to radio firmware bug.
