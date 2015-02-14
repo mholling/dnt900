@@ -2146,7 +2146,7 @@ static int dnt900_tty_put_char(struct tty_struct *tty, unsigned char ch)
 {
 	struct dnt900_radio *radio = TTY_TO_RADIO(tty);
 
-	return kfifo_put(&radio->fifo, &ch) ? 1 : 0;
+	return kfifo_put(&radio->fifo, ch) ? 1 : 0;
 }
 
 static int dnt900_tty_write_room(struct tty_struct *tty)
@@ -2261,7 +2261,7 @@ static void dnt900_ldisc_receive_buf(struct tty_struct *tty, const unsigned char
 
 	while (count > 0) {
 		for (; count > 0; --count, ++cp, ++fp)
-			if (*fp == TTY_NORMAL && !kfifo_put(&local->rx_fifo, cp))
+			if (*fp == TTY_NORMAL && !kfifo_put(&local->rx_fifo, *cp))
 				break;
 		spin_lock_irqsave(&local->rx_fifo_lock, flags);
 		while (kfifo_out_peek(&local->rx_fifo, response, 2) == 2) {
