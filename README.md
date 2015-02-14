@@ -544,3 +544,4 @@ Release History
   * 30/11/2013: version 0.3.2: update for kernel version 3.10.
   * 5/2/2014: version 0.3.3: added throttling of remote register requests to prevent NACKs due to radio firmware bug.
   * 6/2/2014: version 0.3.4: prioritised register reads over data transmission to reduce timeout issues.
+  * 14/2/2015: version 0.3.5: update code for kernel version 3.18.

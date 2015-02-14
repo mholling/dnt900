@@ -2,7 +2,7 @@
     Linux line discipline for RFM DNT900 & DNT2400 radio transceiver
     modules.
     
-    Copyright (C) 2012, 2013, 2014 Matthew Hollingworth.
+    Copyright (C) 2012, 2013, 2014, 2015 Matthew Hollingworth.
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -2941,7 +2941,7 @@ module_exit(dnt900_exit);
 MODULE_AUTHOR("Matthew Hollingworth");
 MODULE_DESCRIPTION("driver for DNT900 RF module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.3.4");
+MODULE_VERSION("0.3.5");
 //MODULE_ALIAS_LDISC(N_DNT900);
 
 // Future work:
