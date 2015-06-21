@@ -194,54 +194,6 @@
 #define ARG_COUNT(...) (sizeof((char[]){__VA_ARGS__})/sizeof(char))
 #define PACKET(name, ...) unsigned char name[] = { START_OF_PACKET, ARG_COUNT(__VA_ARGS__), __VA_ARGS__ }
 
-/**
- * kfifo_out_prepare - setup a pointer for direct output buffer access
- * @fifo: address of the fifo to be used
- * @pbuf: address of buffer pointer to be initialized
- *
- * This macro sets the provided buffer pointer to the address of the
- * current fifo output location.
- * It returns the maximum number of contiguous elements which can be read
- * out from this location. A zero means there is no data in the fifo.
- *
- * Note that with only one concurrent reader and one concurrent
- * writer, you don't need extra locking to use these macros.
- */
-#define kfifo_out_prepare(fifo, pbuf) \
-__kfifo_uint_must_check_helper( \
-({ \
-	typeof((fifo) + 1) __tmp = (fifo);  \
-	typeof((*pbuf) + 1) *__pbuf = (pbuf); \
-	struct __kfifo *__kfifo = &__tmp->kfifo; \
-	unsigned int size = __kfifo->mask + 1; \
-	unsigned int off = __kfifo->out & __kfifo->mask; \
-	*__pbuf = (__is_kfifo_ptr(__tmp) ? \
-		((typeof(__tmp->type))__kfifo->data) : \
-		(__tmp->buf)) + off; \
-	min(size - off, __kfifo->in - __kfifo->out); \
-}) \
-)
-
-/**
- * kfifo_out_finish - finish a direct output buffer access operation
- * @fifo: address of the fifo to be used
- * @len: number of elements which were read out
- *
- * This macro finishes a direct output buffer access operation. The out
- * counter will be updated by the len parameter. No error checking will
- * be done.
- *
- * Note that with only one concurrent reader and one concurrent
- * writer, you don't need extra locking to use these macros.
- */
-#define kfifo_out_finish(fifo, len) \
-(void)({ \
-	typeof((fifo) + 1) __tmp = (fifo);  \
-	struct __kfifo *__kfifo = &__tmp->kfifo; \
-	unsigned int __len = (len); \
-	__kfifo->out += __len; \
-})
-
 struct dnt900_transaction {
 	struct list_head list;
 	struct completion completed;
@@ -2039,22 +1991,20 @@ static int dnt900_local_drain_packets(struct dnt900_local *local)
 static void dnt900_local_drain_fifo(struct dnt900_local *local)
 {
 	unsigned long flags;
-	unsigned char *buf;
+	int room, count;
+	unsigned char buf[512];
 
 	if (!spin_trylock_irqsave(&local->tx_fifo_lock, flags))
 		return;
 	if (dnt900_local_drain_packets(local) == 0)
 		dnt900_for_each_radio(local, dnt900_radio_drain_fifo);
-	while (true) {
-		int room = tty_write_room(local->tty);
-		int avail = kfifo_out_prepare(&local->tx_fifo, &buf);
-		int len = min(room, avail);
-
-		if (len <= 0)
+	for (room = tty_write_room(local->tty); room > 0; room = tty_write_room(local->tty)) {
+		count = room < ARRAY_SIZE(buf) ? room : ARRAY_SIZE(buf);
+		count = kfifo_out(&local->tx_fifo, buf, count);
+		if (count <= 0)
 			break;
 		set_bit(TTY_DO_WRITE_WAKEUP, &local->tty->flags);
-		local->tty->ops->write(local->tty, buf, len);
-		kfifo_out_finish(&local->tx_fifo, len);
+		local->tty->ops->write(local->tty, buf, count);
 	}
 	spin_unlock_irqrestore(&local->tx_fifo_lock, flags);
 
