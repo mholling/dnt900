@@ -55,6 +55,9 @@
 #include <linux/bitops.h>
 #include <linux/timer.h>
 
+#include <linux/version.h>
+
+
 #define LDISC_NAME "dnt900"
 #define CLASS_NAME "dnt900"
 #define TTY_DRIVER_NAME "ttyDNT"
@@ -396,7 +399,11 @@ static void dnt900_map_remotes(struct work_struct *ws);
 static void dnt900_map_all_remotes(struct work_struct *ws);
 
 static irqreturn_t dnt900_cts_handler(int irq, void *dev_id);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
 static void dnt900_next_remote_read(unsigned long data);
+#else
+static void dnt900_next_remote_read(struct timer_list *t);
+#endif
 
 static struct dnt900_local *dnt900_create_local(struct tty_struct *tty);
 static void dnt900_unregister_local(struct dnt900_local *local);
@@ -2716,9 +2723,15 @@ static irqreturn_t dnt900_cts_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
 static void dnt900_next_remote_read(unsigned long data)
 {
 	struct dnt900_local *local = (struct dnt900_local *)data;
+#else
+static void dnt900_next_remote_read(struct timer_list *t)
+{
+	struct dnt900_local *local = from_timer(local, t, remote_read_timer);
+#endif
 
 	wake_up_interruptible(&local->remote_read_queue);
 }
@@ -2759,9 +2772,14 @@ static struct dnt900_local *dnt900_create_local(struct tty_struct *tty)
 	INIT_KFIFO(local->packet_fifo);
 	init_waitqueue_head(&local->tx_queue);
 	init_waitqueue_head(&local->remote_read_queue);
-	init_timer(&local->remote_read_timer);
-	local->remote_read_timer.data = (unsigned long)local;
-	local->remote_read_timer.function = dnt900_next_remote_read;
+	#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
+
+		init_timer(&local->remote_read_timer);
+		local->remote_read_timer.data = (unsigned long)local;
+		local->remote_read_timer.function = dnt900_next_remote_read;
+	#else
+	    timer_setup(&local->remote_read_timer, dnt900_next_remote_read, 0);
+	#endif
 	return local;
 
 fail_register:
